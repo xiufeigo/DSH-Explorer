@@ -476,23 +476,27 @@ div:has(> [data-slot="sidebar.footer.action"]):not(:has(button)):not(:has(a)):no
   /* 宿主 height:0，百分比 top 无效；用滚动视口减去输入区后垂直居中。 */
   top: calc((var(--dshx-scrollport-h, 60vh) - var(--dsh-composer-height, 152px)) / 2);
   transform: translateY(-50%);
-  width: 28px; height: auto;
+  width: 40px; height: auto;
   max-height: calc(var(--dshx-scrollport-h, 60vh) - var(--dsh-composer-height, 152px) - 24px);
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  display: flex; flex-direction: column; align-items: flex-start; justify-content: center;
   gap: 3px; padding: 4px 0; overflow-x: hidden; overflow-y: auto;
   scrollbar-width: none;
 }
 .dshx-msg-rail::-webkit-scrollbar { width: 0; height: 0; }
 .dshx-msg-tick {
   appearance: none; border: none; background: transparent; padding: 0;
-  width: 22px; height: 11px; cursor: pointer;
-  display: flex; align-items: center; justify-content: center;
+  width: 36px; height: 11px; cursor: pointer;
+  display: flex; align-items: center; justify-content: flex-start;
   color: var(--dsw-alias-label-primary, var(--dshx-text));
 }
 .dshx-msg-tick-bar {
   display: block; height: 1px; border-radius: 1px;
   background: currentColor; opacity: 0.28;
-  transition: width 140ms ease, height 140ms ease, opacity 140ms ease;
+  transform-origin: left center;
+  transition:
+    width 240ms cubic-bezier(0.22, 1, 0.36, 1),
+    height 200ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 200ms ease;
 }
 .dshx-msg-tick.on .dshx-msg-tick-bar,
 .dshx-msg-tick:hover .dshx-msg-tick-bar {

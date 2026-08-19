@@ -1,5 +1,5 @@
 /**
- * 中栏左侧会话大纲：贴对话列左缘，刻度簇在可视区域垂直居中。
+ * 中栏左侧会话大纲：贴对话列左缘，刻度左对齐（变长往右长），簇在可视区域垂直居中。
  * 悬停弹出 Codex 风格卡片（标题 / 摘要 / 已处理时长），点击跳转对应气泡。
  */
 
@@ -85,6 +85,15 @@ function tickWidth(text: string): number {
   if (n < 80) return 10
   if (n < 180) return 12
   return 14
+}
+
+/** Codex 式鱼眼：焦点拉最长，邻近 1～3 格跟着鼓一点。 */
+function tickBoost(distance: number): number {
+  if (distance === 0) return 20
+  if (distance === 1) return 9
+  if (distance === 2) return 5
+  if (distance === 3) return 2
+  return 0
 }
 
 function collectItems(chat: ChatSnapshotLike): RailItem[] {
@@ -222,11 +231,14 @@ export function MessageRail({ sessionId, useSession }: MessageRailProps): JSX.El
   }
 
   const hovered = hover === null ? undefined : items.find(item => item.key === hover.key)
+  const focusKey = hover?.key ?? active
+  const focusIndex = focusKey === null ? -1 : items.findIndex(item => item.key === focusKey)
 
   const rail = (
     <nav className="dshx-msg-rail" aria-label="会话消息大纲">
       {items.map((item, index) => {
-        const on = active === item.key || hover?.key === item.key
+        const on = focusKey === item.key
+        const width = item.tick + (focusIndex < 0 ? 0 : tickBoost(Math.abs(index - focusIndex)))
         return (
           <button
             key={item.key}
@@ -242,7 +254,7 @@ export function MessageRail({ sessionId, useSession }: MessageRailProps): JSX.El
               scrollToChatKey(item.key)
             }}
           >
-            <span className="dshx-msg-tick-bar" style={{ width: on ? 18 : item.tick }} />
+            <span className="dshx-msg-tick-bar" style={{ width }} />
           </button>
         )
       })}
