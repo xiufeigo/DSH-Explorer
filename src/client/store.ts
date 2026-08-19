@@ -1,0 +1,205 @@
+/**
+ * DSH-Explorer browser half — shared in-memory store.
+ * One store instance per plugin apply, handed to the three registered
+ * surfaces (right details panel, left sidebar browser, header toggle) via
+ * their inject faces.
+ */
+
+import { useEffect, useReducer } from 'react'
+
+export type ExplorerTabKind = 'edit' | 'preview'
+export type ExplorerPage = 'review' | 'context' | 'subagents' | 'sources'
+export type ReviewMode = 'git' | 'last' | 'branch'
+
+export interface FileTab {
+  id: string
+  /** Opening session — a tab is per-session so switching sessions never
+   *  reuses stale content under the same path. */
+  sessionId: string
+  path: string
+  name: string
+  kind: ExplorerTabKind
+  content: string
+  truncated: boolean
+  dirty: boolean
+  loading: boolean
+  error: string | null
+}
+
+export interface ExplorerStore {
+  panelOpen: boolean
+  /** 左侧栏文件模式：true 时文件树临时替换原生会话浏览区，离开即卸载恢复。 */
+  filesMode: boolean
+  /** 置顶摘要：宽栏钉住，窄栏收成按钮。 */
+  summaryOn: boolean
+  /** 窄栏时摘要悬浮窗是否打开。 */
+  summaryFloat: boolean
+  reviewMode: ReviewMode
+  subagentId: string | null
+  extraPages: ExplorerPage[]
+  /** ExplorerPage | a file tab id */
+  active: string
+  defaultActive: ExplorerPage
+  tabs: FileTab[]
+  /** Bumped to ask every file tree to reload its root listing. */
+  treeTick: number
+  openTab(input: { sessionId: string; path: string; name: string; kind: ExplorerTabKind }): FileTab
+  openPage(page: ExplorerPage, opts?: { reviewMode?: ReviewMode; subagentId?: string | null }): void
+  closePage(page: ExplorerPage): void
+  activate(id: string): void
+  closeTab(id: string): void
+  setDefault(tab: ExplorerPage): void
+  setPanelOpen(open: boolean): void
+  setFilesMode(active: boolean): void
+  setReviewMode(mode: ReviewMode): void
+  setSummaryOn(on: boolean): void
+  setSummaryFloat(open: boolean): void
+  patchTab(id: string, patch: Partial<FileTab>): void
+  refreshTree(): void
+  subscribe(listener: () => void): () => void
+}
+
+let tabCounter = 0
+
+export function createExplorerStore(): ExplorerStore {
+  const listeners = new Set<() => void>()
+  const state: { store: ExplorerStore | null } = { store: null }
+
+  const notify = (): void => {
+    for (const listener of listeners) listener()
+  }
+
+  const store: ExplorerStore = {
+    panelOpen: false,
+    filesMode: false,
+    summaryOn: false,
+    summaryFloat: false,
+    reviewMode: 'git',
+    subagentId: null,
+    extraPages: [],
+    active: 'review',
+    defaultActive: 'review',
+    tabs: [],
+    treeTick: 0,
+
+    openTab(input) {
+      const existing = this.tabs.find(tab =>
+        tab.sessionId === input.sessionId && tab.path === input.path && tab.kind === input.kind)
+      if (existing !== undefined) {
+        this.active = existing.id
+        this.panelOpen = true
+        notify()
+        return existing
+      }
+      const tab: FileTab = {
+        id: `dshx-tab-${++tabCounter}`,
+        sessionId: input.sessionId,
+        path: input.path,
+        name: input.name,
+        kind: input.kind,
+        content: '',
+        truncated: false,
+        dirty: false,
+        loading: true,
+        error: null,
+      }
+      this.tabs = [...this.tabs, tab]
+      this.active = tab.id
+      this.panelOpen = true
+      notify()
+      return tab
+    },
+
+    openPage(page, opts) {
+      if (page === 'subagents' || page === 'sources') {
+        if (!this.extraPages.includes(page)) this.extraPages = [...this.extraPages, page]
+      }
+      if (opts?.reviewMode !== undefined) this.reviewMode = opts.reviewMode
+      if (opts !== undefined && Object.prototype.hasOwnProperty.call(opts, 'subagentId')) {
+        this.subagentId = opts.subagentId ?? null
+      }
+      this.active = page
+      this.panelOpen = true
+      notify()
+    },
+
+    closePage(page) {
+      this.extraPages = this.extraPages.filter(item => item !== page)
+      if (this.active === page) this.active = this.defaultActive
+      if (page === 'subagents') this.subagentId = null
+      notify()
+    },
+
+    activate(id) {
+      this.active = id
+      notify()
+    },
+
+    closeTab(id) {
+      const index = this.tabs.findIndex(tab => tab.id === id)
+      if (index < 0) return
+      this.tabs = this.tabs.filter(tab => tab.id !== id)
+      if (this.active === id) this.active = this.defaultActive
+      notify()
+    },
+
+    setDefault(tab) {
+      this.defaultActive = tab
+      if (!this.tabs.some(t => t.id === this.active)) this.active = tab
+      notify()
+    },
+
+    setPanelOpen(open) {
+      this.panelOpen = open
+      notify()
+    },
+
+    setFilesMode(active) {
+      this.filesMode = active
+      notify()
+    },
+
+    setReviewMode(mode) {
+      this.reviewMode = mode
+      notify()
+    },
+
+    setSummaryOn(on) {
+      this.summaryOn = on
+      if (!on) this.summaryFloat = false
+      notify()
+    },
+
+    setSummaryFloat(open) {
+      this.summaryFloat = open
+      notify()
+    },
+
+    patchTab(id, patch) {
+      const tab = this.tabs.find(t => t.id === id)
+      if (tab === undefined) return
+      Object.assign(tab, patch)
+      notify()
+    },
+
+    refreshTree() {
+      this.treeTick++
+      notify()
+    },
+
+    subscribe(listener) {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    },
+  }
+
+  state.store = store
+  return store
+}
+
+/** Subscribe a component to every store change (small UI — full re-render is fine). */
+export function useExplorer(store: ExplorerStore): ExplorerStore {
+  const [, force] = useReducer((x: number) => x + 1, 0)
+  useEffect(() => store.subscribe(force), [store])
+  return store
+}

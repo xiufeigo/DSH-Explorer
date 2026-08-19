@@ -1,0 +1,183 @@
+# DSH-Explorer
+
+> 声明：本项目是纯 vibecoding 做出来的，由 Cursor + Grok 4.6 制作。
+
+给 DeepSeek Harness（Web / Desktop）加的 OpenCode 风格浏览与审查插件：左侧看文件，中间看会话，右侧审查变更。
+
+## 界面
+
+### 左侧栏 — 工作区 | 文件
+
+头栏变成 **[工作区 | 文件]**，和原生搜索 / 筛选 / 新建同一行。
+
+| 模式 | 做什么 |
+| --- | --- |
+| 工作区 | 原生会话分组、搜索、新建、打开目录，完全不改官方列表 |
+| 文件 | 以当前会话工作目录为根的文件树（惰性展开，按类型显示图标）。单击打开右侧**编辑**；右键 `.md` / `.html` 可**预览**。点回「工作区」即卸掉文件树，原生会话栏原样恢复 |
+
+未 fork 顶部座位时，同一组 tab 会画在侧栏底部，切换逻辑相同。
+
+### 中栏 — 大纲与摘要
+
+会话头部 utilities（开合按钮始终钉在这里，不会跑到右侧 tab 上）：
+
+- **会话大纲**：对话左侧列出每条用户消息，点击跳到对应气泡。
+- **置顶摘要**：Codex 风格环境卡片，含变更（`+N / -N`，点击打开右侧**审查**）、切分支、提交 / 推送、比较分支（有 GitHub remote 时同时打开 compare）、子智能体、来源。没有「本地」项。
+- **面板**：开关右侧栏。
+
+宽屏且右侧栏收起时，摘要钉在对话右侧，点窗外不收。右侧栏拉开或中栏变窄后改成悬浮窗，点窗外或 Esc **只收摘要，不关右侧栏**。
+
+### 右侧栏 — 审查 / 上下文 / 文件
+
+嵌入官方 details 列（列宽由 harness / 桌面壳驱动）。常驻 **审查**、**上下文**；从摘要可打开 **子智能体**、**来源**；点文件则多出编辑 / 预览 tab。
+
+**审查**（Git 变更 / 上一回合变更 / 分支变更）：
+
+- 面板顺序：未跟踪文件 → Diff → 其他文件。三个面板默认折叠，开合状态记在 `localStorage`。
+- 列表只拉路径；点到某个文件才拉该文件的 patch，文件列表和 diff 都虚拟滚动。
+- 切到上下文 / 编辑等 tab 再回来，审查页不卸载，立刻显示上次结果，git 在后台刷新。
+- **上一回合变更**：上一个 Agent 回合（`turn/start` → `turn/end`）里产生的文件变更，回合结束时冻结。
+- **分支变更**：当前分支相对基准（`origin/HEAD` → `origin/main` → `origin/master` → `main` → `master`）的差异和提交列表。
+
+**上下文**：上方 ToDo（读会话 `todo/write`），下方会话概览（Goal / 计划模式 / 工作目录 / 预设）和模型上下文清单。
+
+**子智能体**：当前会话全部子智能体；点一条在右侧栏看该子会话，不切换中间主对话。
+
+**来源**：当前会话引用 / 搜到的页面与内容。
+
+**文件 tab**：编辑器（Ctrl+S 保存、脏标记）、Markdown 预览、HTML 沙箱预览。对话里点 Read / Write / Edit 等工具行上的文件路径，会在右侧栏打开（图片等二进制仍走系统打开）。
+
+## 快速开始
+
+需要 Node.js ≥ 22、pnpm，以及能跑的 `dsh web`。
+
+```powershell
+git clone <仓库地址> DSH-Explorer
+cd DSH-Explorer
+pnpm plugin:install                 # 构建 + 自检 + junction + patch 行
+pnpm plugin:install --fork-ui       # 额外：放宽右侧栏宽度 + 工作区顶部动作条座位
+```
+
+然后 **重启 `dsh web`**（Host 半边只有重启才会加载），再刷新页面。
+
+应能看到：左侧 **[工作区 | 文件]**、会话头 **摘要 / 面板**、对话左侧消息大纲、右侧 **审查 / 上下文**。
+
+常用参数：`--profile <name>`（默认 `web`）、`--harness <path>`、`--rebuild`、`--dry-run`。
+
+### 卸载
+
+```powershell
+pnpm plugin:uninstall                # 去掉 patch 行和 junction，并回退宽度 fork
+pnpm plugin:uninstall --keep-fork    # 保留宽度 fork
+pnpm plugin:uninstall --dry-run
+```
+
+卸载后建议再重启一次 `dsh web`。
+
+### 改动能不能只刷新？
+
+| 改了什么 | 怎么生效 |
+| --- | --- |
+| 客户端 UI（`src/client/`） | `pnpm run build` 后刷新页面 |
+| Host RPC（`src/index.ts`） | 必须重启 `dsh web` / 桌面壳。运行中的进程会缓存已加载的插件模块 |
+
+## 开发
+
+```bash
+pnpm install
+pnpm run build       # 产出 lib/index.js + lib/client.js
+pnpm run watch       # 开发时增量构建
+pnpm run typecheck
+pnpm run verify      # 冒烟：按运行时方式真正执行两个 bundle
+```
+
+`verify` 会：
+
+- Host：按 cordis Loader 的方式 `require('dsh-explorer')`，断言带 `inject` 的插件对象；
+- 浏览器：模拟 `window.__ModuleLoader__.load`，注入真实 React 后执行工厂；
+- 顺带抽测 RPC 跨站闸（同源 OPTIONS、跨源拒绝、无自定义头 POST 拒绝）。
+
+客户端 bundle 的 `exports` 垫片写在 tsdown `banner` 里（`intro` 会被静默丢掉）。缺这一步时浏览器会 `exports is not defined`，整页 Failed to load plugins，所以发版前务必 `verify`。
+
+## 架构
+
+```
+src/index.ts             Host：POST /dsh-explorer/rpc
+src/client/index.tsx     浏览器：插槽注册（右侧栏 / 侧栏 tab / 头部 utilities）
+src/client/…             审查、摘要、文件树、编辑器、子智能体、来源
+lib/index.js             Host bundle
+lib/client.js            浏览器 bundle（window.__ModuleLoader__ 工厂）
+scripts/install.mjs      安装器
+scripts/smoke.mjs        verify 冒烟
+```
+
+浏览器半边经 `package.json` 的 `dsh.client` 由模块表扫描加载；Host 半边靠 profile 的 `cordis.patch.yml` 插入行（示例见 [`cordis.patch.example.yml`](./cordis.patch.example.yml)）。
+
+### 插槽
+
+| 座位 | 用途 |
+| --- | --- |
+| `details`（priority -10） | 盖住官方工具详情，渲染审查 / 上下文 / 文件 tab |
+| `sidebar.workspaces.actions` | 「工作区 \| 文件」，portal 进浏览区头栏；未 fork 时底部 `sidebar.footer.action` 回退 |
+| `sidebar.workspaces` | 仅文件模式动态占用，离开即 dispose |
+| `conversation.session.header.utilities` | 摘要、右侧栏开关、会话大纲 |
+
+### RPC（`POST /dsh-explorer/rpc`）
+
+必须带自定义头 `x-dsh-explorer: 1`（触发浏览器 preflight，跨站过不了闸）。
+
+| 方法 | 作用 |
+| --- | --- |
+| `fs.list` / `fs.read` / `fs.write` | 会话 cwd 内的树与读写 |
+| `git.status` / `git.diff` / `git.fileDiff` | 状态、变更文件列表、按文件懒加载 patch |
+| `git.branch` / `git.lastRound` | 相对基准分支的差异；上一回合冻结快照 |
+| `git.summary` / `git.checkout` / `git.commit` / `git.push` | 摘要卡片上的分支与提交 |
+| `todo.list` / `context.meta` | ToDo 与模型上下文清单 |
+| `session.meta` / `session.sources` / `session.subagents` / `session.transcript` | 会话元数据、来源、子智能体、子会话内容 |
+
+所有路径操作限制在当前会话 `cwd` 内；文件树不列出 `.git`。
+
+## Harness fork（可选）
+
+插件层绕不过的两处，用 fork 补座位 / 放宽列宽。文件内都有 `FORK` 标记。升级 DSH 会覆盖这些改动，再跑一次 `pnpm plugin:install --fork-ui` 即可重打。
+
+### 右侧栏宽度
+
+官方 `DETAILS_MAX = 520`。`--fork-width` / `--fork-ui` 改成 1200，并记住拖拽宽度（`localStorage['dsh-explorer:details-width']`）。重建：
+
+```bash
+cd deepseek-harness
+pnpm --filter @deepseek-ai/dsh-client-ui-layout run bundle
+```
+
+实际宽度仍受让步链约束（中心列 ≥ 640px），1920 屏 + 280 侧栏大约能拖到 ~1000px。
+
+**DSH Desktop**：吃的是 npm `@deepseek-ai/dsh` 载荷，不是本机 harness 工作树。`--fork-width` 对已装的桌面壳无效。桌面壳自己在 `DSH-Desktop/crates/dsh-gui/src/titlebar.js` 里改 `clampWidth(..., 300, 520)`。本仓库不要去改 Desktop 的 `@deepseek-ai/*`。
+
+### 工作区顶部动作条
+
+官方侧栏没有 `sidebar.workspaces.actions`。`--fork-ui` 给 ui-sidebar 加这个座位，插件把 **[工作区 | 文件]** portal 进头栏同一行。重建：
+
+```bash
+pnpm --filter @deepseek-ai/dsh-client-ui-sidebar run bundle
+```
+
+空座位会整条隐藏，卸载时保留也无害。
+
+## 行为与限制
+
+- git 调用显式带「当前会话 + full-access」沙箱策略。不加的话，沙箱会落到 `dsh web` 启动目录；会话 cwd 在启动目录之外时，所有 git 会表现为「不是 Git 仓库」。
+- 编辑器保存视为用户显式写入（full-access），仍受会话目录边界约束。
+- 超过 2MB 不提供编辑 / 预览；二进制读失败会提示。
+- Markdown 预览是内置轻量渲染（标题 / 列表 / 任务 / 代码块 / 引用 / 链接 / 图片等常用子集）。
+- HTML 预览在 `sandbox=""` 的 iframe 里，不执行脚本。
+
+### 手动安装（排查用）
+
+1. `pnpm install && pnpm run build && pnpm run verify`
+2. 建 junction，指向本项目目录：
+   - `%DSH_HOME%\profiles\node_modules\dsh-explorer`
+   - `%DSH_HOME%\profiles\<profile>\node_modules\dsh-explorer`
+   - `<harness>\apps\cli\node_modules\dsh-explorer`
+3. 在 `%DSH_HOME%\profiles\<profile>\cordis.patch.yml` 追加 `- insert: [{id: dsh-explorer, name: dsh-explorer}]`
+4. 重启 `dsh web`，刷新页面
