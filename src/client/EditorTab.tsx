@@ -22,6 +22,34 @@ function canPreview(name: string): boolean {
   return isMarkdown(name) || isHtml(name)
 }
 
+/** Document + search: open the file with the OS default program. */
+function IconOpenFile16({ size = 16, className }: { size?: number; className?: string }): JSX.Element {
+  return (
+    <svg
+      width={size}
+      height={size}
+      className={className}
+      viewBox="0 0 1024 1024"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <path
+        d="M531.01097 1024H173.259072a112.625598 112.625598 0 0 1-112.337553-112.337553V112.337553A112.625598 112.625598 0 0 1 173.259072 0h442.437131l347.382278 267.017722V619.296765h-57.609001V295.534177L596.109142 57.609001H173.259072A54.728551 54.728551 0 0 0 118.53052 112.337553v799.324894a54.728551 54.728551 0 0 0 54.728552 54.728552h357.751898z"
+        fill="currentColor"
+      />
+      <path
+        d="M913.822785 337.300703H562.983966V35.141491h57.609002v244.550211h293.229817v57.609001zM163.177496 184.348805h256.072012v57.609001H163.177496zM163.177496 319.153868h303.311393v57.609001H163.177496zM163.177496 453.958931h364.664979v57.609001H163.177496zM637.011533 844.259916a160.729114 160.729114 0 1 1 160.729114-160.729114A160.729114 160.729114 0 0 1 637.011533 844.259916z m0-263.849227a103.120113 103.120113 0 1 0 103.120113 103.120113A103.120113 103.120113 0 0 0 637.011533 580.410689z"
+        fill="currentColor"
+      />
+      <path
+        d="M716.684782 810.011364l40.556737-40.902391 171.012321 169.514487-40.556737 40.902391z"
+        fill="currentColor"
+      />
+    </svg>
+  )
+}
+
 function FileDesktopActions({
   sessionId, path, onError,
 }: {
@@ -67,22 +95,23 @@ function FileDesktopActions({
     <>
       <button
         type="button"
-        className="dshx-btn small"
+        className="dshx-btn small icon"
         disabled={busy !== null}
-        title="在文件资源管理器打开所在目录"
+        title="在文件资源管理器打开"
+        aria-label="在文件资源管理器打开"
         onClick={() => { void run('reveal') }}
       >
-        <IconFolderOpen16 className="dshx-btn-glyph" />
-        在文件资源管理器打开
+        <IconFolderOpen16 />
       </button>
       <button
         type="button"
-        className="dshx-btn small"
+        className="dshx-btn small icon"
         disabled={busy !== null}
-        title="使用系统默认程序打开该文件"
+        title="使用默认程序打开"
+        aria-label="使用默认程序打开"
         onClick={() => { void run('open') }}
       >
-        使用默认程序打开
+        <IconOpenFile16 />
       </button>
     </>
   )

@@ -220,7 +220,23 @@ div[style*="grid-template-columns"]:has(.dshx-root) > [data-side] {
 .dshx-editor-toolbar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--dshx-border); flex: none; flex-wrap: wrap; }
 .dshx-editor-toolbar .path { flex: 1 1 120px; min-width: 0; font-size: 11px; color: var(--dshx-text2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
 .dshx-editor-actions { display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: 6px; margin-left: auto; }
-.dshx-btn .dshx-btn-glyph { width: 14px; height: 14px; flex: none; }
+.dshx-editor-actions .dshx-btn.small {
+  box-sizing: border-box;
+  height: 22px;
+  padding: 0 8px;
+  line-height: 20px;
+}
+.dshx-editor-actions .dshx-btn.icon {
+  width: 22px;
+  padding: 0;
+  justify-content: center;
+}
+.dshx-editor-actions .dshx-btn.icon svg {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  display: block;
+}
 .dshx-btn.on { background: var(--dshx-layer2); color: var(--dshx-text); border-color: var(--dshx-border2); }
 .dshx-code-stat { flex: none; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; font-weight: 600; display: inline-flex; gap: 6px; }
 .dshx-code-stat .add { color: var(--dshx-ok); }
@@ -370,6 +386,8 @@ div:has(> [data-slot="sidebar.footer.action"]):not(:has(button)):not(:has(a)):no
   background: var(--dsw-alias-interactive-bg-hover, var(--dshx-layer2));
   color: var(--dsw-alias-label-primary, var(--dshx-text));
 }
+.dshx-icon-btn:disabled { opacity: 0.5; cursor: default; }
+.dshx-icon-btn:disabled:hover { background: transparent; }
 .dshx-sidebar-body { flex: 1 1 auto; overflow: auto; min-height: 0; }
 
 /* ── File tree (row metrics copy WorkspaceBrowser Rows.module.css) ───────── */
