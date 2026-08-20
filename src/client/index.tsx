@@ -9,17 +9,21 @@
  *  - 文件模式：点击「文件」时**动态注册**一个 priority -10 的
  *    `sidebar.workspaces` 条目临时遮蔽原生会话浏览器；点「工作区」时 dispose，
  *    原生会话栏 100% 原样恢复（不做任何自绘替代）。
- *  - `conversation.session.header.utilities`：置顶摘要、右侧栏开关、会话大纲。
+ *  - `conversation.session.header.utilities`：置顶摘要、终端、右侧栏开关、会话大纲。
+ *  - `settings.plugin.item`：设置 → 插件配置里的 DSH-Explorer 卡片。
  *
  * 所有 Host 数据经包私有 HTTP RPC 路由（/dsh-explorer/rpc）。
  */
 
 import { ExplorerPanel, type LayoutFace } from './ExplorerPanel'
+import { ExplorerSettingsCard } from './ExplorerSettingsCard'
 import { FilesToggle } from './FilesToggle'
 import { MessageRail } from './MessageRail'
 import { PanelToggle } from './PanelToggle'
 import { SidebarFiles } from './SidebarFiles'
 import { SummaryToggle } from './SummaryToggle'
+import { TerminalToggle } from './TerminalToggle'
+import { installDetailsWidthMemory } from './detailsWidth'
 import { createExplorerStore, type ExplorerStore } from './store'
 import { injectStyles } from './styles'
 import { installChatFileOpen } from './chatFileOpen'
@@ -42,6 +46,8 @@ interface ExplorerClientContext {
 export const inject = ['slots', 'sessions', 'workspaces', 'layout']
 
 export function apply(ctx: ExplorerClientContext): void {
+  // 赶在首屏 attachPanels 之前包一层，打开右侧栏时写回上次宽度。
+  installDetailsWidthMemory(ctx.layout)
   if (typeof document !== 'undefined') {
     ctx.effect(() => injectStyles(), 'dsh-explorer: styles')
   }
@@ -134,6 +140,16 @@ export function apply(ctx: ExplorerClientContext): void {
   ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register(
     {
       name: 'conversation.session.header.utilities',
+      id: 'dsh-explorer-term',
+      // 排在右侧栏开关（20）左边：摘要 10 → 终端 15 → 右侧栏 20
+      order: 15,
+      inject: () => ({ explorer: { store } }),
+    },
+    TerminalToggle as never,
+  ))
+  ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register(
+    {
+      name: 'conversation.session.header.utilities',
       id: 'dsh-explorer-panel',
       order: 20,
       inject: () => ({ explorer: { store, layout: ctx.layout } }),
@@ -144,4 +160,26 @@ export function apply(ctx: ExplorerClientContext): void {
     { name: 'conversation.session.header.utilities', id: 'dsh-explorer-msg-rail', order: 30 },
     MessageRail as never,
   ))
+
+  // 设置 → 插件配置：和官方卡片同一列表。注册失败不能拖死整插件。
+  try {
+    ctx.slots.inject('settings.plugin.item', () => {
+      try {
+        return ctx.slots.register(
+          {
+            name: 'settings.plugin.item',
+            id: 'dsh-explorer',
+            key: 'dsh-explorer',
+            order: 30,
+          },
+          ExplorerSettingsCard as never,
+        )
+      } catch (error) {
+        console.error('dsh-explorer: 设置卡片注册失败', error)
+        return () => {}
+      }
+    })
+  } catch (error) {
+    console.error('dsh-explorer: 设置卡片 inject 失败', error)
+  }
 }

@@ -48,6 +48,25 @@ export function ensureHost(attr: string, className: string): HTMLElement | null 
   return host
 }
 
+export function conversationRoot(): HTMLElement | null {
+  const scroller = conversationScroll()
+  const root = scroller?.parentElement
+  return root instanceof HTMLElement ? root : null
+}
+
+/** 对话列底部终端座位：挂在滚动区外面，开合时压缩对话而不是盖住输入框。 */
+export function ensureTermHost(): HTMLElement | null {
+  const root = conversationRoot()
+  if (root === null) return null
+  const existing = root.querySelector('[data-dshx-term-host]')
+  if (existing instanceof HTMLElement) return existing
+  const host = document.createElement('div')
+  host.setAttribute('data-dshx-term-host', '')
+  host.className = 'dshx-term-host'
+  root.appendChild(host)
+  return host
+}
+
 export function flattenContent(content: unknown): string {
   if (typeof content === 'string') return content
   if (!Array.isArray(content)) return ''

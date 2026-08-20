@@ -7,6 +7,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { canPinSummary, conversationScroll, ensureHost } from './conversationHost'
+import { IconSummary16 } from './headerIcons'
 import { SummaryCard, type LayoutFace, type SessionsFace } from './SummaryCard'
 import { useExplorer, type ExplorerStore } from './store'
 
@@ -14,15 +15,6 @@ export interface SummaryToggleProps {
   sessionId: string
   useSessions?: (selector: (state: any) => unknown) => any
   explorer: { store: ExplorerStore; layout: LayoutFace; sessions?: SessionsFace }
-}
-
-function IconSummary({ className }: { className?: string }): JSX.Element {
-  return (
-    <svg className={className} width="16" height="16" viewBox="0 0 16 16" aria-hidden>
-      <rect x="2.5" y="2.5" width="11" height="11" rx="2.5" fill="none" stroke="currentColor" strokeWidth="1.3" />
-      <path d="M5 6h6M5 8.5h6M5 11h3.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-    </svg>
-  )
 }
 
 function eventInsideSummary(event: Event, btn: HTMLElement | null): boolean {
@@ -144,7 +136,7 @@ export function SummaryToggle({ sessionId, useSessions, explorer }: SummaryToggl
         aria-pressed={pressed}
         onClick={toggle}
       >
-        <IconSummary />
+        <IconSummary16 />
       </button>
       {showPin && pinHost !== null ? createPortal(
         <div className="dshx-summary-pin">{card}</div>,

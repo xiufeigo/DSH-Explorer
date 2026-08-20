@@ -4,13 +4,18 @@
  * Registers one JSON RPC route on the shared `webServer`
  * (`POST /dsh-explorer/rpc`) that the browser half consumes for file-tree
  * listing, file read/write, git review views, the ToDo list and the model
- * context manifest. Every path operation is fenced to the requesting
- * session's cwd. "上一回合变更" is produced from git snapshots taken at the
- * session's `turn/start` / `turn/end` durable events.
+ * context manifest, plus a user PTY stream at `POST /dsh-explorer/pty`.
+ * Also registers the `dsh-explorer` settings namespace so the plugin-config
+ * tab can dispatch the browser card (keyed slot ∩ describe).
+ * Every path operation is fenced to the requesting session's cwd. "上一回合变更"
+ * is produced from git snapshots taken at the session's `turn/start` /
+ * `turn/end` durable events.
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { isAbsolute, relative, resolve as pathResolve } from 'node:path'
+import { createPtyHub, gateExplorerRequest, type PtyHub, type SubprocessLike } from './pty'
+import { registerExplorerSettings } from './settingsNs'
 
 // ── Loose service shapes (what the host composition really provides) ──────
 
@@ -18,6 +23,7 @@ interface ExplorerContext {
   get(name: string): unknown
   on(name: string, listener: (...args: any[]) => any): () => void
   effect(callback: () => (() => void) | void, label?: string): () => void
+  inject?(deps: string[], callback: (owner: ExplorerContext) => void): unknown
 }
 
 interface FsTargetLike {
@@ -107,6 +113,8 @@ interface Services {
   sandboxPolicy?: SandboxPolicyService
   /** Per-call sandbox policy: the calling session plus the explicit full-access mode. */
   policyFor(session: SessionLike): unknown
+  /** 用户终端。Host 没有 subprocess 时打开会报错，不拖垮其它 RPC。 */
+  pty?: PtyHub
 }
 
 // ── 上一回合（last round）快照 ─────────────────────────────────────────────
@@ -869,37 +877,9 @@ function sendJson(res: ServerResponse, payload: unknown): void {
   res.end(text)
 }
 
-async function handleRpc(req: IncomingMessage, res: ServerResponse, sv: Services, lastRounds: Map<string, LastRound>): Promise<void> {  // 跨站防护：本路由只接受同源页面（Origin 与 Host 一致）发出的带
-  // `x-dsh-explorer` 自定义头的请求。自定义头会触发浏览器 preflight，
-  // 跨站页面连 preflight 都过不了；简单请求（text/plain、无自定义头）
-  // 则在此被 403 拒绝。OPTIONS 仅对同源 preflight 放行。
-  const origin = req.headers.origin
-  const host = req.headers.host
-  const sameHost = typeof origin === 'string' && origin.length > 0 && typeof host === 'string'
-    && ((): boolean => {
-        try { return new URL(origin).host === host } catch { return false }
-      })()
-
-  if (req.method === 'OPTIONS') {
-    if (sameHost) {
-      res.writeHead(204, {
-        'access-control-allow-origin': origin,
-        'access-control-allow-methods': 'POST, OPTIONS',
-        'access-control-allow-headers': 'content-type, x-dsh-explorer',
-        'access-control-max-age': '600',
-      })
-      res.end()
-    } else {
-      res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' })
-      res.end('forbidden origin')
-    }
-    return
-  }
-  if (req.method !== 'POST' || req.headers['x-dsh-explorer'] !== '1') {
-    res.writeHead(req.method === 'POST' ? 403 : 405, { 'content-type': 'text/plain; charset=utf-8' })
-    res.end(req.method === 'POST' ? 'forbidden' : 'POST only')
-    return
-  }
+async function handleRpc(req: IncomingMessage, res: ServerResponse, sv: Services, lastRounds: Map<string, LastRound>): Promise<void> {
+  // 跨站防护：本路由只接受同源页面发出的带 `x-dsh-explorer` 自定义头的请求。
+  if (!gateExplorerRequest(req, res)) return
   let body: any
   try {
     body = await readJsonBody(req, 32 * 1024 * 1024)
@@ -983,6 +963,23 @@ async function handleRpc(req: IncomingMessage, res: ServerResponse, sv: Services
         }
         return sendJson(res, sessionTranscript(target))
       }
+      case 'pty.open': {
+        if (sv.pty === undefined) return sendJson(res, { error: '终端服务未就绪' })
+        const cols = typeof args.cols === 'number' ? args.cols : 120
+        const rows = typeof args.rows === 'number' ? args.rows : 32
+        return sendJson(res, await sv.pty.open({ sessionId, cwd, cols, rows }))
+      }
+      case 'pty.write': {
+        if (sv.pty === undefined) return sendJson(res, { error: '终端服务未就绪' })
+        const id = typeof args.id === 'string' ? args.id : ''
+        const data = typeof args.data === 'string' ? args.data : ''
+        return sendJson(res, await sv.pty.write(sessionId, id, data))
+      }
+      case 'pty.close': {
+        if (sv.pty === undefined) return sendJson(res, { error: '终端服务未就绪' })
+        const id = typeof args.id === 'string' ? args.id : ''
+        return sendJson(res, await sv.pty.close(sessionId, id))
+      }
       default:
         return sendJson(res, { error: `未知方法 ${String(method)}` })
     }
@@ -1002,7 +999,10 @@ export function apply(ctx: ExplorerContext): void {
   // webserver 等就绪后才 apply）；此处检查仅为类型收窄。
   if (webServer === undefined || fs === undefined || shell === undefined || sessions === undefined) return
 
+  registerExplorerSettings(ctx)
+
   const sandboxPolicy = ctx.get('sandboxPolicy') as SandboxPolicyService | undefined
+  const pty = createPtyHub(() => ctx.get('subprocess') as SubprocessLike | undefined)
   const services: Services = {
     fs,
     shell,
@@ -1011,6 +1011,7 @@ export function apply(ctx: ExplorerContext): void {
     sandboxPolicy,
     persistence: ctx.get('sessionPersistence') as PersistenceLike | undefined,
     policyFor: (session: SessionLike) => sandboxPolicy?.resolve({ session, mode: 'danger-full-access' }),
+    pty,
   }
 
   const pendingStarts = new Map<string, Snapshot>()
@@ -1047,6 +1048,43 @@ export function apply(ctx: ExplorerContext): void {
       if (!res.headersSent) sendJson(res, { error: msg(error) })
     }),
   }), 'dsh-explorer: rpc route')
+
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: '/dsh-explorer/pty',
+    handler: (req, res) => void handlePtyStream(req, res, services).catch(error => {
+      if (!res.headersSent) sendJson(res, { error: msg(error) })
+    }),
+  }), 'dsh-explorer: pty stream')
+
+  ctx.effect(() => () => { void pty.disposeAll() }, 'dsh-explorer: pty teardown')
+}
+
+async function handlePtyStream(req: IncomingMessage, res: ServerResponse, sv: Services): Promise<void> {
+  if (!gateExplorerRequest(req, res)) return
+  if (sv.pty === undefined) {
+    sendJson(res, { error: '终端服务未就绪' })
+    return
+  }
+  let body: any
+  try {
+    body = await readJsonBody(req, 64 * 1024)
+  } catch (error) {
+    sendJson(res, { error: `无效请求：${msg(error)}` })
+    return
+  }
+  const sessionId = body?.sessionId
+  const id = body?.id
+  if (typeof sessionId !== 'string' || sessionId.length === 0 || typeof id !== 'string' || id.length === 0) {
+    sendJson(res, { error: '缺少 sessionId 或终端 id' })
+    return
+  }
+  const session = await loadSessionLog(sv, sessionId)
+  if (session === null) {
+    sendJson(res, { error: '会话不存在或已卸载' })
+    return
+  }
+  await sv.pty.attach(sessionId, id, res)
 }
 
 export { handleRpc }
@@ -1060,3 +1098,5 @@ export default {
   inject: ['webServer', 'fs', 'shell', 'sessions'],
   apply,
 }
+
+export { EXPLORER_SETTINGS_NS } from './settingsNs'

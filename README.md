@@ -23,6 +23,7 @@
 
 - **会话大纲**：对话左侧列出每条用户消息，点击跳到对应气泡。
 - **置顶摘要**：Codex 风格环境卡片，含变更（`+N / -N`，点击打开右侧**审查**）、切分支、提交 / 推送、比较分支（有 GitHub remote 时同时打开 compare）、子智能体、来源。没有「本地」项。
+- **终端**：右上角底栏按钮。点开在对话列下方展开终端，默认进当前会话工作目录；支持多标签、`+` 新建、关闭标签。收起面板不断开进程。
 - **面板**：开关右侧栏。
 
 宽屏且右侧栏收起时，摘要钉在对话右侧，点窗外不收。右侧栏拉开或中栏变窄后改成悬浮窗，点窗外或 Esc **只收摘要，不关右侧栏**。
@@ -60,7 +61,7 @@ pnpm plugin:install --fork-ui       # 额外：放宽右侧栏宽度 + 工作区
 
 然后 **重启 `dsh web`**（Host 半边只有重启才会加载），再刷新页面。
 
-应能看到：左侧 **[工作区 | 文件]**、会话头 **摘要 / 面板**、对话左侧消息大纲、右侧 **审查 / 上下文**。
+应能看到：左侧 **[工作区 | 文件]**、会话头 **摘要 / 终端 / 面板**、对话左侧消息大纲、右侧 **审查 / 上下文**。
 
 常用参数：`--profile <name>`（默认 `web`）、`--harness <path>`、`--rebuild`、`--dry-run`。
 
@@ -79,7 +80,7 @@ pnpm plugin:uninstall --dry-run
 | 改了什么 | 怎么生效 |
 | --- | --- |
 | 客户端 UI（`src/client/`） | `pnpm run build` 后刷新页面 |
-| Host RPC（`src/index.ts`） | 必须重启 `dsh web` / 桌面壳。运行中的进程会缓存已加载的插件模块 |
+| Host RPC / 终端 PTY（`src/index.ts`、`src/pty.ts`） | 必须重启 `dsh web` / 桌面壳。运行中的进程会缓存已加载的插件模块 |
 
 ## 开发
 
@@ -103,6 +104,7 @@ pnpm run verify      # 冒烟：按运行时方式真正执行两个 bundle
 
 ```
 src/index.ts             Host：POST /dsh-explorer/rpc
+src/pty.ts               Host：会话 cwd 里的用户 PTY（/dsh-explorer/pty 流）
 src/client/index.tsx     浏览器：插槽注册（右侧栏 / 侧栏 tab / 头部 utilities）
 src/client/…             审查、摘要、文件树、编辑器、子智能体、来源
 lib/index.js             Host bundle
@@ -120,7 +122,8 @@ scripts/smoke.mjs        verify 冒烟
 | `details`（priority -10） | 盖住官方工具详情，渲染审查 / 上下文 / 文件 tab |
 | `sidebar.workspaces.actions` | 「工作区 \| 文件」，portal 进浏览区头栏；未 fork 时底部 `sidebar.footer.action` 回退 |
 | `sidebar.workspaces` | 仅文件模式动态占用，离开即 dispose |
-| `conversation.session.header.utilities` | 摘要、右侧栏开关、会话大纲 |
+| `conversation.session.header.utilities` | 摘要、终端、右侧栏开关、会话大纲 |
+| `settings.plugin.item` | 设置 → 插件配置：终端配色 / 字号 / 字体（Host 命名空间 `dsh-explorer`） |
 
 ### RPC（`POST /dsh-explorer/rpc`）
 
@@ -143,7 +146,7 @@ scripts/smoke.mjs        verify 冒烟
 
 ### 右侧栏宽度
 
-官方 `DETAILS_MAX = 520`。`--fork-width` / `--fork-ui` 改成 1200，并记住拖拽宽度（`localStorage['dsh-explorer:details-width']`）。重建：
+官方 `DETAILS_MAX = 520`。`--fork-width` / `--fork-ui` 改成 1200。插件本身会把拖拽宽度记到 `localStorage['dsh-explorer:details-width']`，关掉再开右侧栏会恢复；没有宽度 fork 时仍被官方 520 卡住。重建：
 
 ```bash
 cd deepseek-harness

@@ -45,6 +45,44 @@ try {
     throw new Error(`host plugin inject must include webServer (got ${JSON.stringify(plugin.inject)})`)
   }
   ok(`host half: require("dsh-explorer") exposes { inject: [${plugin.inject.join(', ')}], apply }`)
+
+  const registered = []
+  const ctx = {
+    get(name) {
+      if (name === 'webServer') return { register: () => () => {} }
+      if (name === 'fs') return {}
+      if (name === 'shell') return {}
+      if (name === 'sessions') return { get: () => undefined }
+      if (name === 'settings') {
+        return {
+          register(ns, schema, options) {
+            registered.push({ ns, schema, options })
+            return { get: () => ({}), watch: () => () => {}, update: async () => {}, replace: async () => {} }
+          },
+        }
+      }
+      return undefined
+    },
+    inject(deps, callback) {
+      if (deps.includes('settings')) callback(ctx)
+      return () => {}
+    },
+    effect(cb) {
+      const d = cb()
+      return typeof d === 'function' ? d : () => {}
+    },
+    on() { return () => {} },
+  }
+  plugin.apply(ctx)
+  const ns = registered.find(row => row.ns === 'dsh-explorer')
+  if (ns === undefined) throw new Error('host apply did not settings.register("dsh-explorer")')
+  if (typeof ns.schema !== 'function') throw new Error('explorer settings schema is not callable')
+  if (typeof ns.schema.toJSON !== 'function') throw new Error('explorer settings schema missing toJSON')
+  const parsed = ns.schema({})
+  if (parsed.termTheme !== 'auto' || parsed.termFontSize !== 13) {
+    throw new Error(`schema defaults unexpected: ${JSON.stringify(parsed)}`)
+  }
+  ok('host half: settings.register("dsh-explorer") with callable schema')
 } catch (error) {
   fail('host half import', error)
 }
@@ -78,6 +116,54 @@ try {
   if (typeof pluginModule?.apply !== 'function') throw new Error('client module exposes no apply')
   if (!Array.isArray(pluginModule.inject)) throw new Error('client module exposes no inject array')
   ok(`browser half: factory evaluates and exports apply + inject (${pluginModule.inject.join(', ')})`)
+
+  function makeSlots() {
+    const specs = new Map()
+    const waiters = new Map()
+    const registers = []
+    return {
+      registers,
+      inject(name, cb) {
+        const list = waiters.get(name) ?? []
+        list.push(cb)
+        waiters.set(name, list)
+        if (specs.has(name)) cb()
+      },
+      register(options, component) {
+        const spec = specs.get(options.name)
+        if (!spec) throw new Error(`slot "${options.name}" is not declared`)
+        if (spec.kind === 'keyed' && options.key === undefined) {
+          throw new Error(`keyed slot "${options.name}" requires options.key`)
+        }
+        if (spec.kind === 'list' && options.id === undefined) {
+          throw new Error(`list slot "${options.name}" requires options.id`)
+        }
+        registers.push({ options, component })
+        return () => {}
+      },
+      declare(name, spec) {
+        specs.set(name, spec)
+        for (const cb of waiters.get(name) ?? []) cb()
+      },
+    }
+  }
+  const slots = makeSlots()
+  pluginModule.apply({
+    get: () => undefined,
+    effect: (cb) => {
+      const d = cb()
+      return typeof d === 'function' ? d : () => {}
+    },
+    slots,
+    sessions: {},
+    workspaces: { openPath: async () => {} },
+    layout: {},
+  })
+  slots.declare('settings.plugin.item', { kind: 'keyed', scope: 'root' })
+  const card = slots.registers.find(row => row.options.name === 'settings.plugin.item' && row.options.key === 'dsh-explorer')
+  if (card === undefined) throw new Error('missing settings.plugin.item key=dsh-explorer')
+  if (card.options.id !== 'dsh-explorer') throw new Error('settings.plugin.item should also carry id=dsh-explorer')
+  ok('settings slots: plugin.item card registers with key+id=dsh-explorer')
 } catch (error) {
   fail('browser half evaluation', error)
 }

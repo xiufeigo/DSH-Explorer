@@ -54,12 +54,29 @@ export interface ExplorerStore {
   setReviewMode(mode: ReviewMode): void
   setSummaryOn(on: boolean): void
   setSummaryFloat(open: boolean): void
+  /** 底部终端面板。 */
+  terminalOn: boolean
+  terminalHeight: number
+  setTerminalOn(on: boolean): void
+  setTerminalHeight(h: number): void
   patchTab(id: string, patch: Partial<FileTab>): void
   refreshTree(): void
   subscribe(listener: () => void): () => void
 }
 
 let tabCounter = 0
+const TERM_HEIGHT_KEY = 'dsh-explorer:term-height'
+
+function readTermHeight(): number {
+  try {
+    const raw = localStorage.getItem(TERM_HEIGHT_KEY)
+    const n = raw === null ? Number.NaN : Number(raw)
+    if (Number.isFinite(n)) return Math.min(560, Math.max(140, n))
+  } catch {
+    /* private mode */
+  }
+  return 240
+}
 
 export function createExplorerStore(): ExplorerStore {
   const listeners = new Set<() => void>()
@@ -74,6 +91,8 @@ export function createExplorerStore(): ExplorerStore {
     filesMode: false,
     summaryOn: false,
     summaryFloat: false,
+    terminalOn: false,
+    terminalHeight: readTermHeight(),
     reviewMode: 'git',
     subagentId: null,
     extraPages: [],
@@ -172,6 +191,18 @@ export function createExplorerStore(): ExplorerStore {
 
     setSummaryFloat(open) {
       this.summaryFloat = open
+      notify()
+    },
+
+    setTerminalOn(on) {
+      this.terminalOn = on
+      notify()
+    },
+
+    setTerminalHeight(h) {
+      const next = Math.min(560, Math.max(140, Math.round(h)))
+      this.terminalHeight = next
+      try { localStorage.setItem(TERM_HEIGHT_KEY, String(next)) } catch { /* ignore */ }
       notify()
     },
 
