@@ -1,6 +1,6 @@
 /**
- * 会话头部右上角：底部终端开关（Codex 同款底栏语义）。
- * 开合始终钉在 header.utilities；面板 portal 到对话列底部。
+ * Session-header control for the bottom terminal (Codex dock semantics).
+ * The toggle stays on header.utilities; the panel portals under the conversation.
  */
 
 import { IconPanelLeftOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -12,11 +12,11 @@ import { useExplorer, type ExplorerStore } from './store'
 
 export interface TerminalToggleProps {
   sessionId: string
-  explorer: { store: ExplorerStore }
+  store: ExplorerStore
 }
 
-export function TerminalToggle({ sessionId, explorer }: TerminalToggleProps): JSX.Element {
-  const store = useExplorer(explorer.store)
+export function TerminalToggle({ sessionId, store: storeHandle }: TerminalToggleProps): JSX.Element {
+  const store = useExplorer(storeHandle)
   const [host, setHost] = useState<HTMLElement | null>(null)
 
   useLayoutEffect(() => {

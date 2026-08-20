@@ -1,36 +1,16 @@
 /**
- * 对话列底部终端：标签页 + xterm。每个标签在当前会话 cwd 开一条 PTY。
- * 收起面板不断开进程；关掉标签才 terminate。
+ * Bottom-of-conversation terminal: tabs + xterm. Each tab opens a PTY in
+ * the current session cwd. Collapsing the panel keeps processes; closing
+ * a tab terminates it.
  */
 
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { IconFolderClose16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { rpc } from './rpc'
 import { getPrefs, resolveTermFont, resolveTermTheme, subscribePrefs, waitTermFont } from './prefs'
-import { useExplorer, type ExplorerStore } from './store'
-
-interface TermTab {
-  localId: string
-  ptyId: string | null
-  title: string
-  error: string | null
-}
-
-interface Bag { tabs: TermTab[]; active: string }
-
-const bags = new Map<string, Bag>()
-let seq = 0
-
-function bagFor(sessionId: string): Bag {
-  let bag = bags.get(sessionId)
-  if (bag === undefined) {
-    bag = { tabs: [], active: '' }
-    bags.set(sessionId, bag)
-  }
-  return bag
-}
+import { useExplorer, type ExplorerStore, type TermTab } from './store'
 
 function applyTermLook(term: Terminal, fit: FitAddon): void {
   const prefs = getPrefs()
@@ -186,20 +166,15 @@ function TermPane({ sessionId, tab, active, visible, height, onMeta }: {
 
 export function TerminalPanel({ sessionId, store }: { sessionId: string; store: ExplorerStore }): JSX.Element | null {
   useExplorer(store)
-  const [, bump] = useState(0)
   const drag = useRef<{ startY: number; startH: number } | null>(null)
-  const bag = bagFor(sessionId)
+  const bag = store.termBag(sessionId)
   const visible = store.terminalOn
-  const refresh = (): void => { bump(n => n + 1) }
 
   useEffect(() => {
     if (!visible) return
     if (bag.tabs.length > 0) return
-    const localId = `term-${++seq}`
-    bag.tabs = [{ localId, ptyId: null, title: '终端', error: null }]
-    bag.active = localId
-    refresh()
-  }, [visible, sessionId])
+    store.addTermTab(sessionId)
+  }, [visible, sessionId, bag.tabs.length, store])
 
   useEffect(() => {
     const onMove = (event: PointerEvent): void => {
@@ -217,20 +192,12 @@ export function TerminalPanel({ sessionId, store }: { sessionId: string; store: 
 
   if (!visible && bag.tabs.length === 0) return null
 
-  const addTab = (): void => {
-    const localId = `term-${++seq}`
-    bag.tabs = [...bag.tabs, { localId, ptyId: null, title: '终端', error: null }]
-    bag.active = localId
-    refresh()
-  }
+  const addTab = (): void => { store.addTermTab(sessionId) }
 
   const closeTab = (localId: string, event: { preventDefault(): void; stopPropagation(): void }): void => {
     event.preventDefault()
     event.stopPropagation()
-    bag.tabs = bag.tabs.filter(tab => tab.localId !== localId)
-    if (bag.active === localId) bag.active = bag.tabs[bag.tabs.length - 1]?.localId ?? ''
-    if (bag.tabs.length === 0) store.setTerminalOn(false)
-    refresh()
+    store.closeTermTab(sessionId, localId)
   }
 
   return (
@@ -254,7 +221,7 @@ export function TerminalPanel({ sessionId, store }: { sessionId: string; store: 
             className={`dshx-term-tab${bag.active === tab.localId ? ' on' : ''}`}
             aria-selected={bag.active === tab.localId}
             title={tab.title}
-            onClick={() => { bag.active = tab.localId; refresh() }}
+            onClick={() => { store.setTermActive(sessionId, tab.localId) }}
           >
             <IconFolderClose16 className="dshx-term-tab-icon" />
             <span className="dshx-term-tab-label">{tab.title}</span>
@@ -286,10 +253,11 @@ export function TerminalPanel({ sessionId, store }: { sessionId: string; store: 
             active={bag.active === tab.localId}
             visible={visible}
             height={store.terminalHeight}
-            onMeta={refresh}
+            onMeta={() => { store.touch() }}
           />
         ))}
       </div>
     </div>
   )
 }
+

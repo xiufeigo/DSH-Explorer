@@ -1,11 +1,9 @@
 /**
  * DSH-Explorer browser half — shared in-memory store.
- * One store instance per plugin apply, handed to the three registered
- * surfaces (right details panel, left sidebar browser, header toggle) via
- * their inject faces.
+ * One handle per plugin apply, shared across slot registrations.
  */
 
-import { useEffect, useReducer } from 'react'
+import { useSyncExternalStore } from 'react'
 
 export type ExplorerTabKind = 'edit' | 'preview'
 export type ExplorerPage = 'review' | 'context' | 'subagents' | 'sources'
@@ -26,13 +24,27 @@ export interface FileTab {
   error: string | null
 }
 
+export interface TermTab {
+  localId: string
+  ptyId: string | null
+  title: string
+  error: string | null
+}
+
+export interface TermBag {
+  tabs: TermTab[]
+  active: string
+}
+
 export interface ExplorerStore {
+  /** Bumped on every mutation; `useExplorer` snapshots this, not the handle. */
+  version: number
   panelOpen: boolean
-  /** 左侧栏文件模式：true 时文件树临时替换原生会话浏览区，离开即卸载恢复。 */
+  /** Left sidebar file mode: the file tree temporarily shadows the session list. */
   filesMode: boolean
-  /** 置顶摘要：宽栏钉住，窄栏收成按钮。 */
+  /** Pinned summary: stays docked on a wide column, collapses to a button when narrow. */
   summaryOn: boolean
-  /** 窄栏时摘要悬浮窗是否打开。 */
+  /** Floating summary window while the column is narrow. */
   summaryFloat: boolean
   reviewMode: ReviewMode
   subagentId: string | null
@@ -43,6 +55,8 @@ export interface ExplorerStore {
   tabs: FileTab[]
   /** Bumped to ask every file tree to reload its root listing. */
   treeTick: number
+  terminalOn: boolean
+  terminalHeight: number
   openTab(input: { sessionId: string; path: string; name: string; kind: ExplorerTabKind }): FileTab
   openPage(page: ExplorerPage, opts?: { reviewMode?: ReviewMode; subagentId?: string | null }): void
   closePage(page: ExplorerPage): void
@@ -54,11 +68,14 @@ export interface ExplorerStore {
   setReviewMode(mode: ReviewMode): void
   setSummaryOn(on: boolean): void
   setSummaryFloat(open: boolean): void
-  /** 底部终端面板。 */
-  terminalOn: boolean
-  terminalHeight: number
   setTerminalOn(on: boolean): void
   setTerminalHeight(h: number): void
+  termBag(sessionId: string): TermBag
+  addTermTab(sessionId: string): TermTab
+  closeTermTab(sessionId: string, localId: string): void
+  setTermActive(sessionId: string, localId: string): void
+  /** Re-render after in-place TermTab patches (pty id / title / error). */
+  touch(): void
   patchTab(id: string, patch: Partial<FileTab>): void
   refreshTree(): void
   subscribe(listener: () => void): () => void
@@ -80,13 +97,16 @@ function readTermHeight(): number {
 
 export function createExplorerStore(): ExplorerStore {
   const listeners = new Set<() => void>()
-  const state: { store: ExplorerStore | null } = { store: null }
+  const termBags = new Map<string, TermBag>()
+  let termSeq = 0
 
   const notify = (): void => {
+    store.version += 1
     for (const listener of listeners) listener()
   }
 
   const store: ExplorerStore = {
+    version: 0,
     panelOpen: false,
     filesMode: false,
     summaryOn: false,
@@ -206,6 +226,46 @@ export function createExplorerStore(): ExplorerStore {
       notify()
     },
 
+    termBag(sessionId) {
+      let bag = termBags.get(sessionId)
+      if (bag === undefined) {
+        bag = { tabs: [], active: '' }
+        termBags.set(sessionId, bag)
+      }
+      return bag
+    },
+
+    addTermTab(sessionId) {
+      const bag = this.termBag(sessionId)
+      const tab: TermTab = {
+        localId: `term-${++termSeq}`,
+        ptyId: null,
+        title: '终端',
+        error: null,
+      }
+      bag.tabs = [...bag.tabs, tab]
+      bag.active = tab.localId
+      notify()
+      return tab
+    },
+
+    closeTermTab(sessionId, localId) {
+      const bag = this.termBag(sessionId)
+      bag.tabs = bag.tabs.filter(tab => tab.localId !== localId)
+      if (bag.active === localId) bag.active = bag.tabs[bag.tabs.length - 1]?.localId ?? ''
+      if (bag.tabs.length === 0) this.terminalOn = false
+      notify()
+    },
+
+    setTermActive(sessionId, localId) {
+      this.termBag(sessionId).active = localId
+      notify()
+    },
+
+    touch() {
+      notify()
+    },
+
     patchTab(id, patch) {
       const tab = this.tabs.find(t => t.id === id)
       if (tab === undefined) return
@@ -224,13 +284,11 @@ export function createExplorerStore(): ExplorerStore {
     },
   }
 
-  state.store = store
   return store
 }
 
 /** Subscribe a component to every store change (small UI — full re-render is fine). */
 export function useExplorer(store: ExplorerStore): ExplorerStore {
-  const [, force] = useReducer((x: number) => x + 1, 0)
-  useEffect(() => store.subscribe(force), [store])
+  useSyncExternalStore(store.subscribe, () => store.version, () => store.version)
   return store
 }

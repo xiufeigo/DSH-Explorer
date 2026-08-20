@@ -1,6 +1,9 @@
 /**
- * 对话里点文件路径（Read / Write / Edit 行、收尾正文 mention）会走
- * workspaces.openPath → 系统默认应用。插件把它拦下来，改在右侧栏打开。
+ * Chat file-path clicks go through workspaces.openPath → OS default app.
+ * We intercept text files into the details panel, but keep the original
+ * opener for "open with default app" (and for binary extensions). Folders
+ * must not go through this path on Windows — Invoke-Item uses the folder's
+ * default app (often the IDE), not explorer.exe.
  */
 
 import { basename, openFileTab } from './rpc'
@@ -38,13 +41,40 @@ function shouldOpenInPanel(path: string): boolean {
   return !SKIP_EXT.test(trimmed)
 }
 
+/** Parent directory of a POSIX or Windows path (browser-safe, no node:path). */
+export function parentDir(path: string): string {
+  const trimmed = path.replace(/[\\/]+$/, '')
+  const sepIndex = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'))
+  if (sepIndex < 0) return trimmed
+  const parent = trimmed.slice(0, sepIndex)
+  if (/^[A-Za-z]:$/.test(parent)) return `${parent}\\`
+  return parent.length > 0 ? parent : trimmed
+}
+
+let hostOpenPath: ((path: string) => Promise<void>) | null = null
+
+/** Capture the platform opener before we wrap `workspaces.openPath`. */
+export function rememberHostOpenPath(workspaces: WorkspacesFace): void {
+  if (hostOpenPath === null) hostOpenPath = workspaces.openPath.bind(workspaces)
+}
+
+/** Open a path with the OS default handler (Explorer for a folder). */
+export async function openWithSystem(path: string): Promise<void> {
+  if (hostOpenPath === null) {
+    throw new Error('系统打开不可用（插件未完成初始化）')
+  }
+  await hostOpenPath(path)
+}
+
 export function installChatFileOpen(
   workspaces: WorkspacesFace,
   sessions: SessionsFace,
   layout: LayoutFace,
   store: ExplorerStore,
 ): () => void {
-  const original = workspaces.openPath.bind(workspaces)
+  rememberHostOpenPath(workspaces)
+  const original = hostOpenPath ?? workspaces.openPath.bind(workspaces)
+  hostOpenPath = original
   workspaces.openPath = async (path: string) => {
     if (!shouldOpenInPanel(path)) return original(path)
     const snap = sessions.list?.getSnapshot()

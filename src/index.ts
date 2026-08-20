@@ -13,7 +13,8 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { isAbsolute, relative, resolve as pathResolve } from 'node:path'
+import { dirname, isAbsolute, relative, resolve as pathResolve } from 'node:path'
+import { openOnDesktop } from './openNative'
 import { createPtyHub, gateExplorerRequest, type PtyHub, type SubprocessLike } from './pty'
 import { registerExplorerSettings } from './settingsNs'
 
@@ -368,6 +369,41 @@ async function fsWrite(sv: Services, cwd: string, args: Record<string, unknown>)
     return { ok: true }
   } catch (error) {
     return { ok: false, error: msg(error) }
+  }
+}
+
+function nativeFsPath(target: FsTargetLike): string {
+  if (typeof target.targetKey === 'string' && target.targetKey.length > 0) return target.targetKey
+  return target.displayPath
+}
+
+/** Open the containing folder in Explorer / Finder / the desktop file manager. */
+async function fsReveal(sv: Services, cwd: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const target = await resolveInside(sv, cwd, String(args.path ?? ''))
+  if ('error' in target) return { error: target.error }
+  const info = await sv.fs.stat(target)
+  const abs = nativeFsPath(target)
+  const folder = info?.type === 'directory' ? abs : dirname(abs)
+  if (folder.length === 0) return { error: '无法确定所在目录' }
+  try {
+    await openOnDesktop(folder, 'folder')
+    return { ok: true }
+  } catch (error) {
+    return { error: `无法打开资源管理器：${msg(error)}` }
+  }
+}
+
+/** Open the file with the OS default application (not the in-panel editor). */
+async function fsOpenExternal(sv: Services, cwd: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const target = await resolveInside(sv, cwd, String(args.path ?? ''))
+  if ('error' in target) return { error: target.error }
+  const info = await sv.fs.stat(target)
+  if (!info || info.type !== 'file') return { error: '不是普通文件' }
+  try {
+    await openOnDesktop(nativeFsPath(target), 'file')
+    return { ok: true }
+  } catch (error) {
+    return { error: `无法用默认程序打开：${msg(error)}` }
   }
 }
 
@@ -918,6 +954,10 @@ async function handleRpc(req: IncomingMessage, res: ServerResponse, sv: Services
         return sendJson(res, await fsRead(sv, cwd, args))
       case 'fs.write':
         return sendJson(res, await fsWrite(sv, cwd, { ...args, session }))
+      case 'fs.reveal':
+        return sendJson(res, await fsReveal(sv, cwd, args))
+      case 'fs.openExternal':
+        return sendJson(res, await fsOpenExternal(sv, cwd, args))
       case 'git.status':
         return sendJson(res, await gitStatus(sv, policy, cwd))
       case 'git.diff':
@@ -1090,11 +1130,12 @@ async function handlePtyStream(req: IncomingMessage, res: ServerResponse, sv: Se
 export { handleRpc }
 
 /**
- * 插件对象（带 inject）：webserver 行要等 webStartup 就绪，冷启动时本行
- * 若裸 apply 会先于它执行、拿不到 webServer 而静默丢路由 —— 因此把四个
- * 必需服务声明为硬依赖，行等待就绪后再 apply。
+ * Plugin object with hard inject: the webserver row waits for webStartup.
+ * A bare apply on cold start can run before webServer exists and silently
+ * drop the route. Declaring the four required services makes the row wait.
  */
 export default {
+  name: 'dsh-explorer',
   inject: ['webServer', 'fs', 'shell', 'sessions'],
   apply,
 }

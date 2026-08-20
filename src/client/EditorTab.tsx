@@ -2,8 +2,10 @@
  * 文件 tab 内容：查看（行号 / 高亮 / git 着色）与编辑、预览（Markdown / HTML）。
  */
 
+import { IconFolderOpen16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { CodeView, gitStats } from './CodeView'
+import { openWithSystem } from './chatFileOpen'
 import { renderMarkdown } from './Markdown'
 import { openFileTab, rpc } from './rpc'
 import type { ExplorerStore, FileTab } from './store'
@@ -18,6 +20,72 @@ function isHtml(name: string): boolean {
 
 function canPreview(name: string): boolean {
   return isMarkdown(name) || isHtml(name)
+}
+
+function FileDesktopActions({
+  sessionId, path, onError,
+}: {
+  sessionId: string
+  path: string
+  onError(message: string | null): void
+}): JSX.Element {
+  const [busy, setBusy] = useState<'reveal' | 'open' | null>(null)
+
+  const run = async (which: 'reveal' | 'open'): Promise<void> => {
+    setBusy(which)
+    onError(null)
+    try {
+      if (which === 'reveal') {
+        const res = await rpc(sessionId, 'fs.reveal', { path })
+        if (res.error !== undefined) {
+          const message = res.error.startsWith('未知方法')
+            ? '打开资源管理器需要重启 dsh web / 桌面壳（Host 还没有 fs.reveal）'
+            : res.error
+          console.error('dsh-explorer: fs.reveal failed', res.error)
+          onError(message)
+        }
+        return
+      }
+      try {
+        await openWithSystem(path)
+      } catch (error) {
+        const res = await rpc(sessionId, 'fs.openExternal', { path })
+        if (res.error === undefined) return
+        const detail = error instanceof Error ? error.message : String(error)
+        const message = res.error.startsWith('未知方法')
+          ? `打开失败：请重启 dsh web / 桌面壳后再试（${res.error}）`
+          : res.error
+        console.error('dsh-explorer: desktop open failed', { path, detail, rpc: res.error })
+        onError(message)
+      }
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        className="dshx-btn small"
+        disabled={busy !== null}
+        title="在文件资源管理器打开所在目录"
+        onClick={() => { void run('reveal') }}
+      >
+        <IconFolderOpen16 className="dshx-btn-glyph" />
+        在文件资源管理器打开
+      </button>
+      <button
+        type="button"
+        className="dshx-btn small"
+        disabled={busy !== null}
+        title="使用系统默认程序打开该文件"
+        onClick={() => { void run('open') }}
+      >
+        使用默认程序打开
+      </button>
+    </>
+  )
 }
 
 function EditPane({
@@ -85,6 +153,7 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
   const [mode, setMode] = useState<'view' | 'edit'>('view')
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
+  const [desktopError, setDesktopError] = useState<string | null>(null)
   const [patch, setPatch] = useState<string | null>(null)
   const [untracked, setUntracked] = useState(false)
   const loadedOnce = useRef(false)
@@ -103,6 +172,7 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
     setUntracked(false)
     setValue(tab.content)
     setSaveError(null)
+    setDesktopError(null)
   }, [tab.id])
 
   useEffect(() => {
@@ -162,28 +232,32 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
             {stats.deleted > 0 && <span className="del">−{stats.deleted}</span>}
           </span>
         )}
-        <button
-          className={`dshx-btn small${mode === 'view' ? ' on' : ''}`}
-          onClick={() => setMode('view')}
-        >
-          查看
-        </button>
-        <button
-          className={`dshx-btn small${mode === 'edit' ? ' on' : ''}`}
-          onClick={() => setMode('edit')}
-        >
-          编辑
-        </button>
-        {canPreview(tab.name) && (
-          <button className="dshx-btn small" onClick={preview} title="在右侧打开预览">预览</button>
-        )}
-        {(mode === 'edit' || tab.dirty) && (
-          <button className="dshx-btn small primary" disabled={saving || tab.loading} onClick={() => void save()}>
-            {saving ? '保存中…' : '保存 (Ctrl+S)'}
+        <div className="dshx-editor-actions">
+          <FileDesktopActions sessionId={sessionId} path={tab.path} onError={setDesktopError} />
+          <button
+            className={`dshx-btn small${mode === 'view' ? ' on' : ''}`}
+            onClick={() => setMode('view')}
+          >
+            查看
           </button>
-        )}
+          <button
+            className={`dshx-btn small${mode === 'edit' ? ' on' : ''}`}
+            onClick={() => setMode('edit')}
+          >
+            编辑
+          </button>
+          {canPreview(tab.name) && (
+            <button className="dshx-btn small" onClick={preview} title="在右侧打开预览">预览</button>
+          )}
+          {(mode === 'edit' || tab.dirty) && (
+            <button className="dshx-btn small primary" disabled={saving || tab.loading} onClick={() => void save()}>
+              {saving ? '保存中…' : '保存 (Ctrl+S)'}
+            </button>
+          )}
+        </div>
       </div>
       {saveError !== null && <div className="dshx-error" style={{ padding: 6, flex: 'none' }}>{saveError}</div>}
+      {desktopError !== null && <div className="dshx-error" style={{ padding: 6, flex: 'none' }}>{desktopError}</div>}
       {tab.error !== null && <div className="dshx-error" style={{ padding: 6, flex: 'none' }}>{tab.error}</div>}
       {tab.truncated && (
         <div className="dshx-muted" style={{ padding: '4px 10px', flex: 'none' }}>文件过大，仅显示已读入的部分</div>
@@ -209,6 +283,7 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
 
 export function PreviewTab({ tab, sessionId, store }: { tab: FileTab; sessionId: string; store: ExplorerStore }): JSX.Element {
   const [content, setContent] = useState(tab.content)
+  const [desktopError, setDesktopError] = useState<string | null>(null)
 
   useEffect(() => {
     if (!tab.loading) setContent(tab.content)
@@ -238,9 +313,13 @@ export function PreviewTab({ tab, sessionId, store }: { tab: FileTab; sessionId:
     <div className="dshx-editor">
       <div className="dshx-editor-toolbar">
         <span className="path">{tab.path}</span>
-        <button className="dshx-btn small" onClick={edit}>编辑</button>
-        <button className="dshx-btn small" onClick={reload}>重新加载</button>
+        <div className="dshx-editor-actions">
+          <FileDesktopActions sessionId={sessionId} path={tab.path} onError={setDesktopError} />
+          <button className="dshx-btn small" onClick={edit}>编辑</button>
+          <button className="dshx-btn small" onClick={reload}>重新加载</button>
+        </div>
       </div>
+      {desktopError !== null && <div className="dshx-error" style={{ padding: 6, flex: 'none' }}>{desktopError}</div>}
       {isMarkdown(tab.name)
         ? (
             <div

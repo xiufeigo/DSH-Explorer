@@ -1,12 +1,13 @@
 /**
- * 「工作区 | 文件」切换。
+ * Workspace | Files toggle.
  *
- * 优先画进工作区浏览头栏左侧（与搜索/筛选同一行）。
- * Web 的 fork 座位会多出一行，用锚点 CSS 藏掉；桌面/未 fork 只有
- * footer.action，也走同一个 portal，避免 tab 掉在设置按钮上面。
+ * Prefers the workspace browse header (same row as search / filter).
+ * The Web fork seat adds a placeholder row that CSS hides; Desktop / unforked
+ * builds only have footer.action, which uses the same portal so the tabs do
+ * not land above the settings button.
  *
- * 官方收起轨是 56px 图标列（搜索 / 新建工作区）。tab 只在宽栏出现；
- * 缩起来后卸掉 portal 和插入的 host，把头栏还给原生。
+ * The official collapsed rail is a 56px icon column. Tabs show only while
+ * the sidebar is wide; folding it removes the portal and injected host.
  */
 
 import { useLayoutEffect, useState } from 'react'
@@ -14,14 +15,12 @@ import { createPortal } from 'react-dom'
 import { useExplorer, type ExplorerStore } from './store'
 
 export interface FilesToggleProps {
-  /** 侧栏外壳 fold 状态：false = 56px 图标轨。 */
+  /** Sidebar shell fold: false = 56px icon rail. */
   wide?: boolean
-  explorer: {
-    store: ExplorerStore
-    toggle(): void
-    /** 顶部座位已激活时返回 true（底部回退按钮据此隐藏自己）。 */
-    hidden?: () => boolean
-  }
+  store: ExplorerStore
+  toggleFiles(): void
+  /** True while the top seat is active (footer fallback hides itself). */
+  filesToggleHidden?: () => boolean
 }
 
 function ModeTabs({ filesMode, onToggle }: { filesMode: boolean; onToggle(): void }): JSX.Element {
@@ -52,7 +51,7 @@ function ModeTabs({ filesMode, onToggle }: { filesMode: boolean; onToggle(): voi
   )
 }
 
-/** 文件面板自带挂载点；否则取原生浏览区头栏，并插入 host。 */
+/** File panel ships its own mount; otherwise take the native browse header. */
 function resolveTabsHost(): HTMLElement | null {
   const slot = document.querySelector('[data-dshx-tabs-slot]')
   if (slot instanceof HTMLElement) return slot
@@ -71,22 +70,22 @@ function resolveTabsHost(): HTMLElement | null {
   return host
 }
 
-/** 只卸插件插进原生头栏的 host，不动文件面板里 React 管的 slot。 */
+/** Drop only the host we injected into the native header, not the file-panel slot. */
 function removeInjectedTabsHost(): void {
   document.querySelectorAll('[data-dshx-tabs-host]').forEach((node) => {
     node.remove()
   })
 }
 
-export function FilesToggle({ explorer, wide = true }: FilesToggleProps): JSX.Element | null {
-  const store = useExplorer(explorer.store)
+export function FilesToggle({ store: storeHandle, toggleFiles, filesToggleHidden, wide = true }: FilesToggleProps): JSX.Element | null {
+  const store = useExplorer(storeHandle)
   const [host, setHost] = useState<HTMLElement | null>(null)
-  const isFooterFallback = explorer.hidden !== undefined
-  const hiddenByTopSeat = explorer.hidden?.() === true
+  const isFooterFallback = filesToggleHidden !== undefined
+  const hiddenByTopSeat = filesToggleHidden?.() === true
   const showTabs = wide && !hiddenByTopSeat
 
   useLayoutEffect(() => {
-    // 顶部座位活着时底部实例必须放手，不能把头顶栏的 host 拆掉。
+    // The footer instance must not tear down the header host while the top seat is live.
     if (hiddenByTopSeat) return
     if (!wide) {
       setHost(null)
@@ -113,7 +112,7 @@ export function FilesToggle({ explorer, wide = true }: FilesToggleProps): JSX.El
     return isFooterFallback ? null : <span className="dshx-sidebar-tabs-anchor" hidden />
   }
 
-  const tabs = <ModeTabs filesMode={store.filesMode} onToggle={explorer.toggle} />
+  const tabs = <ModeTabs filesMode={store.filesMode} onToggle={toggleFiles} />
 
   if (host !== null) {
     return (

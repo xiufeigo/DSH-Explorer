@@ -1,9 +1,11 @@
 /**
- * 左侧栏文件模式面板：由 apply 里的 activateFiles() 动态注册到
- * sidebar.workspaces（priority -10，临时遮蔽原生会话浏览器）；
- * 点头栏「工作区」tab 时 dispose 本条目，原生浏览器原样恢复。
+ * Left-sidebar file mode: apply's activateFiles() dynamically registers this
+ * on sidebar.workspaces (priority -10, temporarily shadows the native session
+ * browser). Clicking the header "Workspace" tab disposes the entry and the
+ * native browser returns unchanged.
  *
- * 头栏左侧是 FilesToggle 传送进来的「工作区 | 文件」；右侧只留刷新。
+ * FilesToggle portals Workspace | Files into the left of the header; the
+ * right side keeps only Refresh.
  */
 
 import { IconRefreshOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -35,15 +37,13 @@ export interface SidebarFilesProps {
   expandSidebar?: () => void
   useSessions: (selector: (state: ListStateLike) => unknown) => any
   useWorkspaces: (selector: (state: WorkspaceListLike) => unknown) => any
-  explorer: {
-    store: ExplorerStore
-    layout: { openDetails(): void }
-  }
+  store: ExplorerStore
+  openDetails(): void
 }
 
-export function SidebarFiles({ wide, useSessions, useWorkspaces, explorer }: SidebarFilesProps): JSX.Element | null {
-  useExplorer(explorer.store)
-  // 钩子必须在提前 return 之前调用（框架选择器钩子内部是 useSyncExternalStore）。
+export function SidebarFiles({ wide, useSessions, useWorkspaces, store, openDetails }: SidebarFilesProps): JSX.Element | null {
+  useExplorer(store)
+  // Hooks before any early return (the selector hooks wrap useSyncExternalStore).
   const list = (useSessions((state: ListStateLike) => state) as ListStateLike | undefined) ?? {}
   const workspaces = (useWorkspaces((state: WorkspaceListLike) => state) as WorkspaceListLike | undefined) ?? {}
 
@@ -65,7 +65,7 @@ export function SidebarFiles({ wide, useSessions, useWorkspaces, explorer }: Sid
     <div className="dshx-sidebar">
       <div className="dshx-sidebar-header">
         <div className="dshx-sidebar-tabs-slot" data-dshx-tabs-slot="" />
-        <button className="dshx-icon-btn" title="刷新文件树" onClick={() => explorer.store.refreshTree()}>
+        <button className="dshx-icon-btn" title="刷新文件树" onClick={() => store.refreshTree()}>
           <IconRefreshOutline16 />
         </button>
       </div>
@@ -73,10 +73,10 @@ export function SidebarFiles({ wide, useSessions, useWorkspaces, explorer }: Sid
         <FileTree
           cwd={cwd}
           sessionId={currentId}
-          store={explorer.store}
+          store={store}
           onOpenPanel={() => {
-            explorer.store.setPanelOpen(true)
-            explorer.layout.openDetails()
+            store.setPanelOpen(true)
+            openDetails()
           }}
         />
       </div>

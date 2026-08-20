@@ -1,6 +1,7 @@
 /**
- * 右侧栏：当前会话的子智能体列表；点进一条显示该子会话的对话内容。
- * 不调用 openSubagent，避免把中间主对话切走。
+ * Right-hand list of child agents for the current session. Clicking a row
+ * shows that child's transcript in this column — it does not call
+ * openSubagent, so the center conversation stays put.
  */
 
 import { useCallback, useEffect, useState } from 'react'
@@ -30,20 +31,16 @@ interface TranscriptMessage {
   seq: number
 }
 
-interface SessionsFace {
-  refreshSubagents?(id: string): Promise<void>
-  setSubagentCatalogOpen?(id: string, open: boolean): void
-}
-
 const PREVIEW = 4
 
 export function SubagentsView({
-  sessionId, store, useSessions, sessions,
+  sessionId, store, useSessions, refreshSubagents, setSubagentCatalogOpen,
 }: {
   sessionId: string
   store: ExplorerStore
   useSessions?: (selector: (state: any) => unknown) => any
-  sessions?: SessionsFace
+  refreshSubagents(id: string): void
+  setSubagentCatalogOpen(id: string, open: boolean): void
 }): JSX.Element {
   const explorer = useExplorer(store)
   const selected = explorer.subagentId
@@ -64,17 +61,17 @@ export function SubagentsView({
     : undefined
 
   useEffect(() => {
-    void sessions?.refreshSubagents?.(sessionId)
-    sessions?.setSubagentCatalogOpen?.(sessionId, true)
+    void refreshSubagents(sessionId)
+    setSubagentCatalogOpen(sessionId, true)
     void rpc<{ agents?: AgentRow[] }>(sessionId, 'session.subagents').then(res => {
       setHostAgents(res.agents ?? [])
     })
     const timer = setInterval(() => setNow(Date.now()), 1000)
     return () => {
       clearInterval(timer)
-      sessions?.setSubagentCatalogOpen?.(sessionId, false)
+      setSubagentCatalogOpen(sessionId, false)
     }
-  }, [sessionId, sessions])
+  }, [sessionId, refreshSubagents, setSubagentCatalogOpen])
 
   const catalogAgents: AgentRow[] = (catalog?.entries ?? [])
     .filter(entry => entry.kind === 'child' && typeof entry.id === 'string')

@@ -1,22 +1,13 @@
 /**
- * Codex 风格环境摘要：变更 / 分支 / 提交推送 / 子智能体 / 来源。
- * 不含「本地」。变更点击打开右侧审查；子智能体 / 来源打开对应侧栏页。
+ * Codex-style environment summary: changes / branch / commit-push / child
+ * agents / sources. No "local" row. Change counts open Review; child agents
+ * and sources open the matching details page.
  */
 
 import { useCallback, useEffect, useState } from 'react'
 import { agentHue } from './conversationHost'
 import { rpc, rpcWithSessionRetry } from './rpc'
 import type { ExplorerStore, ReviewMode } from './store'
-
-export interface LayoutFace {
-  openDetails(): void
-  closeDetails(): void
-}
-
-export interface SessionsFace {
-  refreshSubagents?(id: string): Promise<void>
-  setSubagentCatalogOpen?(id: string, open: boolean): void
-}
 
 export interface GitSummary {
   notRepo?: boolean
@@ -63,24 +54,25 @@ interface CatalogEntry {
 interface SummaryCardProps {
   sessionId: string
   store: ExplorerStore
-  layout: LayoutFace
-  sessions?: SessionsFace
+  openDetails(): void
+  refreshSubagents(id: string): void
+  setSubagentCatalogOpen(id: string, open: boolean): void
   useSessions?: (selector: (state: any) => unknown) => any
   onNavigate?: () => void
 }
 
 function openPage(
   store: ExplorerStore,
-  layout: LayoutFace,
+  openDetails: () => void,
   page: 'review' | 'subagents' | 'sources',
   opts?: { reviewMode?: ReviewMode; subagentId?: string | null },
 ): void {
   store.openPage(page, opts)
-  layout.openDetails()
+  openDetails()
 }
 
 export function SummaryCard({
-  sessionId, store, layout, sessions, useSessions, onNavigate,
+  sessionId, store, openDetails, refreshSubagents, setSubagentCatalogOpen, useSessions, onNavigate,
 }: SummaryCardProps): JSX.Element {
   const [git, setGit] = useState<GitSummary>({})
   const [sources, setSources] = useState<SourceGroup[]>([])
@@ -103,18 +95,18 @@ export function SummaryCard({
     void rpcWithSessionRetry<{ agents?: SubagentRow[] }>(sessionId, 'session.subagents').then(res => {
       setHostAgents(res.agents ?? [])
     })
-    void sessions?.refreshSubagents?.(sessionId)
-    sessions?.setSubagentCatalogOpen?.(sessionId, true)
-  }, [sessionId, sessions])
+    void refreshSubagents(sessionId)
+    setSubagentCatalogOpen(sessionId, true)
+  }, [sessionId, refreshSubagents, setSubagentCatalogOpen])
 
   useEffect(() => {
     load()
     const timer = setInterval(load, 8000)
     return () => {
       clearInterval(timer)
-      sessions?.setSubagentCatalogOpen?.(sessionId, false)
+      setSubagentCatalogOpen(sessionId, false)
     }
-  }, [load, sessionId, sessions])
+  }, [load, sessionId, setSubagentCatalogOpen])
 
   const catalogAgents: SubagentRow[] = (catalog?.entries ?? [])
     .filter(entry => entry.kind === 'child' && typeof entry.id === 'string')
@@ -132,7 +124,7 @@ export function SummaryCard({
   const deleted = git.deleted ?? 0
 
   const go = (page: 'review' | 'subagents' | 'sources', opts?: { reviewMode?: ReviewMode }): void => {
-    openPage(store, layout, page, opts)
+    openPage(store, openDetails, page, opts)
     onNavigate?.()
   }
 

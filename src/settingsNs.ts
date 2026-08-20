@@ -1,9 +1,14 @@
 /**
- * Host settings 命名空间。
+ * Host settings namespace.
  *
- * 「插件配置」keyed 座位只渲染 describe ∩ 已注册卡片 key 的交集。
- * 没在 Host `settings.register` 的 ns 不会出现在 describe 里，卡片派发不到。
- * 协议放行已注册的 kebab-case ns；字段值仍由浏览器 localStorage 持有。
+ * The plugin-config keyed seat only renders describe ∩ registered card keys.
+ * A namespace that never calls Host `settings.register` never appears in
+ * describe, so the card is never dispatched. The protocol admits a registered
+ * kebab-case ns; field values still live in browser localStorage.
+ *
+ * The schema is a callable Standard Schema (schemastery-shaped: `schema(input)`
+ * + `toJSON`) so `ctx.settings.register` can resolve and serialize it. We do
+ * not depend on `@deepseek-ai/schemastery` — that package is harness-vendored.
  */
 
 export const EXPLORER_SETTINGS_NS = 'dsh-explorer'
@@ -15,12 +20,21 @@ export interface ExplorerSettingsSection {
   termFontCustom: string
 }
 
-const THEMES = new Set(['auto', 'light', 'dark', 'slate', 'forest'])
-const FONTS = new Set(['ui', 'code', 'mono', 'custom'])
+const THEMES = ['auto', 'light', 'dark', 'slate', 'forest'] as const
+const FONTS = ['ui', 'code', 'mono', 'custom'] as const
+const THEME_SET = new Set<string>(THEMES)
+const FONT_SET = new Set<string>(FONTS)
+
+const DEFAULT_SECTION: ExplorerSettingsSection = {
+  termTheme: 'auto',
+  termFontSize: 13,
+  termFont: 'code',
+  termFontCustom: '',
+}
 
 function clipSize(n: unknown): number {
   const value = typeof n === 'number' ? n : Number(n)
-  if (!Number.isFinite(value)) return 13
+  if (!Number.isFinite(value)) return DEFAULT_SECTION.termFontSize
   return Math.min(22, Math.max(11, Math.round(value)))
 }
 
@@ -29,29 +43,43 @@ function parseSection(input: unknown): ExplorerSettingsSection {
   const theme = raw.termTheme
   const font = raw.termFont
   return {
-    termTheme: typeof theme === 'string' && THEMES.has(theme)
+    termTheme: typeof theme === 'string' && THEME_SET.has(theme)
       ? theme as ExplorerSettingsSection['termTheme']
-      : 'auto',
+      : DEFAULT_SECTION.termTheme,
     termFontSize: clipSize(raw.termFontSize),
-    termFont: typeof font === 'string' && FONTS.has(font)
+    termFont: typeof font === 'string' && FONT_SET.has(font)
       ? font as ExplorerSettingsSection['termFont']
-      : 'ui',
+      : DEFAULT_SECTION.termFont,
     termFontCustom: typeof raw.termFontCustom === 'string' ? raw.termFontCustom.slice(0, 120) : '',
   }
 }
 
+interface StandardResult { value: ExplorerSettingsSection }
+interface StandardSchema {
+  readonly version: 1
+  readonly vendor: 'dsh-explorer'
+  validate(value: unknown): StandardResult
+}
+
 /**
- * schemastery 形：可调用（resolve）+ `toJSON`（describe 序列化）。
- * 不依赖 `@deepseek-ai/schemastery` 包，Host 侧照样能 register。
+ * Callable schema + `toJSON` + Standard Schema (`~standard`), matching what
+ * Host `settings.register` / `describe` invoke. Values are not persisted here.
  */
 export const explorerSettingsSchema = Object.assign(parseSection, {
+  '~standard': {
+    version: 1 as const,
+    vendor: 'dsh-explorer' as const,
+    validate(value: unknown): StandardResult {
+      return { value: parseSection(value) }
+    },
+  } satisfies StandardSchema,
   toJSON: () => ({
     type: 'object',
     properties: {
-      termTheme: { type: 'string' },
-      termFontSize: { type: 'number' },
-      termFont: { type: 'string' },
-      termFontCustom: { type: 'string' },
+      termTheme: { type: 'string', enum: [...THEMES], default: DEFAULT_SECTION.termTheme },
+      termFontSize: { type: 'number', default: DEFAULT_SECTION.termFontSize },
+      termFont: { type: 'string', enum: [...FONTS], default: DEFAULT_SECTION.termFont },
+      termFontCustom: { type: 'string', default: DEFAULT_SECTION.termFontCustom },
     },
   }),
 })
@@ -65,7 +93,7 @@ interface SettingsOwner {
   inject?(deps: string[], callback: (owner: { get(name: string): unknown }) => void): unknown
 }
 
-/** settings 服务就绪后注册 ns；没有该服务时整插件照常工作。 */
+/** Register the ns once `settings` is up; the rest of the plugin still runs without it. */
 export function registerExplorerSettings(ctx: SettingsOwner): void {
   const attach = (owner: { get(name: string): unknown }): void => {
     const settings = owner.get('settings') as SettingsLike | undefined
@@ -73,7 +101,7 @@ export function registerExplorerSettings(ctx: SettingsOwner): void {
     try {
       settings.register(EXPLORER_SETTINGS_NS, explorerSettingsSchema, { applies: 'live' })
     } catch (error) {
-      console.error('dsh-explorer: settings.register 失败', error)
+      console.error('dsh-explorer: settings.register failed', error)
     }
   }
   if (typeof ctx.inject === 'function') {

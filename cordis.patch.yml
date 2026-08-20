@@ -1,0 +1,9 @@
+# DSH-Explorer bundle layer. `dsh plugin add` applies this when the profile
+# lists the package; `scripts/install.mjs` still writes the same row into the
+# profile patch for the existing junction-based install.
+
+- insert:
+    # Dual-face plugin: Host registers POST /dsh-explorer/rpc and /pty; the
+    # browser half is scanned from package.json `dsh.client`.
+    - id: dsh-explorer
+      name: dsh-explorer

@@ -1,10 +1,9 @@
-# DSH-Explorer 安装示例：把下面这段并入 profile 的 cordis.patch.yml
-# （%DSH_HOME%\profiles\<profile>\cordis.patch.yml）。该文件是顶层 YAML 数组，
-# 若已存在其它条目，把这里的 insert 列表追加进去即可。
+# Same insert as cordis.patch.yml — copy into a profile's cordis.patch.yml
+# only when installing by hand. Prefer `dsh plugin add` (reads dsh.bundle) or
+# `pnpm plugin:install` (junction shortcut).
 
 - insert:
-    # DSH-Explorer：OpenCode 风格文件树 / 编辑 / 预览 / 审查 / 上下文 / ToDo。
-    # 双面插件：Host 半边注册 POST /dsh-explorer/rpc；浏览器半边经
-    # package.json 的 dsh.client 声明由模块表扫描加载。
+    # Dual-face plugin: Host registers POST /dsh-explorer/rpc and /pty; the
+    # browser half is scanned from package.json `dsh.client`.
     - id: dsh-explorer
       name: dsh-explorer

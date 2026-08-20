@@ -1,6 +1,7 @@
 /**
- * 设置 → 插件配置 里的 DSH-Explorer 卡片。
- * 自绘卡片，不依赖官方 PluginCard（那是另一个包，不在模块表里）。
+ * DSH-Explorer card on Settings → Plugins.
+ * Hand-drawn; does not import official PluginCard (that package is not
+ * on the module table). Prefs still live in localStorage and apply live.
  */
 
 import { useEffect, useReducer, useState } from 'react'

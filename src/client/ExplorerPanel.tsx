@@ -1,10 +1,8 @@
 /**
- * 右侧 Explorer 面板：嵌入式渲染（官方 details 列内）。
- * 列宽由官方布局驱动（带宽度记忆 fork，可拖 300–1200px）。
- * 开合按钮在会话头部 utilities，不在本面板 tab 栏。
- * 面板内嵌 0 高探针用 ResizeObserver 同步真实开合状态到 store，
- * 无论面板是被头部按钮、文件树点击还是官方流程（点击工具调用）打开的，
- * store.panelOpen 始终准确。
+ * Right-hand Explorer panel, embedded in the official details column.
+ * Column width is owned by the host layout (with the width-memory wrap).
+ * The open/close control lives in header utilities, not this tab bar.
+ * A zero-height probe keeps store.panelOpen in sync with the real column.
  */
 
 import { useLayoutEffect, useRef } from 'react'
@@ -14,6 +12,7 @@ import { ReviewView } from './ReviewView'
 import { SourcesView } from './SourcesView'
 import { SubagentsView } from './SubagentsView'
 import { useExplorer, type ExplorerPage, type ExplorerStore } from './store'
+import type { CatalogActions } from './faces'
 
 export interface LayoutFace {
   openDetails(): void
@@ -30,7 +29,9 @@ export interface ExplorerPanelProps {
   sessionId: string
   useProjection?: (key: string) => any
   useSessions?: (selector: (state: any) => unknown) => any
-  explorer: { store: ExplorerStore; layout: LayoutFace; sessions?: SessionsFace }
+  store: ExplorerStore
+  refreshSubagents: CatalogActions['refreshSubagents']
+  setSubagentCatalogOpen: CatalogActions['setSubagentCatalogOpen']
 }
 
 const PAGE_LABEL: Record<ExplorerPage, string> = {
@@ -40,15 +41,18 @@ const PAGE_LABEL: Record<ExplorerPage, string> = {
   sources: '来源',
 }
 
-export function ExplorerPanel({ sessionId, useProjection, useSessions, explorer }: ExplorerPanelProps): JSX.Element {
-  const store = useExplorer(explorer.store)
+export function ExplorerPanel({
+  sessionId, useProjection, useSessions, store: storeHandle, refreshSubagents, setSubagentCatalogOpen,
+}: ExplorerPanelProps): JSX.Element {
+  const store = useExplorer(storeHandle)
   const active = store.active
   const activeTab = store.tabs.find(tab => tab.id === active)
   const probeRef = useRef<HTMLDivElement | null>(null)
 
-  // 开合状态同步：details 列宽度 >0 即视为打开（无论谁打开的）。
-  // 必须 debounce：宿主 grid 过渡期间宽度每帧变化，若立刻 setPanelOpen
-  // 会和点击态打架，并把审查 diff 整树重绘叠在过渡上，右侧栏必卡。
+  // Sync open state: details column width > 0 means open, whoever opened it.
+  // Debounce is required: during the host grid transition the width changes
+  // every frame, and an immediate setPanelOpen fights the click and stacks a
+  // full review-diff rerender on the transition.
   useLayoutEffect(() => {
     const probe = probeRef.current
     if (probe === null || typeof ResizeObserver === 'undefined') return
@@ -71,7 +75,7 @@ export function ExplorerPanel({ sessionId, useProjection, useSessions, explorer 
 
   return (
     <div className="dshx-root">
-      {/* 列宽探针：0 高、满宽，仅在列开合时触发 ResizeObserver。 */}
+      {/* Column-width probe: zero height, full width; ResizeObserver only. */}
       <div ref={probeRef} style={{ width: '100%', height: 0 }} aria-hidden />
 
       <div className="dshx-tabbar">
@@ -146,7 +150,7 @@ export function ExplorerPanel({ sessionId, useProjection, useSessions, explorer 
       </div>
 
       <div className="dshx-page" hidden={active !== 'review'} aria-hidden={active !== 'review'}>
-        <ReviewView sessionId={sessionId} store={explorer.store} visible={active === 'review'} />
+        <ReviewView sessionId={sessionId} store={storeHandle} visible={active === 'review'} />
       </div>
       {active === 'context' && <ContextView sessionId={sessionId} useProjection={useProjection} />}
       {active === 'subagents' && (
@@ -154,7 +158,8 @@ export function ExplorerPanel({ sessionId, useProjection, useSessions, explorer 
           sessionId={sessionId}
           store={store}
           useSessions={useSessions}
-          sessions={explorer.sessions}
+          refreshSubagents={refreshSubagents}
+          setSubagentCatalogOpen={setSubagentCatalogOpen}
         />
       )}
       {active === 'sources' && <SourcesView sessionId={sessionId} />}

@@ -61,6 +61,14 @@ pnpm plugin:install --fork-ui       # 额外：放宽右侧栏宽度 + 工作区
 
 然后 **重启 `dsh web`**（Host 半边只有重启才会加载），再刷新页面。
 
+包已声明 `dsh.bundle`（[`cordis.patch.yml`](./cordis.patch.yml)）。也可以走官方安装：
+
+```powershell
+dsh plugin --profile web add <本仓库路径>
+```
+
+这会把包写进 profile 的 `dsh.profile.bundles`。`pnpm plugin:install` 仍是本机捷径：junction + 直接写 profile 的 `cordis.patch.yml` 行，不必经过 `dsh plugin add`。
+
 应能看到：左侧 **[工作区 | 文件]**、会话头 **摘要 / 终端 / 面板**、对话左侧消息大纲、右侧 **审查 / 上下文**。
 
 常用参数：`--profile <name>`（默认 `web`）、`--harness <path>`、`--rebuild`、`--dry-run`。
@@ -96,7 +104,8 @@ pnpm run verify      # 冒烟：按运行时方式真正执行两个 bundle
 
 - Host：按 cordis Loader 的方式 `require('dsh-explorer')`，断言带 `inject` 的插件对象；
 - 浏览器：模拟 `window.__ModuleLoader__.load`，注入真实 React 后执行工厂；
-- 顺带抽测 RPC 跨站闸（同源 OPTIONS、跨源拒绝、无自定义头 POST 拒绝）。
+- 顺带抽测 RPC 跨站闸（同源 OPTIONS、跨源拒绝、无自定义头 POST 拒绝）；
+- 断言 `dsh.bundle.patch` 与客户端工厂内联了 `.dshx-root` 样式（不能再 `require` 独立 CSS 文件）。
 
 客户端 bundle 的 `exports` 垫片写在 tsdown `banner` 里（`intro` 会被静默丢掉）。缺这一步时浏览器会 `exports is not defined`，整页 Failed to load plugins，所以发版前务必 `verify`。
 
@@ -105,15 +114,18 @@ pnpm run verify      # 冒烟：按运行时方式真正执行两个 bundle
 ```
 src/index.ts             Host：POST /dsh-explorer/rpc
 src/pty.ts               Host：会话 cwd 里的用户 PTY（/dsh-explorer/pty 流）
-src/client/index.tsx     浏览器：插槽注册（右侧栏 / 侧栏 tab / 头部 utilities）
-src/client/…             审查、摘要、文件树、编辑器、子智能体、来源
+src/settingsNs.ts        Host：schemastery 形 schema（值仍走浏览器 localStorage）
+src/client/index.tsx     浏览器：apply 里建 store，插槽只注入句柄和回调
+src/client/explorer.module.css  全局 `dshx-*` 样式（打进 client 工厂的 style 标签）
+src/client/…             审查、摘要、文件树、编辑器、子智能体、来源、终端
 lib/index.js             Host bundle
 lib/client.js            浏览器 bundle（window.__ModuleLoader__ 工厂）
-scripts/install.mjs      安装器
+cordis.patch.yml         `dsh.bundle` 层：插入 id/name `dsh-explorer`
+scripts/install.mjs      安装器（junction 捷径）
 scripts/smoke.mjs        verify 冒烟
 ```
 
-浏览器半边经 `package.json` 的 `dsh.client` 由模块表扫描加载；Host 半边靠 profile 的 `cordis.patch.yml` 插入行（示例见 [`cordis.patch.example.yml`](./cordis.patch.example.yml)）。
+浏览器半边经 `package.json` 的 `dsh.client` 由模块表扫描加载；Host 半边靠 `dsh.bundle.patch` 指向的 [`cordis.patch.yml`](./cordis.patch.yml)（`dsh plugin add` 会把本包列入 `dsh.profile.bundles`）。`pnpm plugin:install` 仍会把同一行写进 profile 的 patch。手册示例见 [`cordis.patch.example.yml`](./cordis.patch.example.yml)。
 
 ### 插槽
 
@@ -132,6 +144,7 @@ scripts/smoke.mjs        verify 冒烟
 | 方法 | 作用 |
 | --- | --- |
 | `fs.list` / `fs.read` / `fs.write` | 会话 cwd 内的树与读写 |
+| `fs.reveal` / `fs.openExternal` | 用资源管理器打开所在目录；用系统默认程序打开文件 |
 | `git.status` / `git.diff` / `git.fileDiff` | 状态、变更文件列表、按文件懒加载 patch |
 | `git.branch` / `git.lastRound` | 相对基准分支的差异；上一回合冻结快照 |
 | `git.summary` / `git.checkout` / `git.commit` / `git.push` | 摘要卡片上的分支与提交 |

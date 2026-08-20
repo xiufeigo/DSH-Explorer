@@ -1,20 +1,25 @@
 /**
- * 会话头部右上角：置顶摘要开关。
- * 中栏能放下消息列+卡片时钉在对话右侧，点窗外不收；
- * 不够宽（含右侧栏拉开后）收成按钮，点开是悬浮窗，点窗外 / Esc 收起。
+ * Session-header pinned-summary toggle.
+ * When the center column can fit the message list plus the card, the summary
+ * docks to the right of the conversation and an outside click does not dismiss
+ * it. When the column is too narrow (including after details opens), it
+ * collapses to a button; the float closes on outside click or Escape.
  */
 
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { canPinSummary, conversationScroll, ensureHost } from './conversationHost'
 import { IconSummary16 } from './headerIcons'
-import { SummaryCard, type LayoutFace, type SessionsFace } from './SummaryCard'
+import { SummaryCard } from './SummaryCard'
 import { useExplorer, type ExplorerStore } from './store'
 
 export interface SummaryToggleProps {
   sessionId: string
   useSessions?: (selector: (state: any) => unknown) => any
-  explorer: { store: ExplorerStore; layout: LayoutFace; sessions?: SessionsFace }
+  store: ExplorerStore
+  openDetails(): void
+  refreshSubagents(id: string): void
+  setSubagentCatalogOpen(id: string, open: boolean): void
 }
 
 function eventInsideSummary(event: Event, btn: HTMLElement | null): boolean {
@@ -25,8 +30,10 @@ function eventInsideSummary(event: Event, btn: HTMLElement | null): boolean {
   return node.closest('.dshx-summary, .dshx-summary-float, .dshx-summary-pin') !== null
 }
 
-export function SummaryToggle({ sessionId, useSessions, explorer }: SummaryToggleProps): JSX.Element {
-  const store = useExplorer(explorer.store)
+export function SummaryToggle({
+  sessionId, useSessions, store: storeHandle, openDetails, refreshSubagents, setSubagentCatalogOpen,
+}: SummaryToggleProps): JSX.Element {
+  const store = useExplorer(storeHandle)
   const btnRef = useRef<HTMLButtonElement>(null)
   const floatRef = useRef<HTMLDivElement>(null)
   const wasWide = useRef(false)
@@ -117,8 +124,9 @@ export function SummaryToggle({ sessionId, useSessions, explorer }: SummaryToggl
     <SummaryCard
       sessionId={sessionId}
       store={store}
-      layout={explorer.layout}
-      sessions={explorer.sessions}
+      openDetails={openDetails}
+      refreshSubagents={refreshSubagents}
+      setSubagentCatalogOpen={setSubagentCatalogOpen}
       useSessions={useSessions}
       onNavigate={() => { if (!wide) store.setSummaryFloat(false) }}
     />

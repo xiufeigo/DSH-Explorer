@@ -29,6 +29,16 @@ const fail = (label, error) => {
 }
 const ok = label => console.log(`✔ ${label}`)
 
+try {
+  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+  if (pkg.dsh?.bundle?.patch !== './cordis.patch.yml') {
+    throw new Error(`package.json dsh.bundle.patch unexpected: ${JSON.stringify(pkg.dsh?.bundle)}`)
+  }
+  ok('package.json declares dsh.bundle.patch = ./cordis.patch.yml')
+} catch (error) {
+  fail('dsh.bundle manifest', error)
+}
+
 // ── 1. Host half ──────────────────────────────────────────────────────────
 try {
   const entry = require('dsh-explorer')
@@ -40,6 +50,9 @@ try {
   const plugin = entry.default
   if (typeof plugin !== 'object' || plugin === null || typeof plugin.apply !== 'function') {
     throw new Error('host default export must be a plugin object with apply')
+  }
+  if (plugin.name !== 'dsh-explorer') {
+    throw new Error(`host plugin name must be dsh-explorer (got ${JSON.stringify(plugin.name)})`)
   }
   if (!Array.isArray(plugin.inject) || !plugin.inject.includes('webServer')) {
     throw new Error(`host plugin inject must include webServer (got ${JSON.stringify(plugin.inject)})`)
@@ -79,8 +92,11 @@ try {
   if (typeof ns.schema !== 'function') throw new Error('explorer settings schema is not callable')
   if (typeof ns.schema.toJSON !== 'function') throw new Error('explorer settings schema missing toJSON')
   const parsed = ns.schema({})
-  if (parsed.termTheme !== 'auto' || parsed.termFontSize !== 13) {
+  if (parsed.termTheme !== 'auto' || parsed.termFontSize !== 13 || parsed.termFont !== 'code') {
     throw new Error(`schema defaults unexpected: ${JSON.stringify(parsed)}`)
+  }
+  if (ns.schema['~standard']?.vendor !== 'dsh-explorer' || typeof ns.schema['~standard']?.validate !== 'function') {
+    throw new Error('explorer settings schema missing Standard Schema ~standard')
   }
   ok('host half: settings.register("dsh-explorer") with callable schema')
 } catch (error) {
@@ -90,6 +106,16 @@ try {
 // ── 2. Browser half ────────────────────────────────────────────────────────
 try {
   const code = readFileSync(join(root, 'lib', 'client.js'), 'utf8')
+  if (!code.includes('.dshx-root')) {
+    throw new Error('client bundle did not inline explorer CSS (.dshx-root missing)')
+  }
+  if (!code.includes('dataset.plugin')) {
+    throw new Error('client bundle did not stamp style[data-plugin] for unload')
+  }
+  if (/require\([^)]*\.css/.test(code)) {
+    throw new Error('client bundle still requires a CSS file; the module table cannot serve it')
+  }
+  ok('browser half: explorer CSS inlined into the factory')
   let captured = null
   globalThis.window = {
     __ModuleLoader__: {
@@ -116,6 +142,18 @@ try {
   if (typeof pluginModule?.apply !== 'function') throw new Error('client module exposes no apply')
   if (!Array.isArray(pluginModule.inject)) throw new Error('client module exposes no inject array')
   ok(`browser half: factory evaluates and exports apply + inject (${pluginModule.inject.join(', ')})`)
+  if (typeof pluginModule.parentDir !== 'function') throw new Error('client module exposes no parentDir')
+  const parentCases = [
+    ['C:\\sensorsdata\\main\\program\\DSH-Explorer\\cordis.patch.example.yml', 'C:\\sensorsdata\\main\\program\\DSH-Explorer'],
+    ['C:\\foo\\bar\\', 'C:\\foo'],
+    ['C:\\foo', 'C:\\'],
+    ['/tmp/a/b.txt', '/tmp/a'],
+  ]
+  for (const [input, expected] of parentCases) {
+    const got = pluginModule.parentDir(input)
+    if (got !== expected) throw new Error(`parentDir(${JSON.stringify(input)}) => ${JSON.stringify(got)}, expected ${JSON.stringify(expected)}`)
+  }
+  ok('browser half: parentDir handles Windows and POSIX paths')
 
   function makeSlots() {
     const specs = new Map()
