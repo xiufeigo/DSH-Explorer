@@ -528,7 +528,7 @@ div:has(> [data-slot="sidebar.footer.action"]):not(:has(button)):not(:has(a)):no
     height 200ms cubic-bezier(0.22, 1, 0.36, 1),
     opacity 200ms ease;
 }
-.dshx-msg-tick.on .dshx-msg-tick-bar,
+.dshx-msg-tick.hot .dshx-msg-tick-bar,
 .dshx-msg-tick:hover .dshx-msg-tick-bar {
   height: 2px; opacity: 0.92;
 }

@@ -1,6 +1,6 @@
 /**
- * 中栏左侧会话大纲：贴对话列左缘，刻度左对齐（变长往右长），簇在可视区域垂直居中。
- * 悬停弹出 Codex 风格卡片（标题 / 摘要 / 已处理时长），点击跳转对应气泡。
+ * Conversation outline on the left of the chat column.
+ * Ticks are equal length at rest and only grow under the pointer (or its hover card).
  */
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
@@ -34,7 +34,6 @@ interface RailItem {
   body: string
   durationMs: number | null
   running: boolean
-  tick: number
 }
 
 interface HoverState {
@@ -79,22 +78,9 @@ function splitCopy(text: string): { title: string; body: string } {
   return { title: clip(compact, 48), body: compact.slice(48).trim() }
 }
 
-function tickWidth(text: string): number {
-  const n = text.length
-  if (n < 24) return 8
-  if (n < 80) return 10
-  if (n < 180) return 12
-  return 14
-}
-
-/** Codex 式鱼眼：焦点拉最长，邻近 1～3 格跟着鼓一点。 */
-function tickBoost(distance: number): number {
-  if (distance === 0) return 20
-  if (distance === 1) return 9
-  if (distance === 2) return 5
-  if (distance === 3) return 2
-  return 0
-}
+/** Resting tick ≈ half of the old shortest (8px) bar. Hover is the only grow. */
+const TICK_IDLE = 4
+const TICK_HOVER = 24
 
 function collectItems(chat: ChatSnapshotLike): RailItem[] {
   const order = chat.order ?? []
@@ -144,7 +130,6 @@ function collectItems(chat: ChatSnapshotLike): RailItem[] {
       body,
       durationMs,
       running: sawAssistant === false && durationMs === null,
-      tick: tickWidth(user.text),
     }
   })
 }
@@ -231,28 +216,24 @@ export function MessageRail({ sessionId, useSession }: MessageRailProps): JSX.El
   }
 
   const hovered = hover === null ? undefined : items.find(item => item.key === hover.key)
-  const focusKey = hover?.key ?? active
-  const focusIndex = focusKey === null ? -1 : items.findIndex(item => item.key === focusKey)
 
   const rail = (
     <nav className="dshx-msg-rail" aria-label="会话消息大纲">
       {items.map((item, index) => {
-        const on = focusKey === item.key
-        const width = item.tick + (focusIndex < 0 ? 0 : tickBoost(Math.abs(index - focusIndex)))
+        const hot = hover?.key === item.key
+        const width = hot ? TICK_HOVER : TICK_IDLE
         return (
           <button
             key={item.key}
             type="button"
-            className={`dshx-msg-tick${on ? ' on' : ''}`}
+            className={`dshx-msg-tick${hot ? ' hot' : ''}`}
+            aria-current={active === item.key ? 'true' : undefined}
             aria-label={`第 ${index + 1} 条：${item.title}`}
             onMouseEnter={event => openHover(item.key, event.currentTarget)}
             onMouseLeave={scheduleLeave}
             onFocus={event => openHover(item.key, event.currentTarget)}
             onBlur={scheduleLeave}
-            onClick={() => {
-              setHover(null)
-              scrollToChatKey(item.key)
-            }}
+            onClick={() => { scrollToChatKey(item.key) }}
           >
             <span className="dshx-msg-tick-bar" style={{ width }} />
           </button>
