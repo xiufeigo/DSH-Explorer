@@ -113,6 +113,7 @@ pnpm run verify      # 冒烟：按运行时方式真正执行两个 bundle
 
 ```
 src/index.ts             Host：POST /dsh-explorer/rpc
+src/payloadFork.ts       Host：载荷自愈钩子（启动时补桌面壳 ui-layout 宽度钳制）
 src/pty.ts               Host：会话 cwd 里的用户 PTY（/dsh-explorer/pty 流）
 src/settingsNs.ts        Host：schemastery 形 schema（值仍走浏览器 localStorage）
 src/client/index.tsx     浏览器：apply 里建 store，插槽只注入句柄和回调
@@ -168,7 +169,19 @@ pnpm --filter @deepseek-ai/dsh-client-ui-layout run bundle
 
 实际宽度仍受让步链约束（中心列 ≥ 640px），1920 屏 + 280 侧栏大约能拖到 ~1000px。
 
-**DSH Desktop**：吃的是 npm `@deepseek-ai/dsh` 载荷，不是本机 harness 工作树。`--fork-width` 对已装的桌面壳无效。桌面壳自己在 `DSH-Desktop/crates/dsh-gui/src/titlebar.js` 里改 `clampWidth(..., 300, 520)`。本仓库不要去改 Desktop 的 `@deepseek-ai/*`。
+**DSH Desktop**：吃的是 npm `@deepseek-ai/dsh` 载荷，不是本机 harness 工作树。`--fork-width` 对已装的桌面壳无效。桌面壳 titlebar.js 里的运行时改写也不可靠：client-modules 系统启动时用 `target.load = …` 原地接管队列 loader，注入的模块加载包装会被冲掉，动态加载的 ui-layout 走不到改写。真正兜底的是下面的**载荷自愈钩子**。
+
+### 载荷自愈钩子（桌面壳更新后自动重打）
+
+`src/payloadFork.ts` 挂在插件启动上：dsh-explorer 的 host 半边在 `dsh web` / 桌面壳进程里 apply 时，趁页面还没拉任何客户端 bundle，直接把磁盘上 `@deepseek-ai/dsh-client-ui-layout/lib/client.js` 里的 `clampWidth(…, 300, 520)` 两处点位改成 `300, 1200`。服务器按内容哈希生成 bundle rev，所以重启桌面壳（或 `dsh web`）后刷新页面即可生效。
+
+- **幂等**：文件尾有 `dsh-explorer payload fork` 标记就跳过；找不到 520 点位（源码 fork 已在、上游改形）也只记录不写。
+- **可回退**：首补时留 `client.js.dshx-orig` 原始备份；卸载插件后可手工还原。
+- **不阻塞**：定位 / 读写任何一步失败都只打日志（`[dsh-explorer:payload-fork]`），插件照常加载。
+- **可扩展**：`ForkSpec` 结构（定位 + 文本重写），以后要补 ui-sidebar 动作条座位之类再加一条。
+- 定位顺序：`DSH_EXPLORER_PAYLOAD_ROOT`（分号分隔多个根）→ `DSH_PAYLOAD_DIR`（桌面壳自己的覆盖变量）→ `require.resolve`（沿 CLI 入口）→ 从 cwd / argv / execPath 向上爬 `node_modules`。
+
+`pnpm run verify` 的 smoke 里有整条路径的用例（补丁 / 幂等 / 跳过 / 缺载荷）。
 
 ### 工作区顶部动作条
 

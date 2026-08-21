@@ -15,6 +15,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { dirname, isAbsolute, relative, resolve as pathResolve } from 'node:path'
 import { openOnDesktop } from './openNative'
+import { runPayloadForkOnce, type PayloadForkStatus } from './payloadFork'
 import { createPtyHub, gateExplorerRequest, type PtyHub, type SubprocessLike } from './pty'
 import { registerExplorerSettings } from './settingsNs'
 
@@ -1030,6 +1031,21 @@ async function handleRpc(req: IncomingMessage, res: ServerResponse, sv: Services
 
 // ── 插件入口 ───────────────────────────────────────────────────────────────
 
+/** 载荷自愈钩子的结果只进日志：patched / already 是好事，其余给原因。 */
+function reportPayloadFork(status: PayloadForkStatus | undefined): void {
+  if (status === undefined) return
+  const tag = '[dsh-explorer:payload-fork]'
+  if (status.status === 'patched') {
+    console.log(`${tag} 已补 ${status.sites} 处右侧栏宽度钳制 → ${status.path}（原始备份 .dshx-orig，刷新页面生效）`)
+  } else if (status.status === 'already') {
+    console.log(`${tag} 载荷补丁已在位：${status.path}`)
+  } else if (status.status === 'missing') {
+    console.log(`${tag} 跳过：${status.reason}`)
+  } else {
+    console.warn(`${tag} ${status.status}：${status.path ?? ''} ${status.reason ?? ''}`)
+  }
+}
+
 export function apply(ctx: ExplorerContext): void {
   const webServer = ctx.get('webServer') as WebServerService | undefined
   const fs = ctx.get('fs') as FsService | undefined
@@ -1038,6 +1054,10 @@ export function apply(ctx: ExplorerContext): void {
   // 这些服务已通过插件对象上的 inject 声明为硬依赖（冷启动时行会等到
   // webserver 等就绪后才 apply）；此处检查仅为类型收窄。
   if (webServer === undefined || fs === undefined || shell === undefined || sessions === undefined) return
+
+  // 载荷自愈钩子（见 src/payloadFork.ts）：趁页面还没拉客户端 bundle，
+  // 先把桌面载荷里被更新覆盖掉的右侧栏宽度钳制补回来。失败只记日志。
+  reportPayloadFork(runPayloadForkOnce())
 
   registerExplorerSettings(ctx)
 
@@ -1128,6 +1148,9 @@ async function handlePtyStream(req: IncomingMessage, res: ServerResponse, sv: Se
 }
 
 export { handleRpc }
+
+// 载荷自愈钩子的公开面：smoke / 排查脚本直接从包根取用。
+export { applyPayloadFork, FORK_MARKER, locateLayoutBundle, rewriteClampSites } from './payloadFork'
 
 /**
  * Plugin object with hard inject: the webserver row waits for webStartup.

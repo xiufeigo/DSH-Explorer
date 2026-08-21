@@ -269,4 +269,92 @@ try {
   process.exit(1)
 }
 
+// ── 4. 载荷自愈钩子（src/payloadFork.ts） ─────────────────────────────────
+// 纯内存 IO 直测三条路径：补丁写入（含备份与原子换名）、幂等跳过、
+// 无点位跳过；再验证 rewriteClampSites 对已 fork 源码返回 null。
+try {
+  const { applyPayloadFork, FORK_MARKER, rewriteClampSites } = require('dsh-explorer')
+
+  const UPSTREAM = [
+    'setDetails: (d, px) => { d.details = clampWidth(px, 300, 520); },',
+    'const d0 = details === 0 ? 0 : clampWidth(details, 300, 520);',
+  ].join('\n')
+
+  {
+    const rewritten = rewriteClampSites(UPSTREAM, 1200)
+    if (rewritten === null) throw new Error('upstream source should produce a rewrite')
+    if (rewritten.sites !== 2) throw new Error(`expected 2 clamp sites, got ${rewritten.sites}`)
+    if (!rewritten.text.includes('clampWidth(px, 300, 1200)')) throw new Error('drag site not raised to 1200')
+    if (!rewritten.text.includes('clampWidth(details, 300, 1200)')) throw new Error('computeColumns site not raised to 1200')
+    if (!rewritten.text.includes(FORK_MARKER)) throw new Error('marker not appended')
+    ok('payload fork: rewrite raises both clamp sites to 1200 and stamps the marker')
+  }
+  {
+    const once = rewriteClampSites(UPSTREAM, 1200)
+    const already = rewriteClampSites(once.text, 1200)
+    if (already !== null) throw new Error('forked source should yield null (no 520 sites left)')
+    ok('payload fork: already-forked source is detected as no-op')
+  }
+
+  function makeIo(files) {
+    const io = {
+      exists: path => Object.prototype.hasOwnProperty.call(files, path),
+      read: path => {
+        if (!(path in files)) throw new Error(`ENOENT: ${path}`)
+        return files[path]
+      },
+      write: (path, text) => { files[path] = text },
+      rename: (from, to) => {
+        if (!(from in files)) throw new Error(`ENOENT: ${from}`)
+        files[to] = files[from]
+        delete files[from]
+      },
+      files,
+    }
+    return io
+  }
+  const { join } = require('node:path')
+  const APP_ROOT = 'C:\\fake\\payload\\app'
+  const BUNDLE = join(APP_ROOT, 'node_modules', '@deepseek-ai', 'dsh-client-ui-layout', 'lib', 'client.js')
+  const BASES = [APP_ROOT]
+
+  {
+    const files = { [BUNDLE]: UPSTREAM }
+    const status = applyPayloadFork({ bases: BASES, io: makeIo(files) })
+    if (status.status !== 'patched' || status.sites !== 2) throw new Error(`expected patched(2), got ${JSON.stringify(status)}`)
+    const patchedText = files[BUNDLE]
+    if (!patchedText.includes('clampWidth(px, 300, 1200)')) throw new Error('bundle not rewritten on disk')
+    const backupPath = `${BUNDLE}.dshx-orig`
+    if (files[backupPath] !== UPSTREAM) throw new Error('original backup missing or wrong')
+    if (files[`${BUNDLE}.dshx-tmp`] !== undefined) throw new Error('temp file leaked after rename')
+    ok('payload fork: startup hook patches the bundle, backs up the original, cleans the temp file')
+  }
+  {
+    const files = { [BUNDLE]: `${UPSTREAM}\n${FORK_MARKER}\n` }
+    const status = applyPayloadFork({ bases: BASES, io: makeIo(files) })
+    if (status.status !== 'already') throw new Error(`expected already, got ${JSON.stringify(status)}`)
+    ok('payload fork: second run is idempotent (marker short-circuits)')
+  }
+  {
+    const files = { [BUNDLE]: 'export const DETAILS_MAX = 520 // upstream changed shape' }
+    const status = applyPayloadFork({ bases: BASES, io: makeIo(files) })
+    if (status.status !== 'skipped') throw new Error(`expected skipped, got ${JSON.stringify(status)}`)
+    if (files[BUNDLE] !== 'export const DETAILS_MAX = 520 // upstream changed shape') throw new Error('skipped run must not write')
+    ok('payload fork: unmatched bundle shape is skipped without writing')
+  }
+  {
+    const status = applyPayloadFork({ bases: ['C:/definitely/missing'], io: makeIo({}) })
+    if (status.status !== 'missing') throw new Error(`expected missing, got ${JSON.stringify(status)}`)
+    ok('payload fork: absent payload reports missing instead of throwing')
+  }
+} catch (error) {
+  fail('payload fork checks', error)
+  process.exit(1)
+}
+
+if (failures > 0) {
+  console.error(`\n${failures} check(s) failed`)
+  process.exit(1)
+}
+
 console.log('\nAll smoke checks passed.')
