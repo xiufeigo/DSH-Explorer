@@ -5,13 +5,15 @@
  * A zero-height probe keeps store.panelOpen in sync with the real column.
  */
 
-import { useLayoutEffect, useRef } from 'react'
+import { useLayoutEffect, useEffect, useRef } from 'react'
 import { ContextView } from './ContextView'
 import { EditorTab, PreviewTab } from './EditorTab'
 import { ReviewView } from './ReviewView'
 import { SourcesView } from './SourcesView'
 import { SubagentsView } from './SubagentsView'
-import { useExplorer, type ExplorerPage, type ExplorerStore } from './store'
+import { readPanelIntent, useExplorer, type ExplorerPage, type ExplorerStore } from './store'
+import { closeNarrowOverlay, narrowNow } from './narrowPanel'
+import { getAttachedPanelActions, maybePersistObservedWidth, readDetailsWidth } from './detailsWidth'
 import type { CatalogActions } from './faces'
 
 export interface LayoutFace {
@@ -32,6 +34,8 @@ export interface ExplorerPanelProps {
   store: ExplorerStore
   refreshSubagents: CatalogActions['refreshSubagents']
   setSubagentCatalogOpen: CatalogActions['setSubagentCatalogOpen']
+  /** 宿主的开列动作：会话切换后按用户意图自动恢复右栏。 */
+  openDetails?: () => void
 }
 
 const PAGE_LABEL: Record<ExplorerPage, string> = {
@@ -41,26 +45,108 @@ const PAGE_LABEL: Record<ExplorerPage, string> = {
   sources: '来源',
 }
 
+const PAGE_IDS: ReadonlySet<string> = new Set(Object.keys(PAGE_LABEL))
+
 export function ExplorerPanel({
-  sessionId, useProjection, useSessions, store: storeHandle, refreshSubagents, setSubagentCatalogOpen,
+  sessionId, useProjection, useSessions, store: storeHandle, refreshSubagents, setSubagentCatalogOpen, openDetails,
 }: ExplorerPanelProps): JSX.Element {
   const store = useExplorer(storeHandle)
-  const active = store.active
-  const activeTab = store.tabs.find(tab => tab.id === active)
+
+  // 右栏状态按会话隔离：本会话自己的 tab 列表和激活项；其他会话打开的
+  // 文件互不可见，切回来各自恢复。
+  const sessionTabs = store.sessionTabs(sessionId)
+  let active = store.activeFor(sessionId)
+  if (!PAGE_IDS.has(active) && !sessionTabs.some(tab => tab.id === active)) {
+    active = store.defaultActive // 记录指向了别的会话的 tab / 已删除
+  }
+  const activeTab = sessionTabs.find(tab => tab.id === active)
   const probeRef = useRef<HTMLDivElement | null>(null)
+
+  // 本会话挂载即回报，store 里所有「当前会话」语义（意图写入等）以它为准。
+  useEffect(() => {
+    store.noteSession(sessionId)
+  }, [sessionId, store])
+
+  // 会话切换：宿主 AppFrame 在切会话时无条件 closeDetails()（布局偏好被清
+  // 零）。只有「这个会话」之前被用户显式打开过才恢复：rAF 后（宿主的关闭
+  // 已落定）显式 openDetails 并把记忆宽度直接写入 store——不做探针测量、
+  // 不开长定时器，最多 3 次轻量重试兜底宿主异步时序。
+  const restoredFor = useRef<string | null>(null)
+  useEffect(() => {
+    if (openDetails === undefined) return
+    if (restoredFor.current === sessionId) return
+    restoredFor.current = sessionId
+    if (!readPanelIntent(sessionId)) return
+    let attempt = 0
+    let cancelled = false
+    const timers: number[] = []
+    // 宿主可能在会话选择器异步提交后才补一刀 closeDetails，两档轻量重试兜住
+    const DELAYS = [400, 1000]
+    const restore = (): void => {
+      if (cancelled) return
+      if (store.overlayOpen || narrowNow()) return
+      const probe = probeRef.current
+      // 已经足够宽就不动它（避免在过渡中追加写入引起抖动）
+      if (probe !== null && probe.offsetWidth >= 40) {
+        if (attempt < DELAYS.length) timers.push(window.setTimeout(restore, DELAYS[attempt]))
+        attempt += 1
+        return
+      }
+      const actions = getAttachedPanelActions()
+      const saved = readDetailsWidth()
+      if (
+        actions !== null && typeof actions.openDetails === 'function' &&
+        typeof actions.setDetails === 'function' && saved !== undefined
+      ) {
+        actions.openDetails()
+        actions.setDetails(saved) // 直接写偏好，最终渲染宽度一定是记忆值
+      } else {
+        openDetails() // 兜底：actions 还没挂上时的普通打开
+      }
+      if (attempt < DELAYS.length) timers.push(window.setTimeout(restore, DELAYS[attempt]))
+      attempt += 1
+    }
+    // 双 rAF：确保本轮提交（含宿主的 closeDetails）完全落定之后再写。
+    let raf2 = 0
+    const raf1 = window.requestAnimationFrame(() => { raf2 = window.requestAnimationFrame(restore) })
+    return () => {
+      cancelled = true
+      window.cancelAnimationFrame(raf1)
+      if (raf2 !== 0) window.cancelAnimationFrame(raf2)
+      for (const timer of timers) window.clearTimeout(timer)
+    }
+  }, [sessionId, openDetails, store])
 
   // Sync open state: details column width > 0 means open, whoever opened it.
   // Debounce is required: during the host grid transition the width changes
   // every frame, and an immediate setPanelOpen fights the click and stacks a
   // full review-diff rerender on the transition.
+  // Narrow overlay mode: the column is styled full-width by CSS while the
+  // overlay marker is set, so the probe measure stays valid there too; but
+  // while narrow WITHOUT the marker the official chain pins width to 0 and the
+  // probe must not flip panelOpen around the user's explicit toggle.
   useLayoutEffect(() => {
     const probe = probeRef.current
     if (probe === null || typeof ResizeObserver === 'undefined') return
     let timer = 0
+    let persistTimer = 0
     const sync = (): void => {
       timer = 0
-      const open = probe.offsetWidth > 4
+      // 官方在窄屏下无条件把 details 列压成 0；这不是用户关闭面板，不能
+      // 用它覆盖缩窄前的 panelOpen 状态，否则断点迁移无法判断是否应替换会话。
+      if (store.overlayOpen || narrowNow()) return
+      const width = probe.offsetWidth
+      const open = width > 4
       if (open !== store.panelOpen) store.setPanelOpen(open)
+      // 观测式宽度记忆：稳定 350ms 后落盘（拖拽路径不经任何包装 actions，
+      // 实测是唯一可靠来源；过渡中的中间值靠 settle 窗口过滤）。
+      if (open && width >= 40) {
+        if (persistTimer !== 0) window.clearTimeout(persistTimer)
+        persistTimer = window.setTimeout(() => {
+          persistTimer = 0
+          maybePersistObservedWidth(probe.offsetWidth)
+        }, 350)
+      }
     }
     const observer = new ResizeObserver(() => {
       if (timer !== 0) window.clearTimeout(timer)
@@ -70,6 +156,7 @@ export function ExplorerPanel({
     return () => {
       observer.disconnect()
       if (timer !== 0) window.clearTimeout(timer)
+      if (persistTimer !== 0) window.clearTimeout(persistTimer)
     }
   }, [store])
 
@@ -79,6 +166,18 @@ export function ExplorerPanel({
       <div ref={probeRef} style={{ width: '100%', height: 0 }} aria-hidden />
 
       <div className="dshx-tabbar">
+        {store.overlayOpen && (
+          <button
+            type="button"
+            className="dshx-overlay-close"
+            onClick={() => { closeNarrowOverlay(store, sessionId) }}
+            title="返回会话"
+            aria-label="返回会话"
+          >
+            <span aria-hidden>◀</span>
+            返回
+          </button>
+        )}
         <button
           className={`dshx-tab ${active === 'review' ? 'active' : ''}`}
           onClick={() => store.activate('review')}
@@ -118,7 +217,7 @@ export function ExplorerPanel({
             </span>
           </button>
         ))}
-        {store.tabs.map(tab => (
+        {sessionTabs.map(tab => (
           <button
             key={tab.id}
             className={`dshx-tab ${active === tab.id ? 'active' : ''}`}

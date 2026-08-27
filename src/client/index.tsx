@@ -29,10 +29,30 @@ import { installDetailsWidthMemory } from './detailsWidth'
 import { createExplorerStore, type ExplorerStore } from './store'
 import { injectStyles } from './styles'
 import { installChatFileOpen, rememberHostOpenPath } from './chatFileOpen'
+import { installNarrowOverlay, overlayAwareOpenDetails } from './narrowPanel'
+import { installWorkspaceRecencyOrder } from './workspaceRecencyOrder'
 
 interface SlotsLike {
   inject(name: string, callback: () => unknown): void
   register(options: Record<string, unknown>, component: (props: any) => unknown): unknown
+}
+
+/** 性能诊断：把 >250ms 的长任务打到 console。只读观测，随时可删。 */
+function installLongTaskProbe(): void {
+  if (typeof window === 'undefined' || typeof PerformanceObserver === 'undefined') return
+  const w = window as unknown as { __dshxLongTask?: boolean }
+  if (w.__dshxLongTask === true) return
+  w.__dshxLongTask = true
+  try {
+    const observer = new PerformanceObserver(list => {
+      for (const item of list.getEntries()) {
+        if (item.duration > 250) {
+          console.warn(`[dsh-explorer] 长任务 ${Math.round(item.duration)}ms —— 若切会话仍卡，这就是元凶`, item)
+        }
+      }
+    })
+    observer.observe({ entryTypes: ['longtask'] })
+  } catch { /* 内核不支持就静默 */ }
 }
 
 interface ExplorerClientContext {
@@ -48,21 +68,37 @@ interface ExplorerClientContext {
 export const inject = ['slots', 'sessions', 'workspaces', 'layout']
 export const name = 'dsh-explorer'
 export { parentDir } from './chatFileOpen'
+// 诊断/测试出口：冒烟脚本用假服务直测排序模块。
+export { installWorkspaceRecencyOrder } from './workspaceRecencyOrder'
 
 export function apply(ctx: ExplorerClientContext): void {
   // Wrap attachPanels before the first paint so reopening details restores width.
   installDetailsWidthMemory(ctx.layout)
+  installLongTaskProbe()
   if (typeof document !== 'undefined') {
     ctx.effect(() => injectStyles(), 'dsh-explorer: styles')
   }
 
   const store: ExplorerStore = createExplorerStore()
   const layout = layoutActions(ctx.layout)
+  // 窄屏下所有「打开右侧栏」入口统一替换主会话区域。
+  layout.openDetails = overlayAwareOpenDetails(layout.openDetails, store)
   const catalog = catalogActions(ctx.sessions)
   rememberHostOpenPath(ctx.workspaces as never)
   ctx.effect(
-    () => installChatFileOpen(ctx.workspaces as never, ctx.sessions as never, ctx.layout, store),
+    () => installNarrowOverlay(store, () => ctx.layout.openDetails()),
+    'dsh-explorer: narrow overlay',
+  )
+  ctx.effect(
+    () => installChatFileOpen(ctx.workspaces as never, ctx.sessions as never, { ...ctx.layout, openDetails: layout.openDetails }, store),
     'dsh-explorer: chat file open',
+  )
+  ctx.effect(
+    () => installWorkspaceRecencyOrder({
+      sessions: ctx.sessions as never,
+      workspaces: ctx.workspaces as never,
+    }),
+    'dsh-explorer: workspace recency order',
   )
   let fileTreeEntry: (() => void) | null = null
 
@@ -96,7 +132,7 @@ export function apply(ctx: ExplorerClientContext): void {
     {
       name: 'details',
       priority: -10,
-      inject: () => ({ store, ...catalog }),
+      inject: () => ({ store, ...catalog, openDetails: layout.openDetails }),
     },
     ExplorerPanel as never,
   ))

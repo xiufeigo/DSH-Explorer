@@ -11,7 +11,7 @@ import { createPortal } from 'react-dom'
 import { canPinSummary, conversationScroll, ensureHost } from './conversationHost'
 import { IconSummary16 } from './headerIcons'
 import { SummaryCard } from './SummaryCard'
-import { useExplorer, type ExplorerStore } from './store'
+import { useSessionHint, useExplorer, type ExplorerStore } from './store'
 
 export interface SummaryToggleProps {
   sessionId: string
@@ -34,6 +34,9 @@ export function SummaryToggle({
   sessionId, useSessions, store: storeHandle, openDetails, refreshSubagents, setSubagentCatalogOpen,
 }: SummaryToggleProps): JSX.Element {
   const store = useExplorer(storeHandle)
+  // 右栏关闭时 ExplorerPanel 不挂载；这里持续回报当前会话，
+  // 保证面板开合的按会话记忆写对目标。
+  useSessionHint(store, sessionId)
   const btnRef = useRef<HTMLButtonElement>(null)
   const floatRef = useRef<HTMLDivElement>(null)
   const wasWide = useRef(false)

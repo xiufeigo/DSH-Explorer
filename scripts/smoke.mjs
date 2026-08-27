@@ -352,6 +352,170 @@ try {
   process.exit(1)
 }
 
+// ── 5. 工作区按会话时间排序（workspaceRecencyOrder） ──────────────────────
+// 假 store + 假 insertBefore（按宿主 DOM-insertBefore 语义搬数组），
+// 验证：基线就绪后按会话 updatedAt 降序排到位、幂等不再动、无会话回退 createdAt。
+try {
+  const code5 = readFileSync(join(root, 'lib', 'client.js'), 'utf8')
+  let captured5 = null
+  globalThis.window = { __ModuleLoader__: { load(entry) { captured5 = entry } } }
+  // bundle 顶层有 CSS 注入器（querySelector→createElement→head.appendChild），桩要够用。
+  globalThis.document = {
+    addEventListener() {},
+    removeEventListener() {},
+    querySelector: () => null,
+    createElement: () => ({ dataset: {} }),
+    head: { appendChild() {} },
+  }
+  new Function(code5)()
+  const browserRequire = (specifier) => {
+    if (specifier === 'react') return require('react')
+    if (specifier === 'react/jsx-runtime') return require('react/jsx-runtime')
+    if (specifier === 'react-dom') return require('react-dom')
+    if (specifier === '@deepseek-ai/dsh-client-ui-primitives') return new Proxy({}, { get: () => () => null })
+    throw new Error(`unexpected external require: ${specifier}`)
+  }
+  const { installWorkspaceRecencyOrder } = captured5.factory(browserRequire)
+  if (typeof installWorkspaceRecencyOrder !== 'function') throw new Error('installWorkspaceRecencyOrder not exported')
+
+  const makeStore = (initial) => {
+    let state = initial
+    const listeners = new Set()
+    return {
+      getSnapshot: () => state,
+      set(next) { state = next; for (const listener of [...listeners]) listener() },
+      subscribe(listener) { listeners.add(listener); return () => { listeners.delete(listener) } },
+    }
+  }
+  const NOW = Date.now()
+  const DAY = 86400_000
+  const sessions = makeStore({
+    phase: 'pending',
+    byId: {
+      's-old': { updatedAt: NOW - 5 * DAY },
+      's-mid': { updatedAt: NOW - DAY },
+      's-new': { updatedAt: NOW - 60_000 },
+    },
+  })
+  const items = [
+    { workspaceId: 'w-old', sessionIds: ['s-old'], createdAt: new Date(NOW - 9 * DAY).toISOString() },
+    { workspaceId: 'w-mid', sessionIds: ['s-mid'], createdAt: new Date(NOW - 2 * DAY).toISOString() },
+    { workspaceId: 'w-new', sessionIds: [], createdAt: new Date(NOW - 3600_000).toISOString() },
+    { workspaceId: 'w-active', sessionIds: ['s-new'], createdAt: new Date(NOW - 30 * DAY).toISOString() },
+  ]
+  const workspaces = makeStore({ phase: 'pending', items })
+  const moves = []
+  let current = items
+  const insertBefore = async (id, before) => {
+    const ids = current.map(row => row.workspaceId)
+    const next = ids.filter(existing => existing !== id)
+    const at = before === undefined ? next.length : next.indexOf(before)
+    if (at < 0) throw new Error(`unknown anchor ${JSON.stringify(before)}`)
+    next.splice(at, 0, id)
+    current = next.map(key => items.find(row => row.workspaceId === key))
+    workspaces.set({ phase: 'ready', items: current })
+    moves.push([id, before])
+  }
+  const dispose = installWorkspaceRecencyOrder({ sessions: { list: sessions }, workspaces: { list: workspaces, insertBefore } })
+
+  // 基线就绪 → 去抖 400ms 后应把顺序排成 recency 降序。
+  sessions.set({ ...sessions.getSnapshot(), phase: 'ready' })
+  workspaces.set({ phase: 'ready', items })
+  await new Promise(resolve => setTimeout(resolve, 1000))
+  const orderAfter = current.map(row => row.workspaceId).join(',')
+  if (orderAfter !== 'w-active,w-new,w-mid,w-old') {
+    throw new Error(`recency order unexpected: ${orderAfter} (moves: ${JSON.stringify(moves)})`)
+  }
+  if (moves.length === 0) throw new Error('no insertBefore calls were issued')
+  ok(`recency order: baselines ready → sorted by last-session time (${moves.length} move(s))`)
+
+  // 幂等：再等一轮不应有任何新动作。
+  const movesBeforeIdle = moves.length
+  await new Promise(resolve => setTimeout(resolve, 800))
+  if (moves.length !== movesBeforeIdle) throw new Error(`order oscillated: ${JSON.stringify(moves)}`)
+  ok('recency order: stable when nothing changed (idempotent)')
+
+  dispose()
+
+  // ── 守卫 facade 复刻：runner 给动态插件的服务都包一层方法转发 Proxy ──
+  // 这里复刻 dsh-cordis-client-runner guardedService 的关键语义（方法转发、
+  // 非函数属性原样透传），证明排序模块在真实 ctx.facade 下同样工作。
+  const guardedService = (service) => new Proxy(service, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop, target)
+      if (typeof value !== 'function') return value
+      return (...args) => Reflect.apply(value, target, args)
+    },
+  })
+  moves.length = 0
+  current = [...items].sort(() => -1) // 故意打乱初始顺序
+  current = items // 修正为原始（创建序）排列，等待重排
+  const workspaces2 = makeStore({ phase: 'ready', items })
+  const sessions2 = makeStore({ phase: 'ready', byId: sessions.getSnapshot().byId })
+  const insertBefore2 = async (id, before) => {
+    const ids = current.map(row => row.workspaceId)
+    const next = ids.filter(existing => existing !== id)
+    const at = next.indexOf(before)
+    if (at < 0) throw new Error(`unknown anchor ${JSON.stringify(before)}`)
+    next.splice(at, 0, id)
+    current = next.map(key => items.find(row => row.workspaceId === key))
+    workspaces2.set({ phase: 'ready', items: current })
+    moves.push([id, before])
+  }
+  const dispose2 = installWorkspaceRecencyOrder({
+    sessions: guardedService({ list: sessions2 }),
+    workspaces: guardedService({ list: workspaces2, insertBefore: insertBefore2 }),
+  })
+  await new Promise(resolve => setTimeout(resolve, 1000))
+  const orderGuarded = current.map(row => row.workspaceId).join(',')
+  if (orderGuarded !== 'w-active,w-new,w-mid,w-old') {
+    throw new Error(`guarded facade order unexpected: ${orderGuarded} (moves: ${JSON.stringify(moves)})`)
+  }
+  ok(`recency order: works through runner-style guarded service facade (${moves.length} move(s))`)
+  dispose2()
+
+  // ── 回归：宿主服务是类实例，insertBefore 是原型方法。模块提取方法后若不
+  // 绑回接收者，严格模式 this=undefined → `reading 'manager'`（线上踩过）。
+  class FakeManager {
+    constructor(onMove) { this.onMove = onMove }
+    async insertBefore(id, before) { return this.onMove(id, before) }
+  }
+  class FakeWorkspacesService {
+    constructor(store, onMove) { this.list = store; this.manager = new FakeManager(onMove) }
+    async insertBefore(id, before) {
+      const result = await this.manager.insertBefore(id, before)
+      if (!result.ok) throw new Error(`workspace reorder failed: ${result.error?.message ?? 'unknown'}`)
+    }
+  }
+  moves.length = 0
+  let current3 = items
+  const workspaces3 = makeStore({ phase: 'ready', items })
+  const sessions3 = makeStore({ phase: 'ready', byId: sessions.getSnapshot().byId })
+  const service3 = new FakeWorkspacesService(workspaces3, (id, before) => {
+    const ids = current3.map(row => row.workspaceId)
+    const next = ids.filter(existing => existing !== id)
+    const at = next.indexOf(before)
+    if (at < 0) return { ok: false, error: { message: 'unknown anchor' } }
+    next.splice(at, 0, id)
+    current3 = next.map(key => items.find(row => row.workspaceId === key))
+    workspaces3.set({ phase: 'ready', items: current3 })
+    moves.push([id, before])
+    return { ok: true }
+  })
+  const dispose3 = installWorkspaceRecencyOrder({ sessions: { list: sessions3 }, workspaces: service3 })
+  await new Promise(resolve => setTimeout(resolve, 1000))
+  const orderProto = current3.map(row => row.workspaceId).join(',')
+  if (orderProto !== 'w-active,w-new,w-mid,w-old' || moves.length === 0) {
+    throw new Error(`prototype-method service order unexpected: ${orderProto} (moves: ${JSON.stringify(moves)})`)
+  }
+  ok(`recency order: prototype service method stays bound (this-safe call, ${moves.length} move(s))`)
+  dispose3()
+  delete globalThis.document
+} catch (error) {
+  fail('workspace recency order', error)
+  process.exit(1)
+}
+
 if (failures > 0) {
   console.error(`\n${failures} check(s) failed`)
   process.exit(1)

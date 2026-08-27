@@ -6,6 +6,7 @@ import { IconFolderOpen16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { CodeView, gitStats } from './CodeView'
 import { openWithSystem } from './chatFileOpen'
+import { useExternalFollow } from './fileFollow'
 import { renderMarkdown } from './Markdown'
 import { openFileTab, rpc } from './rpc'
 import type { ExplorerStore, FileTab } from './store'
@@ -185,6 +186,7 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
   const [desktopError, setDesktopError] = useState<string | null>(null)
   const [patch, setPatch] = useState<string | null>(null)
   const [untracked, setUntracked] = useState(false)
+  const [staleDisk, setStaleDisk] = useState<string | null>(null)
   const loadedOnce = useRef(false)
 
   useEffect(() => {
@@ -202,7 +204,30 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
     setValue(tab.content)
     setSaveError(null)
     setDesktopError(null)
+    setStaleDisk(null)
   }, [tab.id])
+
+  // 外部修改跟随：查看态/干净编辑态自动套用；有未保存修改只提示不强改。
+  const dirtyRef = useRef(tab.dirty)
+  dirtyRef.current = tab.dirty
+  const followExternalChange = useCallback(() => {
+    void rpc<{ content?: string }>(sessionId, 'fs.read', { path: tab.path }).then(res => {
+      if (res.error !== undefined || typeof res.content !== 'string') return
+      if (dirtyRef.current) {
+        setStaleDisk(res.content) // 提示条按钮主动载入，绝不覆盖用户正在写的内容
+        return
+      }
+      setValue(res.content)
+      store.patchTab(tab.id, { content: res.content, error: null })
+    })
+  }, [sessionId, tab.path, tab.id, store])
+  const rebase = useExternalFollow({
+    sessionId,
+    path: tab.path,
+    paused: tab.loading || tab.dirty || saving,
+    visible: store.panelOpen || store.overlayOpen, // 列收起时宿主仍挂载本组件，必须停轮询
+    onChanged: followExternalChange,
+  })
 
   useEffect(() => {
     if (tab.loading) return
@@ -228,7 +253,11 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
       return
     }
     store.patchTab(tab.id, { dirty: false, content: value })
-  }, [sessionId, tab.id, tab.path, value, store])
+    // 写盘成功：基准重建，避免把「自己的保存」误判成外部修改；
+    // 挂起的磁盘提示也一并撤销。
+    rebase()
+    setStaleDisk(null)
+  }, [sessionId, tab.id, tab.path, value, store, rebase])
 
   const onKeyDown = useCallback((event: KeyboardEvent<HTMLTextAreaElement>) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
@@ -286,6 +315,24 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
         </div>
       </div>
       {saveError !== null && <div className="dshx-error" style={{ padding: 6, flex: 'none' }}>{saveError}</div>}
+      {staleDisk !== null && (
+        <div className="dshx-stale-bar">
+          <span>文件已在磁盘上被修改</span>
+          <button type="button" className="dshx-btn small" onClick={() => setStaleDisk(null)}>忽略</button>
+          <button
+            type="button"
+            className="dshx-btn small primary"
+            onClick={() => {
+              setValue(staleDisk)
+              store.patchTab(tab.id, { content: staleDisk, error: null })
+              setStaleDisk(null)
+              rebase()
+            }}
+          >
+            载入最新版本
+          </button>
+        </div>
+      )}
       {desktopError !== null && <div className="dshx-error" style={{ padding: 6, flex: 'none' }}>{desktopError}</div>}
       {tab.error !== null && <div className="dshx-error" style={{ padding: 6, flex: 'none' }}>{tab.error}</div>}
       {tab.truncated && (
@@ -317,6 +364,27 @@ export function PreviewTab({ tab, sessionId, store }: { tab: FileTab; sessionId:
   useEffect(() => {
     if (!tab.loading) setContent(tab.content)
   }, [tab.loading, tab.content])
+
+  // markdown 解析按内容 memo：store 每次通知都会重渲染本组件，
+  // 裸调 renderMarkdown 会把整篇文档同步重解析（大文档数百毫秒级 × 连续多次通知）。
+  const markdownHtml = useMemo(
+    () => (isMarkdown(tab.name) ? renderMarkdown(content) : ''),
+    [tab.name, content],
+  )
+
+  // 外部更新跟随：fileFollow 每 2s 探指纹（fs.stat，失败回退 fs.list 父目录，
+  // 与宿主是否重启无关），变化就静默重读。预览只读，不会和编辑冲突。
+  const pullLatest = useCallback(async () => {
+    const read = await rpc<{ content?: string }>(sessionId, 'fs.read', { path: tab.path })
+    if (read.error !== undefined || typeof read.content !== 'string') return
+    store.patchTab(tab.id, { content: read.content, error: null })
+    setContent(read.content)
+  }, [sessionId, tab.id, tab.path, store])
+  useExternalFollow({
+    sessionId, path: tab.path, paused: tab.loading,
+    visible: store.panelOpen || store.overlayOpen, // 列收起时停轮询
+    onChanged: () => { void pullLatest() },
+  })
 
   const reload = useCallback(() => {
     void rpc<{ content?: string }>(sessionId, 'fs.read', { path: tab.path }).then(res => {
@@ -353,7 +421,7 @@ export function PreviewTab({ tab, sessionId, store }: { tab: FileTab; sessionId:
         ? (
             <div
               className="dshx-preview dshx-scroll"
-              dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
+              dangerouslySetInnerHTML={{ __html: markdownHtml }}
             />
           )
         : isHtml(tab.name)

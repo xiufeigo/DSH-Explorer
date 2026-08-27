@@ -11,9 +11,12 @@ import {
   resetPrefs,
   setPrefs,
   subscribePrefs,
+  type ExplorerPrefs,
   type TermFontId,
   type TermThemeId,
+  type SoundId,
 } from './prefs'
+import { SOUND_OPTIONS, playNotificationSound } from './soundPlayer'
 
 const THEME_OPTS: { id: TermThemeId; label: string }[] = [
   { id: 'auto', label: '跟随界面' },
@@ -30,15 +33,65 @@ const FONT_OPTS: { id: TermFontId; label: string }[] = [
   { id: 'custom', label: '自定义' },
 ]
 
+/** Check if the prefs have any notification-related changes from defaults. */
+function isNotificationDirty(prefs: ExplorerPrefs): boolean {
+  return prefs.notifyAgent !== DEFAULT_PREFS.notifyAgent
+    || prefs.notifyPermission !== DEFAULT_PREFS.notifyPermission
+    || prefs.notifyError !== DEFAULT_PREFS.notifyError
+    || prefs.soundAgent !== DEFAULT_PREFS.soundAgent
+    || prefs.soundPermission !== DEFAULT_PREFS.soundPermission
+    || prefs.soundError !== DEFAULT_PREFS.soundError
+}
+function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }): JSX.Element {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      className={`dshx-set-toggle${checked ? ' on' : ''}`}
+      onClick={() => { onChange(!checked) }}
+    >
+      <span className="dshx-set-toggle-thumb" />
+    </button>
+  )
+}
+
+function SoundSelect({ value, onChange }: { value: SoundId; onChange: (v: SoundId) => void }): JSX.Element {
+  return (
+    <div className="dshx-set-sound-row">
+      <select
+        className="dshx-set-input dshx-set-sound-select"
+        value={value}
+        onChange={event => { onChange(event.target.value as SoundId) }}
+      >
+        {SOUND_OPTIONS.map(opt => (
+          <option key={opt.id} value={opt.id}>{opt.label}</option>
+        ))}
+      </select>
+      <button
+        type="button"
+        className="dshx-set-sound-preview"
+        title="预览音效"
+        onClick={() => { playNotificationSound(value) }}
+      >
+        ▶
+      </button>
+    </div>
+  )
+}
+
 export function ExplorerSettingsCard(): JSX.Element {
   const [, bump] = useReducer((n: number) => n + 1, 0)
   const [open, setOpen] = useState(false)
   useEffect(() => subscribePrefs(bump), [])
   const prefs = getPrefs()
-  const dirty = prefs.termTheme !== DEFAULT_PREFS.termTheme
+  const termDirty = prefs.termTheme !== DEFAULT_PREFS.termTheme
     || prefs.termFontSize !== DEFAULT_PREFS.termFontSize
     || prefs.termFont !== DEFAULT_PREFS.termFont
     || prefs.termFontCustom !== DEFAULT_PREFS.termFontCustom
+  const notifDirty = isNotificationDirty(prefs)
+  const workspaceDirty = prefs.sortWorkspacesByRecency !== DEFAULT_PREFS.sortWorkspacesByRecency
+  const dirty = termDirty || notifDirty || workspaceDirty
 
   return (
     <li className={`dshx-set-card${open ? ' open' : ''}`}>
@@ -50,13 +103,14 @@ export function ExplorerSettingsCard(): JSX.Element {
       >
         <span className="dshx-set-copy">
           <span className="dshx-set-name">DSH-Explorer</span>
-          <span className="dshx-set-desc">底部终端的配色、字号和字体。右侧栏宽度会记住上次拖拽结果。</span>
+          <span className="dshx-set-desc">终端、通知与音效；工作区可按最后会话时间排序。右侧栏宽度会记住上次拖拽结果。</span>
         </span>
         <span className="dshx-set-chevron" aria-hidden />
       </button>
       {open
         ? (
           <div className="dshx-set-body">
+            {/* ── 终端设置 ── */}
             <label className="dshx-set-field">
               <span className="dshx-set-label">终端配色</span>
               <select
@@ -109,6 +163,86 @@ export function ExplorerSettingsCard(): JSX.Element {
                 </label>
               )
               : null}
+
+            {/* ── 系统通知 ── */}
+            <div className="dshx-set-section-title">系统通知</div>
+            <div className="dshx-set-field dshx-set-notif-row">
+              <div className="dshx-set-notif-info">
+                <span className="dshx-set-label">智能体</span>
+                <span className="dshx-set-hint">当智能体完成或需要注意时显示系统通知</span>
+              </div>
+              <Toggle
+                checked={prefs.notifyAgent}
+                onChange={v => { setPrefs({ notifyAgent: v }) }}
+              />
+            </div>
+            <div className="dshx-set-field dshx-set-notif-row">
+              <div className="dshx-set-notif-info">
+                <span className="dshx-set-label">权限</span>
+                <span className="dshx-set-hint">当需要权限时显示系统通知</span>
+              </div>
+              <Toggle
+                checked={prefs.notifyPermission}
+                onChange={v => { setPrefs({ notifyPermission: v }) }}
+              />
+            </div>
+            <div className="dshx-set-field dshx-set-notif-row">
+              <div className="dshx-set-notif-info">
+                <span className="dshx-set-label">错误</span>
+                <span className="dshx-set-hint">发生错误时显示系统通知</span>
+              </div>
+              <Toggle
+                checked={prefs.notifyError}
+                onChange={v => { setPrefs({ notifyError: v }) }}
+              />
+            </div>
+
+            {/* ── 音效 ── */}
+            <div className="dshx-set-section-title">音效</div>
+            <div className="dshx-set-field dshx-set-notif-row">
+              <div className="dshx-set-notif-info">
+                <span className="dshx-set-label">智能体</span>
+                <span className="dshx-set-hint">当智能体完成或需要注意时播放声音</span>
+              </div>
+              <SoundSelect
+                value={prefs.soundAgent}
+                onChange={v => { setPrefs({ soundAgent: v }) }}
+              />
+            </div>
+            <div className="dshx-set-field dshx-set-notif-row">
+              <div className="dshx-set-notif-info">
+                <span className="dshx-set-label">权限</span>
+                <span className="dshx-set-hint">当需要权限时播放声音</span>
+              </div>
+              <SoundSelect
+                value={prefs.soundPermission}
+                onChange={v => { setPrefs({ soundPermission: v }) }}
+              />
+            </div>
+            <div className="dshx-set-field dshx-set-notif-row">
+              <div className="dshx-set-notif-info">
+                <span className="dshx-set-label">错误</span>
+                <span className="dshx-set-hint">发生错误时播放声音</span>
+              </div>
+              <SoundSelect
+                value={prefs.soundError}
+                onChange={v => { setPrefs({ soundError: v }) }}
+              />
+            </div>
+
+            {/* ── 工作区 ── */}
+            <div className="dshx-set-section-title">工作区</div>
+            <div className="dshx-set-field dshx-set-notif-row">
+              <div className="dshx-set-notif-info">
+                <span className="dshx-set-label">按最后会话时间排序</span>
+                <span className="dshx-set-hint">左侧栏工作区随会话活动自动把最近的排到最前（重启后顺序保留）；开启期间手动拖拽会被自动排序覆盖，关闭即恢复手动排序。</span>
+              </div>
+              <Toggle
+                checked={prefs.sortWorkspacesByRecency}
+                onChange={v => { setPrefs({ sortWorkspacesByRecency: v }) }}
+              />
+            </div>
+
             <div className="dshx-set-foot">
               <button
                 type="button"

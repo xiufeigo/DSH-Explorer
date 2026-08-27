@@ -3,7 +3,7 @@
  * One handle per plugin apply, shared across slot registrations.
  */
 
-import { useSyncExternalStore } from 'react'
+import { useEffect, useSyncExternalStore } from 'react'
 
 export type ExplorerTabKind = 'edit' | 'preview'
 export type ExplorerPage = 'review' | 'context' | 'subagents' | 'sources'
@@ -40,6 +40,12 @@ export interface ExplorerStore {
   /** Bumped on every mutation; `useExplorer` snapshots this, not the handle. */
   version: number
   panelOpen: boolean
+  /** Narrow-screen replace mode: the details panel takes over the whole
+   *  viewport (replacing the center conversation) instead of docking as a
+   *  third column. Distinct from `panelOpen`, which stays coupled to the
+   *  measured details-column width and can never be true on a narrow viewport
+   *  where the official concession chain forces the details column to 0. */
+  overlayOpen: boolean
   /** Left sidebar file mode: the file tree temporarily shadows the session list. */
   filesMode: boolean
   /** Pinned summary: stays docked on a wide column, collapses to a button when narrow. */
@@ -49,7 +55,7 @@ export interface ExplorerStore {
   reviewMode: ReviewMode
   subagentId: string | null
   extraPages: ExplorerPage[]
-  /** ExplorerPage | a file tab id */
+  /** ExplorerPage | a file tab id（全局最近一次激活；渲染请用 activeFor） */
   active: string
   defaultActive: ExplorerPage
   tabs: FileTab[]
@@ -57,6 +63,13 @@ export interface ExplorerStore {
   treeTick: number
   terminalOn: boolean
   terminalHeight: number
+  /** 当前右栏渲染所属的会话（ExplorerPanel 挂载/更新时回报）。 */
+  currentSessionId: string | null
+  /** 每个会话各自记住的激活页 / 文件 tab；没记过回退 defaultActive。 */
+  noteSession(sessionId: string): void
+  activeFor(sessionId: string): string
+  /** 该会话自己的文件 tab（按打开会话过滤，互不可见）。 */
+  sessionTabs(sessionId: string): FileTab[]
   openTab(input: { sessionId: string; path: string; name: string; kind: ExplorerTabKind }): FileTab
   openPage(page: ExplorerPage, opts?: { reviewMode?: ReviewMode; subagentId?: string | null }): void
   closePage(page: ExplorerPage): void
@@ -64,6 +77,10 @@ export interface ExplorerStore {
   closeTab(id: string): void
   setDefault(tab: ExplorerPage): void
   setPanelOpen(open: boolean): void
+  /** 右栏开合按会话记忆：显式动作才写，探针同步不写。 */
+  setPanelIntent(open: boolean, sessionId?: string): void
+  markPanelIntent(open: boolean, sessionId?: string): void
+  setOverlayOpen(open: boolean): void
   setFilesMode(active: boolean): void
   setReviewMode(mode: ReviewMode): void
   setSummaryOn(on: boolean): void
@@ -83,6 +100,8 @@ export interface ExplorerStore {
 
 let tabCounter = 0
 const TERM_HEIGHT_KEY = 'dsh-explorer:term-height'
+/** 「用户把右栏打开过的会话」集合：只有这些会话切换回来才自动开栏。 */
+const PANEL_SESSIONS_KEY = 'dsh-explorer:panel-sessions'
 
 function readTermHeight(): number {
   try {
@@ -95,9 +114,43 @@ function readTermHeight(): number {
   return 240
 }
 
+function readPanelSessions(): Set<string> {
+  try {
+    const raw = localStorage.getItem(PANEL_SESSIONS_KEY)
+    if (raw === null) return new Set()
+    const list = JSON.parse(raw) as unknown
+    if (!Array.isArray(list)) return new Set()
+    return new Set(list.filter((item): item is string => typeof item === 'string'))
+  } catch {
+    return new Set()
+  }
+}
+
+function savePanelSessions(sessions: Set<string>): void {
+  try {
+    // 只保留最近的 50 个，避免无限增长
+    const trimmed = Array.from(sessions).slice(-50)
+    localStorage.setItem(PANEL_SESSIONS_KEY, JSON.stringify(trimmed))
+  } catch { /* ignore */ }
+}
+
+/**
+ * 该会话是否被用户显式打开过右栏（持久化）。没有 sessionId 视为否——
+ * 老的全局「开了就所有会话都开」的行为正是要修掉的 bug。
+ */
+export function readPanelIntent(sessionId?: string | null): boolean {
+  if (sessionId === undefined || sessionId === null || sessionId.length === 0) return false
+  try {
+    return readPanelSessions().has(sessionId)
+  } catch {
+    return false
+  }
+}
+
 export function createExplorerStore(): ExplorerStore {
   const listeners = new Set<() => void>()
   const termBags = new Map<string, TermBag>()
+  const sessionActive = new Map<string, string>()
   let termSeq = 0
 
   const notify = (): void => {
@@ -108,6 +161,7 @@ export function createExplorerStore(): ExplorerStore {
   const store: ExplorerStore = {
     version: 0,
     panelOpen: false,
+    overlayOpen: false,
     filesMode: false,
     summaryOn: false,
     summaryFloat: false,
@@ -120,13 +174,48 @@ export function createExplorerStore(): ExplorerStore {
     defaultActive: 'review',
     tabs: [],
     treeTick: 0,
+    currentSessionId: null,
+
+    noteSession(sessionId) {
+      // 静默写：currentSessionId 只影响后续意图写入的目标，没有 UI 读它；
+      // 不触发 notify——切会话路径上不要再多出全树重渲染。
+      this.currentSessionId = sessionId
+    },
+
+    activeFor(sessionId) {
+      const own = sessionActive.get(sessionId)
+      return own !== undefined ? own : this.defaultActive
+    },
+
+    /** 该会话此刻该显示的 tab/页面（文件 tab 只属于打开它的会话）。 */
+    sessionTabs(sessionId) {
+      return this.tabs.filter(tab => tab.sessionId === sessionId)
+    },
+
+    markPanelIntent(open, sessionId) {
+      const target = sessionId ?? this.currentSessionId
+      if (target === undefined || target === null || target.length === 0) return
+      let changed = false
+      if (open) {
+        // 重建 Set 以便保持插入顺序（保存时取最近 50 个）
+        const next = readPanelSessions()
+        if (!next.has(target)) { next.add(target); changed = true }
+        savePanelSessions(next)
+      } else {
+        const next = readPanelSessions()
+        if (next.delete(target)) { savePanelSessions(next); changed = true }
+      }
+      if (changed) notify()
+    },
 
     openTab(input) {
       const existing = this.tabs.find(tab =>
         tab.sessionId === input.sessionId && tab.path === input.path && tab.kind === input.kind)
       if (existing !== undefined) {
         this.active = existing.id
+        sessionActive.set(input.sessionId, existing.id)
         this.panelOpen = true
+        this.markPanelIntent(true, input.sessionId)
         notify()
         return existing
       }
@@ -144,7 +233,9 @@ export function createExplorerStore(): ExplorerStore {
       }
       this.tabs = [...this.tabs, tab]
       this.active = tab.id
+      sessionActive.set(input.sessionId, tab.id)
       this.panelOpen = true
+      this.markPanelIntent(true, input.sessionId)
       notify()
       return tab
     },
@@ -159,18 +250,24 @@ export function createExplorerStore(): ExplorerStore {
       }
       this.active = page
       this.panelOpen = true
+      if (this.currentSessionId !== null) sessionActive.set(this.currentSessionId, page)
+      this.markPanelIntent(true)
       notify()
     },
 
     closePage(page) {
       this.extraPages = this.extraPages.filter(item => item !== page)
       if (this.active === page) this.active = this.defaultActive
+      for (const [session, value] of sessionActive) {
+        if (value === page) sessionActive.delete(session)
+      }
       if (page === 'subagents') this.subagentId = null
       notify()
     },
 
     activate(id) {
       this.active = id
+      if (this.currentSessionId !== null) sessionActive.set(this.currentSessionId, id)
       notify()
     },
 
@@ -179,6 +276,9 @@ export function createExplorerStore(): ExplorerStore {
       if (index < 0) return
       this.tabs = this.tabs.filter(tab => tab.id !== id)
       if (this.active === id) this.active = this.defaultActive
+      for (const [session, value] of sessionActive) {
+        if (value === id) sessionActive.delete(session)
+      }
       notify()
     },
 
@@ -190,6 +290,15 @@ export function createExplorerStore(): ExplorerStore {
 
     setPanelOpen(open) {
       this.panelOpen = open
+      notify()
+    },
+
+    setPanelIntent(open, sessionId) {
+      this.markPanelIntent(open, sessionId)
+    },
+
+    setOverlayOpen(open) {
+      this.overlayOpen = open
       notify()
     },
 
@@ -291,4 +400,17 @@ export function createExplorerStore(): ExplorerStore {
 export function useExplorer(store: ExplorerStore): ExplorerStore {
   useSyncExternalStore(store.subscribe, () => store.version, () => store.version)
   return store
+}
+
+/**
+ * 会话回报的轻量替代（供右栏关闭时仍挂载的会话级组件调用）：
+ * 保持 store.currentSessionId 始终等于当前会话，让「面板开合按会话记忆」
+ * 的写入目标在 details 未挂载时也不会指错会话。
+ */
+export function useSessionHint(store: ExplorerStore, sessionId: string | null | undefined): void {
+  useEffect(() => {
+    if (sessionId !== undefined && sessionId !== null && sessionId.length > 0) {
+      store.noteSession(sessionId)
+    }
+  }, [store, sessionId])
 }

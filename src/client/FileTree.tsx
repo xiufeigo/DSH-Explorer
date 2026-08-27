@@ -6,9 +6,12 @@
  *   - 标题 14px/20px；hover/选中背景 var(--dsw-alias-interactive-bg-hover)；
  *   - 目录默认显示文件夹图标，hover 时切换为三角箭头（展开旋转 90°）；
  *   - 文件同一 16px 槽放该类型自己的剪影（Python 双蛇、TS/JS 色块等）。
+ *
+ * 刷新策略：自动（3s 轮询指纹）与手动（treeTick）都做「原地刷新」——
+ * 重新拉根目录与已展开目录的列表，内容没变不 set，展开状态永远保留。
  */
 
-import { useCallback, useEffect, useState, type MouseEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react'
 import {
   IconFolderClose16, IconFolderOpen16, IconTriangleRightFill14,
 } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -35,11 +38,76 @@ function formatSize(size: number): string {
   return `${(size / (1024 * 1024)).toFixed(1)}M`
 }
 
+/** 目录清单指纹：名字/类型/大小任一变化都会改变指纹。 */
+function fingerprint(entries: TreeEntry[]): string {
+  return entries.map(entry => `${entry.type}|${entry.name}|${entry.size ?? ''}`).join('\u0000')
+}
+
+// ── 展开状态记忆（按 cwd 存 localStorage） ─────────────────────────────────
+
+const TREE_OPEN_KEY = 'dsh-explorer:tree-open'
+
+function readSavedOpen(cwd: string): string[] {
+  try {
+    const raw = localStorage.getItem(TREE_OPEN_KEY)
+    if (raw === null) return []
+    const map = JSON.parse(raw) as Record<string, unknown>
+    const list = map[cwd]
+    return Array.isArray(list) ? list.filter((item): item is string => typeof item === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+function saveOpen(cwd: string, paths: string[]): void {
+  try {
+    const raw = localStorage.getItem(TREE_OPEN_KEY)
+    const map: Record<string, unknown> = raw !== null ? JSON.parse(raw) : {}
+    for (const key of Object.keys(map)) {
+      if (!Array.isArray(map[key])) delete map[key]
+    }
+    map[cwd] = paths.slice(0, 150)
+    const keys = Object.keys(map)
+    if (keys.length > 40) {
+      for (const key of keys.slice(0, keys.length - 40)) delete map[key]
+    }
+    localStorage.setItem(TREE_OPEN_KEY, JSON.stringify(map))
+  } catch { /* ignore */ }
+}
+
 interface FileTreeProps {
   cwd: string | undefined
   sessionId: string | undefined
   store: ExplorerStore
   onOpenPanel(): void
+}
+
+type Creating = { parent: string; kind: 'file' | 'dir' } | null
+interface MenuState {
+  x: number
+  y: number
+  entry: TreeEntry | null
+  parent: string
+}
+
+const NAME_BAD = /[\\/:*?"<>|]/
+
+// ── 性能护栏 ────────────────────────────────────────────────────────────────
+// 记忆恢复曾把 node_modules 这类几千项目录在切会话的关键帧里整树同步挂载，
+// 配合宿主网格过渡的逐帧重排造成秒级卡死。三个约束：
+//   1) 每层目录默认只渲染前 TREE_CHILD_CAP 行，超出折叠为「显示全部」；
+//   2) 恢复最多展开 RESTORE_DIR_CAP 个目录、并发 ≤LIST_CONCURRENCY；
+//   3) 恢复等 SWITCH_SETTLE_MS 错峰，不和切换过渡抢主线程。
+const TREE_CHILD_CAP = 120
+const RESTORE_DIR_CAP = 24
+const LIST_CONCURRENCY = 8
+const SWITCH_SETTLE_MS = 350
+
+function delay(signal: AbortSignal | undefined, ms: number): Promise<void> {
+  return new Promise(resolve => {
+    const timer = setTimeout(resolve, ms)
+    signal?.addEventListener('abort', () => { clearTimeout(timer); resolve() }, { once: true })
+  })
 }
 
 export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps): JSX.Element {
@@ -51,7 +119,15 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
   const [errors, setErrors] = useState<Map<string, string>>(() => new Map())
   const [root, setRoot] = useState<TreeEntry[] | null>(null)
   const [rootError, setRootError] = useState<string | null>(null)
-  const [menu, setMenu] = useState<{ x: number; y: number; entry: TreeEntry } | null>(null)
+  const [menu, setMenu] = useState<MenuState | null>(null)
+  const [creating, setCreating] = useState<Creating>(null)
+  /** 用户点「显示全部」后放开渲染上限的目录（key 为目录路径，根目录用 ''）。 */
+  const [showAllDirs, setShowAllDirs] = useState<Set<string>>(() => new Set())
+
+  const childrenRef = useRef(children)
+  childrenRef.current = children
+  const lastRootFp = useRef('')
+  const dirFps = useRef<Map<string, string>>(new Map())
 
   const loadRoot = useCallback(async (signal?: AbortSignal) => {
     if (cwd === undefined || cwd.length === 0) return
@@ -64,16 +140,151 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
       setRoot(null)
       return
     }
-    setRoot(res.entries ?? [])
+    const entries = res.entries ?? []
+    lastRootFp.current = fingerprint(entries)
+    setRoot(entries)
   }, [cwd, sessionId])
 
+  /** cwd / 会话变化：换 cwd 才全量重置并从记忆恢复展开；同 cwd 换会话原地刷新。 */
+  const lastCwdRef = useRef<string | undefined>(undefined)
   useEffect(() => {
-    setRoot(null)
-    setChildren(new Map())
+    const cwdChanged = lastCwdRef.current !== cwd
+    lastCwdRef.current = cwd
     const ac = new AbortController()
-    void loadRoot(ac.signal)
+    if (cwdChanged) {
+      setRoot(null)
+      setChildren(new Map())
+      setLoading(new Map())
+      setCreating(null)
+      setMenu(null)
+      setShowAllDirs(new Set())
+      lastRootFp.current = ''
+      dirFps.current = new Map()
+      // 必须同步捕获：持久化 effect 会随后把当前空展开写入存储，晚读会拿到空
+      const saved = cwd !== undefined && cwd.length > 0
+        ? readSavedOpen(cwd).filter(path => path !== cwd).slice(0, RESTORE_DIR_CAP)
+        : []
+      void (async () => {
+        await loadRoot(ac.signal)
+        if (ac.signal.aborted || saved.length === 0) return
+        if (sessionId === undefined || sessionId.length === 0) return
+        // 错峰：等宿主切会话的网格过渡帧走完再恢复，恢复动作不挤占切换的关键帧；
+        // 分批拉取避免几十个目录并发打满。
+        await delay(ac.signal, SWITCH_SETTLE_MS)
+        for (let start = 0; start < saved.length; start += LIST_CONCURRENCY) {
+          if (ac.signal.aborted) return
+          const batch = saved.slice(start, start + LIST_CONCURRENCY)
+          const results = await Promise.all(batch.map(async path => ({
+            path,
+            res: await rpc<ListResult>(sessionId, 'fs.list', { path }),
+          })))
+          if (ac.signal.aborted) return
+          setChildren(current => {
+            const next = new Map(current)
+            let changed = false
+            for (const { path, res } of results) {
+              if (res.error !== undefined) continue
+              const entries = res.entries ?? []
+              dirFps.current.set(path, fingerprint(entries))
+              next.set(path, entries)
+              changed = true
+            }
+            return changed ? next : current
+          })
+        }
+      })()
+    } else {
+      // 同 cwd 换会话：不重置，原地刷新即可
+      void refreshRef.current()
+    }
     return () => ac.abort()
-  }, [loadRoot, store.treeTick])
+  }, [loadRoot])
+
+  /** 展开状态持久化：children 变化即落盘。 */
+  useEffect(() => {
+    if (cwd === undefined || cwd.length === 0) return
+    saveOpen(cwd, Array.from(children.keys()))
+  }, [children, cwd])
+
+  /** 原地刷新：重拉根目录与所有已展开目录，指纹没变不 set，展开状态不动。 */
+  const refreshRef = useRef<() => Promise<void>>(async () => {})
+  refreshRef.current = async () => {
+    if (cwd === undefined || cwd.length === 0) return
+    if (sessionId === undefined || sessionId.length === 0) return
+    const rootRes = await rpcWithSessionRetry<ListResult>(sessionId, 'fs.list', { path: cwd })
+    if (rootRes.error !== undefined) return // 静默保留旧内容
+    const nextRoot = rootRes.entries ?? []
+    const rootFp = fingerprint(nextRoot)
+    if (rootFp !== lastRootFp.current) {
+      lastRootFp.current = rootFp
+      setRoot(nextRoot)
+    }
+    const openPaths = Array.from(childrenRef.current.keys())
+    if (openPaths.length === 0) return
+    // 分批 ≤8 并发：已展开目录可能很多，避免一次打满
+    const updates: Array<{ path: string; res: ListResult }> = []
+    for (let start = 0; start < openPaths.length; start += LIST_CONCURRENCY) {
+      const batch = openPaths.slice(start, start + LIST_CONCURRENCY)
+      updates.push(...await Promise.all(batch.map(async path => ({
+        path,
+        res: await rpc<ListResult>(sessionId, 'fs.list', { path }),
+      }))))
+    }
+    setChildren(current => {
+      const next = new Map(current)
+      let changed = false
+      for (const { path, res } of updates) {
+        if (res.error !== undefined) continue
+        const entries = res.entries ?? []
+        const fp = fingerprint(entries)
+        if (fp === dirFps.current.get(path)) continue
+        dirFps.current.set(path, fp)
+        next.set(path, entries)
+        changed = true
+      }
+      return changed ? next : current
+    })
+  }
+
+  // 手动刷新（treeTick）：跳过首次，避免与 loadRoot 重复
+  const firstTick = useRef(true)
+  useEffect(() => {
+    if (firstTick.current) { firstTick.current = false; return }
+    void refreshRef.current()
+  }, [store.treeTick])
+
+  // 自动跟随：轮询指纹，页面隐藏时跳过
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (document.hidden) return
+      void refreshRef.current()
+    }, 3000)
+    return () => clearInterval(timer)
+  }, [])
+
+  const reloadDir = useCallback(async (parent: string): Promise<TreeEntry[] | null> => {
+    if (sessionId === undefined || sessionId.length === 0) return null
+    const res = parent === cwd
+      ? await rpcWithSessionRetry<ListResult>(sessionId, 'fs.list', { path: parent })
+      : await rpc<ListResult>(sessionId, 'fs.list', { path: parent })
+    if (res.error !== undefined) return null
+    const entries = res.entries ?? []
+    if (parent === cwd) {
+      lastRootFp.current = fingerprint(entries)
+      setRoot(entries)
+    } else {
+      dirFps.current.set(parent, fingerprint(entries))
+      setChildren(current => new Map(current).set(parent, entries))
+    }
+    return entries
+  }, [cwd, sessionId])
+
+  /** 确保目录处于展开状态（未加载则先拉子项）。 */
+  const ensureOpen = useCallback(async (parent: string): Promise<void> => {
+    if (parent === cwd) return
+    if (childrenRef.current.has(parent)) return
+    await reloadDir(parent)
+  }, [cwd, reloadDir])
 
   const toggle = useCallback(async (entry: TreeEntry) => {
     const path = entry.path
@@ -102,7 +313,9 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
       next.delete(path)
       return next
     })
-    setChildren(current => new Map(current).set(path, res.entries ?? []))
+    const entries = res.entries ?? []
+    dirFps.current.set(path, fingerprint(entries))
+    setChildren(current => new Map(current).set(path, entries))
   }, [children, loading, sessionId])
 
   const openEntry = useCallback((entry: TreeEntry, kind: 'edit' | 'preview') => {
@@ -111,12 +324,19 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
     })
   }, [store, sessionId, onOpenPanel])
 
-  const onContextMenu = useCallback((event: MouseEvent, entry: TreeEntry) => {
-    if (entry.type !== 'file') return
+  const onRowContextMenu = useCallback((event: MouseEvent, entry: TreeEntry, parent: string) => {
     event.preventDefault()
     event.stopPropagation()
-    setMenu({ x: event.clientX, y: event.clientY, entry })
+    // 文件夹行：新建目标在该文件夹内部；文件行：在其所在目录
+    const createIn = entry.type === 'directory' ? entry.path : parent
+    setMenu({ x: event.clientX, y: event.clientY, entry, parent: createIn })
   }, [])
+
+  const onBackgroundContextMenu = useCallback((event: MouseEvent) => {
+    if (cwd === undefined || cwd.length === 0) return
+    event.preventDefault()
+    setMenu({ x: event.clientX, y: event.clientY, entry: null, parent: cwd })
+  }, [cwd])
 
   useEffect(() => {
     if (menu === null) return
@@ -132,8 +352,54 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
     }
   }, [menu])
 
-  const renderEntries = (entries: TreeEntry[], depth: number): JSX.Element[] =>
-    entries.map(entry => {
+  const beginCreate = useCallback((kind: 'file' | 'dir', parent: string) => {
+    setMenu(null)
+    setCreating({ parent, kind })
+    void ensureOpen(parent)
+  }, [ensureOpen])
+
+  const confirmCreate = useCallback(async (name: string) => {
+    if (creating === null || sessionId === undefined || sessionId.length === 0) return
+    const parent = creating.parent
+    const kind = creating.kind
+    setCreating(null)
+    const res = await rpc<{ ok?: boolean }>(sessionId, 'fs.create', { path: parent, name, kind })
+    if (res.error !== undefined || res.ok !== true) return
+    const entries = await reloadDir(parent)
+    if (kind === 'file' && entries !== null) {
+      // 用列表里的规范路径打开（避免猜分隔符）
+      const created = entries.find(entry => entry.name === name)
+      if (created !== undefined) {
+        void openFileTab(store, sessionId, created.path, created.name, 'edit').then(() => onOpenPanel())
+      }
+    }
+  }, [creating, sessionId, reloadDir, store, onOpenPanel])
+
+  const renderNewRow = (parent: string, depth: number, key: string): JSX.Element | null => {
+    if (creating === null || creating.parent !== parent) return null
+    return (
+      <NewNameRow key={key} kind={creating.kind} depth={depth}
+        onConfirm={name => { void confirmCreate(name) }}
+        onCancel={() => setCreating(null)}
+      />
+    )
+  }
+
+  const toggleShowAll = useCallback((dirKey: string) => {
+    setShowAllDirs(current => {
+      const next = new Set(current)
+      if (next.has(dirKey)) next.delete(dirKey)
+      else next.add(dirKey)
+      return next
+    })
+  }, [])
+
+  // 每层默认只渲染前 TREE_CHILD_CAP 行；超过折叠为「显示全部」行。
+  // 没有这层上限，恢复展开记忆可能把几万行的目录在切换帧里同步挂载。
+  const renderEntries = (allEntries: TreeEntry[], depth: number, parent: string): JSX.Element[] => {
+    const capLifted = showAllDirs.has(parent)
+    const entries = capLifted ? allEntries : allEntries.slice(0, TREE_CHILD_CAP)
+    const rows = entries.map(entry => {
       const isDir = entry.type === 'directory'
       const isOpen = children.has(entry.path)
       return (
@@ -145,7 +411,7 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
               if (isDir) void toggle(entry)
               else openEntry(entry, 'edit')
             }}
-            onContextMenu={event => onContextMenu(event, entry)}
+            onContextMenu={event => onRowContextMenu(event, entry, parent)}
             title={entry.path}
           >
             {isDir ? (
@@ -166,16 +432,36 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
           {isDir && isOpen && (
             errors.has(entry.path)
               ? <div className="dshx-error" style={{ padding: '2px 8px 2px 26px', fontSize: 13 }}>{errors.get(entry.path)}</div>
-              : renderEntries(children.get(entry.path) ?? [], depth + 1)
+              : (
+                  <>
+                    {renderEntries(children.get(entry.path) ?? [], depth + 1, entry.path)}
+                    {renderNewRow(entry.path, depth + 1, `${entry.path}::new`)}
+                  </>
+                )
           )}
         </div>
       )
     })
+    if (!capLifted && allEntries.length > TREE_CHILD_CAP) {
+      rows.push(
+        <div
+          key={`${parent}::__more__`}
+          className="dshx-tree-row more"
+          style={{ paddingLeft: 8 + depth * 22 }}
+          onClick={() => toggleShowAll(parent)}
+          title="显示该目录的全部条目"
+        >
+          <span className="dshx-tree-name">…还有 {allEntries.length - TREE_CHILD_CAP} 项（点击全部显示）</span>
+        </div>,
+      )
+    }
+    return rows
+  }
 
   const previewable = (entry: TreeEntry): boolean => /\.(md|markdown|html?|htm)$/i.test(entry.name)
 
   return (
-    <div className="dshx-tree">
+    <div className="dshx-tree" onContextMenu={onBackgroundContextMenu}>
       {cwd === undefined || cwd.length === 0 ? (
         <div className="dshx-empty">当前会话没有工作目录</div>
       ) : rootError !== null ? (
@@ -185,25 +471,84 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
       ) : root.length === 0 ? (
         <div className="dshx-empty">空目录</div>
       ) : (
-        renderEntries(root, 0)
+        renderEntries(root, 0, cwd!)
       )}
+      {cwd !== undefined && cwd.length > 0 && renderNewRow(cwd, 0, '__root__new')}
 
       {menu !== null && (
-        <div className="dshx-menu" style={{ left: menu.x, top: menu.y }} onClick={event => event.stopPropagation()}>
-          <div className="dshx-menu-item" onClick={() => { openEntry(menu.entry, 'edit'); setMenu(null) }}>打开编辑</div>
-          <div
-            className={`dshx-menu-item ${previewable(menu.entry) ? '' : 'disabled'}`}
-            onClick={() => {
-              if (!previewable(menu.entry)) return
-              openEntry(menu.entry, 'preview')
-              setMenu(null)
-            }}
-          >
-            预览（md / html）
-          </div>
-          <div className="dshx-menu-item" onClick={() => { void navigator.clipboard?.writeText(menu.entry.path); setMenu(null) }}>复制路径</div>
+        <div
+          className="dshx-menu"
+          style={{ left: menu.x, top: menu.y }}
+          // 桌面壳毛玻璃 hook（titlebar.js）会把侧栏子树里所有背景强制透明
+          // （background-color:transparent!important），这个属性是它自带的
+          // 不透明白名单，标记后菜单保持实底可读。
+          data-dsh-opaque-surface=""
+          role="menu"
+          onClick={event => event.stopPropagation()}
+        >
+          {menu.entry === null || menu.entry.type === 'directory' ? (
+            <>
+              <div className="dshx-menu-item" onClick={() => beginCreate('file', menu.parent)}>新建文件</div>
+              <div className="dshx-menu-item" onClick={() => beginCreate('dir', menu.parent)}>新建文件夹</div>
+              {menu.entry !== null && (
+                <div className="dshx-menu-item" onClick={() => { void navigator.clipboard?.writeText(menu.entry!.path); setMenu(null) }}>复制路径</div>
+              )}
+            </>
+          ) : (
+            <>
+              <div className="dshx-menu-item" onClick={() => { openEntry(menu.entry!, 'edit'); setMenu(null) }}>打开编辑</div>
+              <div
+                className={`dshx-menu-item ${previewable(menu.entry) ? '' : 'disabled'}`}
+                onClick={() => {
+                  if (!previewable(menu.entry!)) return
+                  openEntry(menu.entry!, 'preview')
+                  setMenu(null)
+                }}
+              >
+                预览（md / html）
+              </div>
+              <div className="dshx-menu-item" onClick={() => beginCreate('file', menu.parent)}>新建文件</div>
+              <div className="dshx-menu-item" onClick={() => beginCreate('dir', menu.parent)}>新建文件夹</div>
+              <div className="dshx-menu-item" onClick={() => { void navigator.clipboard?.writeText(menu.entry!.path); setMenu(null) }}>复制路径</div>
+            </>
+          )}
         </div>
       )}
+    </div>
+  )
+}
+
+/** 新建条目的行内输入行（VS Code 式）：Enter 确认、Esc 取消、失焦取消。 */
+function NewNameRow({ kind, depth, onConfirm, onCancel }: {
+  kind: 'file' | 'dir'
+  depth: number
+  onConfirm(name: string): void
+  onCancel(): void
+}): JSX.Element {
+  const [value, setValue] = useState('')
+  const [bad, setBad] = useState(false)
+  const confirm = (): void => {
+    const name = value.trim()
+    if (name.length === 0) { onCancel(); return }
+    if (name === '.' || name === '..' || NAME_BAD.test(name)) { setBad(true); return }
+    onConfirm(name)
+  }
+  return (
+    <div className="dshx-tree-newrow" style={{ paddingLeft: 8 + depth * 22 }}>
+      <input
+        autoFocus
+        className={`dshx-tree-newinput ${bad ? 'bad' : ''}`}
+        value={value}
+        placeholder={kind === 'dir' ? '文件夹名称' : '文件名称'}
+        spellCheck={false}
+        onChange={event => { setValue(event.target.value); setBad(false) }}
+        onKeyDown={event => {
+          if (event.key === 'Enter') confirm()
+          else if (event.key === 'Escape') onCancel()
+        }}
+        onBlur={onCancel}
+      />
+      {bad && <span className="dshx-tree-newhint">名称含非法字符</span>}
     </div>
   )
 }

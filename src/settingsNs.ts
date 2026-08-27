@@ -18,18 +18,34 @@ export interface ExplorerSettingsSection {
   termFontSize: number
   termFont: 'ui' | 'code' | 'mono' | 'custom'
   termFontCustom: string
+  notifyAgent: boolean
+  notifyPermission: boolean
+  notifyError: boolean
+  soundAgent: 'none' | 'staplebops-01' | 'staplebops-02' | 'nope-03' | 'chime-soft' | 'chime-bright' | 'alert-low' | 'alert-high'
+  soundPermission: 'none' | 'staplebops-01' | 'staplebops-02' | 'nope-03' | 'chime-soft' | 'chime-bright' | 'alert-low' | 'alert-high'
+  soundError: 'none' | 'staplebops-01' | 'staplebops-02' | 'nope-03' | 'chime-soft' | 'chime-bright' | 'alert-low' | 'alert-high'
+  sortWorkspacesByRecency: boolean
 }
 
 const THEMES = ['auto', 'light', 'dark', 'slate', 'forest'] as const
 const FONTS = ['ui', 'code', 'mono', 'custom'] as const
+const SOUNDS = ['none', 'staplebops-01', 'staplebops-02', 'nope-03', 'chime-soft', 'chime-bright', 'alert-low', 'alert-high'] as const
 const THEME_SET = new Set<string>(THEMES)
 const FONT_SET = new Set<string>(FONTS)
+const SOUND_SET = new Set<string>(SOUNDS)
 
 const DEFAULT_SECTION: ExplorerSettingsSection = {
   termTheme: 'auto',
   termFontSize: 13,
   termFont: 'code',
   termFontCustom: '',
+  notifyAgent: true,
+  notifyPermission: true,
+  notifyError: false,
+  soundAgent: 'staplebops-01',
+  soundPermission: 'staplebops-02',
+  soundError: 'nope-03',
+  sortWorkspacesByRecency: true,
 }
 
 function clipSize(n: unknown): number {
@@ -51,6 +67,13 @@ function parseSection(input: unknown): ExplorerSettingsSection {
       ? font as ExplorerSettingsSection['termFont']
       : DEFAULT_SECTION.termFont,
     termFontCustom: typeof raw.termFontCustom === 'string' ? raw.termFontCustom.slice(0, 120) : '',
+    notifyAgent: typeof raw.notifyAgent === 'boolean' ? raw.notifyAgent : DEFAULT_SECTION.notifyAgent,
+    notifyPermission: typeof raw.notifyPermission === 'boolean' ? raw.notifyPermission : DEFAULT_SECTION.notifyPermission,
+    notifyError: typeof raw.notifyError === 'boolean' ? raw.notifyError : DEFAULT_SECTION.notifyError,
+    soundAgent: typeof raw.soundAgent === 'string' && SOUND_SET.has(raw.soundAgent) ? raw.soundAgent as ExplorerSettingsSection['soundAgent'] : DEFAULT_SECTION.soundAgent,
+    soundPermission: typeof raw.soundPermission === 'string' && SOUND_SET.has(raw.soundPermission) ? raw.soundPermission as ExplorerSettingsSection['soundPermission'] : DEFAULT_SECTION.soundPermission,
+    soundError: typeof raw.soundError === 'string' && SOUND_SET.has(raw.soundError) ? raw.soundError as ExplorerSettingsSection['soundError'] : DEFAULT_SECTION.soundError,
+    sortWorkspacesByRecency: typeof raw.sortWorkspacesByRecency === 'boolean' ? raw.sortWorkspacesByRecency : DEFAULT_SECTION.sortWorkspacesByRecency,
   }
 }
 
@@ -80,6 +103,13 @@ export const explorerSettingsSchema = Object.assign(parseSection, {
       termFontSize: { type: 'number', default: DEFAULT_SECTION.termFontSize },
       termFont: { type: 'string', enum: [...FONTS], default: DEFAULT_SECTION.termFont },
       termFontCustom: { type: 'string', default: DEFAULT_SECTION.termFontCustom },
+      notifyAgent: { type: 'boolean', default: DEFAULT_SECTION.notifyAgent },
+      notifyPermission: { type: 'boolean', default: DEFAULT_SECTION.notifyPermission },
+      notifyError: { type: 'boolean', default: DEFAULT_SECTION.notifyError },
+      soundAgent: { type: 'string', enum: [...SOUNDS], default: DEFAULT_SECTION.soundAgent },
+      soundPermission: { type: 'string', enum: [...SOUNDS], default: DEFAULT_SECTION.soundPermission },
+      soundError: { type: 'string', enum: [...SOUNDS], default: DEFAULT_SECTION.soundError },
+      sortWorkspacesByRecency: { type: 'boolean', default: DEFAULT_SECTION.sortWorkspacesByRecency },
     },
   }),
 })

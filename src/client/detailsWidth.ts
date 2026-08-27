@@ -29,6 +29,19 @@ export function persistDetailsWidth(px: number): void {
   try { localStorage.setItem(DETAILS_WIDTH_KEY, String(clamp(px))) } catch { /* ignore */ }
 }
 
+/**
+ * 观测式持久化：把 ResizeObserver 实测的稳定列宽写盘。
+ * 官方拖拽走的是框架直绑 actions（不经 attachPanels 的包装），唯一可靠的
+ * 记忆途径就是实测；阈值内防抖去抖后由调用方决定何时调用。
+ */
+export function maybePersistObservedWidth(px: number): void {
+  if (px < DETAILS_MIN || px > DETAILS_MAX) return
+  const rounded = Math.round(px)
+  const current = readDetailsWidth()
+  if (current !== undefined && Math.abs(current - rounded) <= 1) return
+  try { localStorage.setItem(DETAILS_WIDTH_KEY, String(clamp(rounded))) } catch { /* ignore */ }
+}
+
 interface PanelActions {
   setDetails: (px: number) => void
   openDetails: () => void
@@ -60,6 +73,13 @@ function wrapActions(actions: PanelActions): PanelActions {
   })
 }
 
+/** 最近一次交给宿主的包装 actions——插件代码需要编程式设列宽时用它。 */
+let attachedPanelActions: PanelActions | null = null
+
+export function getAttachedPanelActions(): PanelActions | null {
+  return attachedPanelActions
+}
+
 /** 必须在首屏 render / attachPanels 之前调用。 */
 export function installDetailsWidthMemory(layout: object): void {
   const proto = Object.getPrototypeOf(layout) as {
@@ -70,6 +90,7 @@ export function installDetailsWidthMemory(layout: object): void {
   const origAttach = proto.attachPanels
   if (typeof origAttach !== 'function') return
   proto.attachPanels = function wrappedAttach(this: unknown, actions: PanelActions) {
+    attachedPanelActions = actions
     return origAttach.call(this, wrapActions(actions))
   }
   proto.__dshxDetailsMemory = true

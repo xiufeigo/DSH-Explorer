@@ -357,6 +357,19 @@ async function fsRead(sv: Services, cwd: string, args: Record<string, unknown>):
   }
 }
 
+/** 轻量变更探测：只回版本指纹与大小，供预览页轮询自动刷新。 */
+async function fsStatLite(sv: Services, cwd: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const target = await resolveInside(sv, cwd, String(args.path ?? ''))
+  if ('error' in target) return { error: target.error }
+  try {
+    const info = await sv.fs.stat(target)
+    if (!info || info.type !== 'file') return { error: '不是普通文件' }
+    return { version: info.version === undefined ? null : String(info.version), size: info.size ?? 0 }
+  } catch (error) {
+    return { error: msg(error) }
+  }
+}
+
 async function fsWrite(sv: Services, cwd: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
   const target = await resolveInside(sv, cwd, String(args.path ?? ''))
   if ('error' in target) return { error: target.error }
@@ -367,6 +380,54 @@ async function fsWrite(sv: Services, cwd: string, args: Record<string, unknown>)
   const policy = sv.sandboxPolicy?.resolve({ session: args.session === undefined ? undefined : args.session, mode: 'danger-full-access' })
   try {
     await sv.fs.writeText(target, content, undefined, undefined, policy)
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, error: msg(error) }
+  }
+}
+
+/** 新建文件 / 文件夹（文件树右键）。建文件复用 writeText——底层原子写会自动补齐父目录。 */
+async function fsCreate(sv: Services, cwd: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const parentPath = String(args.path ?? '')
+  const parent = await resolveInside(sv, cwd, parentPath === '' ? cwd : parentPath)
+  if ('error' in parent) return { error: parent.error }
+  const name = typeof args.name === 'string' ? args.name.trim() : ''
+  if (name.length === 0) return { error: '缺少名称' }
+  if (name === '.' || name === '..' || /[\\/:*?"<>|]/.test(name) || name.length > 200) {
+    return { error: '名称含非法字符或过长' }
+  }
+  const kind = args.kind === 'dir' ? 'dir' : 'file'
+  const sep = parent.displayPath.includes('\\') || /^[A-Za-z]:/.test(parent.displayPath) ? '\\' : '/'
+  const joined = `${parent.displayPath.replace(/[\\/]+$/, '')}${sep}${name}`
+  const target = await resolveInside(sv, cwd, joined)
+  if ('error' in target) return { error: target.error }
+  try {
+    const existing = await sv.fs.stat(target)
+    if (existing) return { error: '同名文件或目录已存在' }
+  } catch { /* 不存在即目标状态 */ }
+
+  // 用户在插件 UI 里显式点了新建 —— 与编辑器保存同一授权语义
+  const policy = sv.sandboxPolicy?.resolve({ session: args.session === undefined ? undefined : args.session, mode: 'danger-full-access' })
+  try {
+    if (kind === 'file') {
+      await sv.fs.writeText(target, '', undefined, undefined, policy)
+      return { ok: true }
+    }
+    // 目录：fs 服务没有 mkdir，走 shell（与 git 同一条执行链）
+    const abs = nativeFsPath(target)
+    const command = process.platform === 'win32' ? `mkdir "${abs}"` : `mkdir -p "${abs}"`
+    const spec = sv.shell.resolve({
+      command,
+      workdir: cwd,
+      timeoutMs: 10000,
+      stdoutMaxBytes: 64 * 1024,
+      sandboxPolicy: policy,
+    })
+    const result = await sv.shell.run(spec)
+    if (result.exitCode !== 0) {
+      const detail = result.stderr?.text?.trim() || `mkdir 失败 (exit ${String(result.exitCode)})`
+      return { ok: false, error: detail }
+    }
     return { ok: true }
   } catch (error) {
     return { ok: false, error: msg(error) }
@@ -953,8 +1014,12 @@ async function handleRpc(req: IncomingMessage, res: ServerResponse, sv: Services
         return sendJson(res, await fsList(sv, cwd, args))
       case 'fs.read':
         return sendJson(res, await fsRead(sv, cwd, args))
+      case 'fs.stat':
+        return sendJson(res, await fsStatLite(sv, cwd, args))
       case 'fs.write':
         return sendJson(res, await fsWrite(sv, cwd, { ...args, session }))
+      case 'fs.create':
+        return sendJson(res, await fsCreate(sv, cwd, { ...args, session }))
       case 'fs.reveal':
         return sendJson(res, await fsReveal(sv, cwd, args))
       case 'fs.openExternal':

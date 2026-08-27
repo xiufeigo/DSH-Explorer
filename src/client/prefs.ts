@@ -6,12 +6,27 @@
 
 export type TermThemeId = 'auto' | 'light' | 'dark' | 'slate' | 'forest'
 export type TermFontId = 'ui' | 'code' | 'mono' | 'custom'
+export type SoundId = 'none' | 'staplebops-01' | 'staplebops-02' | 'nope-03' | 'chime-soft' | 'chime-bright' | 'alert-low' | 'alert-high'
 
 export interface ExplorerPrefs {
   termTheme: TermThemeId
   termFontSize: number
   termFont: TermFontId
   termFontCustom: string
+  /** 系统通知：智能体完成或需要注意时 */
+  notifyAgent: boolean
+  /** 系统通知：需要权限时 */
+  notifyPermission: boolean
+  /** 系统通知：发生错误时 */
+  notifyError: boolean
+  /** 音效：智能体完成或需要注意时 */
+  soundAgent: SoundId
+  /** 音效：需要权限时 */
+  soundPermission: SoundId
+  /** 音效：发生错误时 */
+  soundError: SoundId
+  /** 工作区侧栏按最后会话时间自动排序（关闭则保留手动拖拽顺序） */
+  sortWorkspacesByRecency: boolean
 }
 
 export const PREFS_KEY = 'dsh-explorer:prefs'
@@ -21,6 +36,13 @@ export const DEFAULT_PREFS: ExplorerPrefs = {
   termFontSize: 13,
   termFont: 'code',
   termFontCustom: '',
+  notifyAgent: true,
+  notifyPermission: true,
+  notifyError: false,
+  soundAgent: 'staplebops-01',
+  soundPermission: 'staplebops-02',
+  soundError: 'nope-03',
+  sortWorkspacesByRecency: true,
 }
 
 /** 写入 localStorage 的版本。v1 默认把终端交给比例正文，xterm 格子会发糊、字重不均。 */
@@ -164,6 +186,8 @@ function pickKey(prefs: ExplorerPrefs): string {
 
 const THEMES: readonly TermThemeId[] = ['auto', 'light', 'dark', 'slate', 'forest']
 const FONTS: readonly TermFontId[] = ['ui', 'code', 'mono', 'custom']
+const SOUNDS: readonly SoundId[] = ['none', 'staplebops-01', 'staplebops-02', 'nope-03', 'chime-soft', 'chime-bright', 'alert-low', 'alert-high']
+const SOUND_SET = new Set<string>(SOUNDS)
 
 function clipSize(n: number): number {
   return Math.min(22, Math.max(11, Math.round(n)))
@@ -180,7 +204,19 @@ function parsePrefs(raw: string | null): ExplorerPrefs {
     }
     const size = typeof data.termFontSize === 'number' ? clipSize(data.termFontSize) : DEFAULT_PREFS.termFontSize
     const custom = typeof data.termFontCustom === 'string' ? data.termFontCustom.slice(0, 120) : ''
-    return { termTheme: theme, termFontSize: size, termFont: font, termFontCustom: custom }
+    return {
+      termTheme: theme,
+      termFontSize: size,
+      termFont: font,
+      termFontCustom: custom,
+      notifyAgent: typeof data.notifyAgent === 'boolean' ? data.notifyAgent : DEFAULT_PREFS.notifyAgent,
+      notifyPermission: typeof data.notifyPermission === 'boolean' ? data.notifyPermission : DEFAULT_PREFS.notifyPermission,
+      notifyError: typeof data.notifyError === 'boolean' ? data.notifyError : DEFAULT_PREFS.notifyError,
+      soundAgent: typeof data.soundAgent === 'string' && SOUND_SET.has(data.soundAgent) ? data.soundAgent as SoundId : DEFAULT_PREFS.soundAgent,
+      soundPermission: typeof data.soundPermission === 'string' && SOUND_SET.has(data.soundPermission) ? data.soundPermission as SoundId : DEFAULT_PREFS.soundPermission,
+      soundError: typeof data.soundError === 'string' && SOUND_SET.has(data.soundError) ? data.soundError as SoundId : DEFAULT_PREFS.soundError,
+      sortWorkspacesByRecency: typeof data.sortWorkspacesByRecency === 'boolean' ? data.sortWorkspacesByRecency : DEFAULT_PREFS.sortWorkspacesByRecency,
+    }
   } catch {
     return { ...DEFAULT_PREFS }
   }

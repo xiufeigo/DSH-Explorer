@@ -5,6 +5,7 @@
 
 import { IconPanelLeftOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { useExplorer, type ExplorerStore } from './store'
+import { closeNarrowOverlay, narrowNow } from './narrowPanel'
 
 export interface PanelToggleProps {
   store: ExplorerStore
@@ -14,13 +15,26 @@ export interface PanelToggleProps {
 
 export function PanelToggle({ store: storeHandle, openDetails, closeDetails }: PanelToggleProps): JSX.Element {
   const store = useExplorer(storeHandle)
-  const open = store.panelOpen
+  const open = store.panelOpen || store.overlayOpen
   const toggle = (): void => {
+    // 窄屏：右侧栏替换主会话区域。
+    if (narrowNow()) {
+      if (store.overlayOpen) {
+        closeNarrowOverlay(store)
+        store.setPanelIntent(false)
+      } else {
+        store.setPanelIntent(true)
+        openDetails()
+      }
+      return
+    }
     if (open) {
       closeDetails()
+      store.setPanelIntent(false)
       store.setPanelOpen(false)
       return
     }
+    store.setPanelIntent(true)
     store.setPanelOpen(true)
     openDetails()
   }
