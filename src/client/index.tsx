@@ -31,6 +31,7 @@ import { injectStyles } from './styles'
 import { installChatFileOpen, rememberHostOpenPath } from './chatFileOpen'
 import { installNarrowOverlay, overlayAwareOpenDetails } from './narrowPanel'
 import { installWorkspaceRecencyOrder } from './workspaceRecencyOrder'
+import { installWorkspacePinOverlay } from './workspacePinOverlay'
 
 interface SlotsLike {
   inject(name: string, callback: () => unknown): void
@@ -68,8 +69,17 @@ interface ExplorerClientContext {
 export const inject = ['slots', 'sessions', 'workspaces', 'layout']
 export const name = 'dsh-explorer'
 export { parentDir } from './chatFileOpen'
-// 诊断/测试出口：冒烟脚本用假服务直测排序模块。
-export { installWorkspaceRecencyOrder } from './workspaceRecencyOrder'
+// 测试出口：冒烟脚本用假服务直测排序模块（含置顶状态播种/读取）。
+export {
+  installWorkspaceRecencyOrder,
+  __setPinsForTests,
+  getWorkspacePinSummary,
+  resetWorkspacePinOrder,
+  commitWorkspaceOrderIntent,
+  beginWorkspaceDragHold,
+  endWorkspaceDragHold,
+} from './workspaceRecencyOrder'
+export { installWorkspacePinOverlay } from './workspacePinOverlay'
 
 export function apply(ctx: ExplorerClientContext): void {
   // Wrap attachPanels before the first paint so reopening details restores width.
@@ -99,6 +109,10 @@ export function apply(ctx: ExplorerClientContext): void {
       workspaces: ctx.workspaces as never,
     }),
     'dsh-explorer: workspace recency order',
+  )
+  ctx.effect(
+    () => installWorkspacePinOverlay({ workspaces: ctx.workspaces as never }),
+    'dsh-explorer: workspace pin overlay',
   )
   let fileTreeEntry: (() => void) | null = null
 

@@ -17,6 +17,7 @@ import {
   type SoundId,
 } from './prefs'
 import { SOUND_OPTIONS, playNotificationSound } from './soundPlayer'
+import { clearWorkspaceDocks, getWorkspacePinSummary, resetWorkspacePinOrder } from './workspaceRecencyOrder'
 
 const THEME_OPTS: { id: TermThemeId; label: string }[] = [
   { id: 'auto', label: '跟随界面' },
@@ -103,7 +104,7 @@ export function ExplorerSettingsCard(): JSX.Element {
       >
         <span className="dshx-set-copy">
           <span className="dshx-set-name">DSH-Explorer</span>
-          <span className="dshx-set-desc">终端、通知与音效；工作区可按最后会话时间排序。右侧栏宽度会记住上次拖拽结果。</span>
+          <span className="dshx-set-desc">终端、通知与音效；工作区可按最后会话时间排序并支持置顶。右侧栏宽度会记住上次拖拽结果。</span>
         </span>
         <span className="dshx-set-chevron" aria-hidden />
       </button>
@@ -235,13 +236,65 @@ export function ExplorerSettingsCard(): JSX.Element {
             <div className="dshx-set-field dshx-set-notif-row">
               <div className="dshx-set-notif-info">
                 <span className="dshx-set-label">按最后会话时间排序</span>
-                <span className="dshx-set-hint">左侧栏工作区随会话活动自动把最近的排到最前（重启后顺序保留）；开启期间手动拖拽会被自动排序覆盖，关闭即恢复手动排序。</span>
+                <span className="dshx-set-hint">左侧栏工作区随会话活动自动把最近的排到最前（重启后顺序保留）。手动拖拽不会被覆盖：普通区里拖动 = 把它钉在落点，其他项继续跟时间流动。</span>
               </div>
               <Toggle
                 checked={prefs.sortWorkspacesByRecency}
                 onChange={v => { setPrefs({ sortWorkspacesByRecency: v }) }}
               />
             </div>
+            {(() => {
+              const pins = getWorkspacePinSummary()
+              if (pins.count === 0 && pins.dockedCount === 0) {
+                return (
+                  <div className="dshx-set-field">
+                    <span className="dshx-set-hint">置顶：在左侧栏按住工作区行拖动即可调整位置——拖到最顶即置顶（置顶行有左侧色条），拖到普通区某处则钉在那个位置不再跟时间流动；把置顶项拖回普通区即取消置顶。</span>
+                  </div>
+                )
+              }
+              return (
+                <div className="dshx-set-field dshx-set-notif-row">
+                  <div className="dshx-set-notif-info">
+                    <span className="dshx-set-label">
+                      {[
+                        pins.count > 0 ? `已置顶 ${String(pins.count)} 个` : '',
+                        pins.dockedCount > 0 ? `手动定位 ${String(pins.dockedCount)} 个` : '',
+                      ].filter(Boolean).join('，')}
+                    </span>
+                    <span className="dshx-set-hint">
+                      {[
+                        pins.count > 0 ? (pins.mode === 'custom' ? '置顶顺序已按你的操作固定' : '置顶正跟随会话时间') : '',
+                        pins.dockedCount > 0 ? '被拖动定位的工作区不再跟时间流动' : '',
+                      ].filter(Boolean).join('；')}
+                    </span>
+                  </div>
+                  <div className="dshx-set-sound-row">
+                    {pins.dockedCount > 0
+                      ? (
+                        <button
+                          type="button"
+                          className="dshx-set-reset"
+                          onClick={() => { clearWorkspaceDocks(); bump() }}
+                        >
+                          清除定位
+                        </button>
+                      )
+                      : null}
+                    {pins.count > 0 && pins.mode === 'custom'
+                      ? (
+                        <button
+                          type="button"
+                          className="dshx-set-reset"
+                          onClick={() => { resetWorkspacePinOrder(); bump() }}
+                        >
+                          恢复时间排序
+                        </button>
+                      )
+                      : null}
+                  </div>
+                </div>
+              )
+            })()}
 
             <div className="dshx-set-foot">
               <button

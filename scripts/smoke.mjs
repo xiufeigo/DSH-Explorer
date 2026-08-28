@@ -375,7 +375,7 @@ try {
     if (specifier === '@deepseek-ai/dsh-client-ui-primitives') return new Proxy({}, { get: () => () => null })
     throw new Error(`unexpected external require: ${specifier}`)
   }
-  const { installWorkspaceRecencyOrder } = captured5.factory(browserRequire)
+  const { installWorkspaceRecencyOrder, __setPinsForTests, getWorkspacePinSummary, resetWorkspacePinOrder, commitWorkspaceOrderIntent, beginWorkspaceDragHold, endWorkspaceDragHold } = captured5.factory(browserRequire)
   if (typeof installWorkspaceRecencyOrder !== 'function') throw new Error('installWorkspaceRecencyOrder not exported')
 
   const makeStore = (initial) => {
@@ -510,6 +510,174 @@ try {
   }
   ok(`recency order: prototype service method stays bound (this-safe call, ${moves.length} move(s))`)
   dispose3()
+
+  // ── 置顶分区：置顶段在前、普通段在后，各自跟时间；拖拽语义 ├──
+  // 置顶区内拖动一次 → 固化自定义顺序；拖出 → 取消置顶。
+  __setPinsForTests(null)
+  moves.length = 0
+  let current4 = items
+  const workspaces4 = makeStore({ phase: 'ready', items })
+  const sessions4 = makeStore({ phase: 'ready', byId: { ...sessions.getSnapshot().byId } })
+  const insertBefore4 = async (id, before) => {
+    const ids = current4.map(row => row.workspaceId)
+    const next = ids.filter(existing => existing !== id)
+    const at = before === undefined ? next.length : next.indexOf(before)
+    if (at < 0) throw new Error(`unknown anchor ${JSON.stringify(before)}`)
+    next.splice(at, 0, id)
+    current4 = next.map(key => items.find(row => row.workspaceId === key))
+    workspaces4.set({ phase: 'ready', items: current4 })
+    moves.push([id, before])
+  }
+  // 预置：w-new、w-mid 已被置顶（time 模式）。
+  __setPinsForTests({ v: 1, mode: 'time', order: ['w-new', 'w-mid'] })
+  const dispose4 = installWorkspaceRecencyOrder({ sessions: { list: sessions4 }, workspaces: { list: workspaces4, insertBefore: insertBefore4 } })
+  await new Promise(resolve => setTimeout(resolve, 1000))
+  // time 模式下置顶区按各自时间排：w-new(1h 前) > w-mid(1d 前)；普通区 w-active > w-old。
+  const orderPinnedBase = current4.map(row => row.workspaceId).join(',')
+  if (orderPinnedBase !== 'w-new,w-mid,w-active,w-old') {
+    throw new Error(`pinned (time mode) base order unexpected: ${orderPinnedBase} (moves: ${JSON.stringify(moves)})`)
+  }
+  if (getWorkspacePinSummary().mode !== 'time' || getWorkspacePinSummary().count !== 2) {
+    throw new Error(`pin summary unexpected after base enforce: ${JSON.stringify(getWorkspacePinSummary())}`)
+  }
+  ok('pin sections: pinned block first in time mode, rest follows recency')
+
+  // 用户把 w-active 拖到最顶（越过全部置顶项）→ 自动置顶并固化自定义顺序；
+  // 落位与拖动结果一致，无需额外移动。
+  current4 = ['w-active', 'w-new', 'w-mid', 'w-old'].map(key => items.find(row => row.workspaceId === key))
+  workspaces4.set({ phase: 'ready', items: current4 })
+  await new Promise(resolve => setTimeout(resolve, 900))
+  const summaryAfterDragUp = getWorkspacePinSummary()
+  if (summaryAfterDragUp.mode !== 'custom' || summaryAfterDragUp.order.join(',') !== 'w-active,w-new,w-mid') {
+    throw new Error(`drag-up pin intent wrong: ${JSON.stringify(summaryAfterDragUp)}`)
+  }
+  const orderAfterPin = current4.map(row => row.workspaceId).join(',')
+  if (orderAfterPin !== 'w-active,w-new,w-mid,w-old') {
+    throw new Error(`post-pin flat order moved unexpectedly: ${orderAfterPin} (moves: ${JSON.stringify(moves)})`)
+  }
+  ok('pin intent: dragging an unpinned workspace above the pinned block pins it in place')
+
+  // 普通区时间抖动不应重排已固化的置顶顺序。
+  sessions4.set({ ...sessions4.getSnapshot(), byId: { ...sessions4.getSnapshot().byId, 's-mid': { updatedAt: Date.now() } } })
+  await new Promise(resolve => setTimeout(resolve, 900))
+  const orderAfterChurn = current4.map(row => row.workspaceId).join(',')
+  if (orderAfterChurn !== 'w-active,w-new,w-mid,w-old') {
+    throw new Error(`custom pin order churned on session activity: ${orderAfterChurn}`)
+  }
+  ok('pin custom order survives session-activity churn')
+
+  // 设置卡「恢复时间排序」→ w-mid（此刻最新）应回到置顶区最前。
+  resetWorkspacePinOrder()
+  await new Promise(resolve => setTimeout(resolve, 900))
+  const orderAfterReset = current4.map(row => row.workspaceId).join(',')
+  if (getWorkspacePinSummary().mode !== 'time') throw new Error('reset did not switch mode to time')
+  if (orderAfterReset !== 'w-mid,w-active,w-new,w-old') {
+    throw new Error(`reset-to-time order unexpected: ${orderAfterReset}`)
+  }
+  ok('pin reset: returns the pinned block to time ordering')
+
+  // 把已置顶的 w-active 拖到普通项之下 → 取消置顶，并钉在落点（不回时间流）。
+  current4 = ['w-mid', 'w-new', 'w-old', 'w-active'].map(key => items.find(row => row.workspaceId === key))
+  workspaces4.set({ phase: 'ready', items: current4 })
+  await new Promise(resolve => setTimeout(resolve, 900))
+  const summaryAfterDragOut = getWorkspacePinSummary()
+  if (summaryAfterDragOut.count !== 2 || !summaryAfterDragOut.order.includes('w-new') || !summaryAfterDragOut.order.includes('w-mid')) {
+    throw new Error(`drag-out unpin wrong: ${JSON.stringify(summaryAfterDragOut)}`)
+  }
+  // 落点钉住：w-active 停在 w-old 之后，不会被时间（60s 前最新）提回上面。
+  await new Promise(resolve => setTimeout(resolve, 900))
+  const orderAfterUnpin = current4.map(row => row.workspaceId).join(',')
+  if (orderAfterUnpin !== 'w-mid,w-new,w-old,w-active') {
+    throw new Error(`post-unpin flat order unexpected: ${orderAfterUnpin} (moves: ${JSON.stringify(moves)})`)
+  }
+  if (getWorkspacePinSummary().dockedCount !== 1) {
+    throw new Error(`drag-out dock not recorded: ${JSON.stringify(getWorkspacePinSummary())}`)
+  }
+  ok('pin intent: dragging a pinned workspace below the rest unpins it and docks it at the drop point')
+  dispose4()
+  __setPinsForTests(null)
+
+  // ── 普通区拖动 = 钉在落点；其他项继续跟时间流动 ──
+  moves.length = 0
+  let current5 = items
+  const workspaces5 = makeStore({ phase: 'ready', items })
+  const sessions5 = makeStore({ phase: 'ready', byId: { ...sessions.getSnapshot().byId } })
+  const insertBefore5 = async (id, before) => {
+    const ids = current5.map(row => row.workspaceId)
+    const next = ids.filter(existing => existing !== id)
+    const at = before === undefined ? next.length : next.indexOf(before)
+    if (at < 0) throw new Error(`unknown anchor ${JSON.stringify(before)}`)
+    next.splice(at, 0, id)
+    current5 = next.map(key => items.find(row => row.workspaceId === key))
+    workspaces5.set({ phase: 'ready', items: current5 })
+    moves.push([id, before])
+  }
+  __setPinsForTests({ v: 1, mode: 'time', order: ['w-new', 'w-mid'] })
+  const dispose5 = installWorkspaceRecencyOrder({ sessions: { list: sessions5 }, workspaces: { list: workspaces5, insertBefore: insertBefore5 } })
+  await new Promise(resolve => setTimeout(resolve, 1000))
+  const dockBase = current5.map(row => row.workspaceId).join(',')
+  if (dockBase !== 'w-new,w-mid,w-active,w-old') {
+    throw new Error(`dock base order unexpected: ${dockBase} (moves: ${JSON.stringify(moves)})`)
+  }
+
+  // 用户把 w-active 拖到 w-old 之后（普通区内）→ 钉住，位置不回弹。
+  current5 = ['w-new', 'w-mid', 'w-old', 'w-active'].map(key => items.find(row => row.workspaceId === key))
+  workspaces5.set({ phase: 'ready', items: current5 })
+  await new Promise(resolve => setTimeout(resolve, 900))
+  if (current5.map(row => row.workspaceId).join(',') !== 'w-new,w-mid,w-old,w-active') {
+    throw new Error(`dock drag did not stick: ${current5.map(row => row.workspaceId).join(',')}`)
+  }
+  if (getWorkspacePinSummary().dockedCount !== 1) {
+    throw new Error(`dock not recorded: ${JSON.stringify(getWorkspacePinSummary())}`)
+  }
+  ok('dock: dragging within the normal section pins the workspace at the drop point')
+
+  // 被钉住的 w-active 自己变成最新活动，也不会浮回去。
+  sessions5.set({ ...sessions5.getSnapshot(), byId: { ...sessions5.getSnapshot().byId, 's-new': { updatedAt: Date.now() + 60_000 } } })
+  await new Promise(resolve => setTimeout(resolve, 900))
+  if (current5.map(row => row.workspaceId).join(',') !== 'w-new,w-mid,w-old,w-active') {
+    throw new Error(`docked workspace floated on its own activity: ${current5.map(row => row.workspaceId).join(',')}`)
+  }
+  ok('dock: a docked workspace stays put even when its sessions go active')
+
+  // 其他项的时间流动会绕过被钉住的项。
+  sessions5.set({ ...sessions5.getSnapshot(), byId: { ...sessions5.getSnapshot().byId, 's-mid': { updatedAt: Date.now() + 120_000 } } })
+  await new Promise(resolve => setTimeout(resolve, 900))
+  if (current5.map(row => row.workspaceId).join(',') !== 'w-mid,w-new,w-old,w-active') {
+    throw new Error(`pinned time churn unexpected: ${current5.map(row => row.workspaceId).join(',')}`)
+  }
+  ok('dock: the rest of the list keeps time-flowing around the docked item')
+
+  // 「恢复时间排序」清掉手动定位 → 全列表回到纯时间序。
+  resetWorkspacePinOrder()
+  await new Promise(resolve => setTimeout(resolve, 900))
+  if (getWorkspacePinSummary().dockedCount !== 0) {
+    throw new Error(`reset did not clear docks: ${JSON.stringify(getWorkspacePinSummary())}`)
+  }
+  const afterDockReset = current5.map(row => row.workspaceId).join(',')
+  // reset 保留置顶成员（w-new、w-mid 仍在置顶区，按时间 m > n），清掉定位后
+  // 普通区按时间：w-active(+60s) > w-old(5d 前)。
+  if (afterDockReset !== 'w-mid,w-new,w-active,w-old') {
+    throw new Error(`post dock-reset order unexpected: ${afterDockReset}`)
+  }
+  ok('dock reset: clearing manual placement returns everything to time order')
+
+  // 覆盖层指针拖拽的提交入口：拖 w-active 到最顶 → 置顶（与原生拖拽同一分类器）。
+  beginWorkspaceDragHold()
+  commitWorkspaceOrderIntent(['w-active', 'w-mid', 'w-new', 'w-old'])
+  endWorkspaceDragHold()
+  await new Promise(resolve => setTimeout(resolve, 900))
+  const summaryAfterCommit = getWorkspacePinSummary()
+  if (summaryAfterCommit.mode !== 'custom' || summaryAfterCommit.order[0] !== 'w-active') {
+    throw new Error(`commit path pin wrong: ${JSON.stringify(summaryAfterCommit)}`)
+  }
+  const orderAfterCommit = current5.map(row => row.workspaceId).join(',')
+  if (orderAfterCommit !== 'w-active,w-mid,w-new,w-old') {
+    throw new Error(`commit path order unexpected: ${orderAfterCommit}`)
+  }
+  ok('commit entry: pointer-drop intents go through the same classifier')
+  dispose5()
+  __setPinsForTests(null)
   delete globalThis.document
 } catch (error) {
   fail('workspace recency order', error)
