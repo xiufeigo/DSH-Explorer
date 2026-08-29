@@ -20,28 +20,68 @@
 
 import { spawnSync } from 'node:child_process'
 import {
-  existsSync, lstatSync, mkdirSync, readFileSync,
-  symlinkSync, writeFileSync,
+  existsSync, lstatSync, mkdirSync, readdirSync, readFileSync,
+  statSync, symlinkSync, writeFileSync,
 } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { linkPointsTo, locateHarness, shellLine } from './harness.mjs'
+import { atomicWrite, backupOnce, linkPointsTo, locateHarness, shellLine } from './harness.mjs'
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const ROW_ID = 'dsh-explorer'
 
 // ── 参数解析 ───────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2)
+const KNOWN_OPTS = new Set([
+  '--dry-run', '--fork-width', '--fork-ui', '--forks', '--rebuild', '--profile', '--harness',
+])
+for (const token of argv) {
+  const head = token.split('=')[0]
+  if (token.startsWith('--') && !KNOWN_OPTS.has(head)) {
+    console.error(`✘ 未知参数：${token}`)
+    console.error('  可用：--dry-run --fork-width --fork-ui --forks --rebuild --profile <name> --harness <path>')
+    process.exit(1)
+  }
+}
 const flag = (name) => argv.includes(name)
 const opt = (name) => {
+  // 同时支持 `--name value` 与 `--name=value`；漏值（下一个 token 是 -- 开头）视为未提供。
+  const eqForm = argv.find(token => token.startsWith(`${name}=`))
+  if (eqForm !== undefined) {
+    const value = eqForm.slice(name.length + 1)
+    return value.length > 0 ? value : undefined
+  }
   const i = argv.indexOf(name)
   return i >= 0 && argv[i + 1] !== undefined && !argv[i + 1].startsWith('--') ? argv[i + 1] : undefined
+}
+function requireValue(name, value) {
+  const present = argv.some(token => token === name || token.startsWith(`${name}=`))
+  if (present && value === undefined) {
+    console.error(`✘ ${name} 缺少取值（用法：${name} <value>）`)
+    process.exit(1)
+  }
 }
 const DRY = flag('--dry-run')
 const wantWidthFork = flag('--fork-width') || flag('--fork-ui') || flag('--forks')
 const wantSidebarFork = flag('--fork-ui') || flag('--forks')
+const harnessFlag = opt('--harness')
+requireValue('--harness', harnessFlag)
 const PROFILE = opt('--profile') ?? 'web'
-const DSH_HOME = process.env.DSH_HOME || join(process.env.USERPROFILE || process.env.HOME || '', '.dsh')
+requireValue('--profile', opt('--profile'))
+// DSH_HOME 缺失时不再静默落相对路径：默认位置没有 profiles/ 结构就报错，
+// 避免把 junction/patch 写进 <cwd>\.dsh 造成「装成功但不生效」。
+let DSH_HOME
+if (process.env.DSH_HOME !== undefined && process.env.DSH_HOME.length > 0) {
+  DSH_HOME = process.env.DSH_HOME
+} else {
+  const fallback = join(process.env.USERPROFILE || process.env.HOME || '', '.dsh')
+  if (!existsSync(join(fallback, 'profiles'))) {
+    console.error(`✘ 未设置 DSH_HOME，且默认位置 ${fallback} 不含 profiles/ 目录`)
+    console.error('  请设置环境变量 DSH_HOME 指向 DSH 主目录（含 profiles/<profile>）后再试')
+    process.exit(1)
+  }
+  DSH_HOME = fallback
+}
 const PROFILE_DIR = join(DSH_HOME, 'profiles', PROFILE)
 const PATCH_PATH = join(PROFILE_DIR, 'cordis.patch.yml')
 // 包解析基准：DSH 的 junction 农场在 profiles/node_modules（所有 profile 共享），
@@ -66,12 +106,25 @@ function exec(description, fn, dry = DRY) {
     log(`  [dry-run] ${description}`)
     return 0
   }
-  return fn()
+  try {
+    return fn()
+  } catch (error) {
+    console.error(`  ✘ ${description} 失败：${error.message}`)
+    process.exit(1)
+  }
+}
+
+/** 文件存在且含标记；读失败（权限/占用）只当不含，不让提示分支硬崩。 */
+function fileIncludes(filePath, marker) {
+  try {
+    return existsSync(filePath) && readFileSync(filePath, 'utf8').includes(marker)
+  } catch {
+    return false
+  }
 }
 
 // ── 1. 定位 harness（fork / apps/cli junction 才需要） ─────────────────────
 step('定位 deepseek-harness')
-const harnessFlag = opt('--harness')
 const harnessRoot = locateHarness({
   explicit: harnessFlag,
   projectRoot: PROJECT_ROOT,
@@ -103,17 +156,51 @@ const LIB_INDEX = join(PROJECT_ROOT, 'lib', 'index.js')
 const LIB_CLIENT = join(PROJECT_ROOT, 'lib', 'client.js')
 const HAS_LIB = existsSync(LIB_INDEX) && existsSync(LIB_CLIENT)
 const HAS_DEPS = existsSync(join(PROJECT_ROOT, 'node_modules', 'react'))
+
+/** src 里最新文件的 mtime（递归）；目录不存在返回 0。 */
+function newestMtimeMs(dir) {
+  if (!existsSync(dir)) return 0
+  let newest = 0
+  const stack = [dir]
+  while (stack.length > 0) {
+    const current = stack.pop()
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const full = join(current, entry.name)
+      if (entry.isDirectory()) { stack.push(full); continue }
+      if (entry.isFile()) {
+        const mtime = statSync(full).mtimeMs
+        if (mtime > newest) newest = mtime
+      }
+    }
+  }
+  return newest
+}
+/** 陈旧产物检测：src 比任一 lib 产物新 → 不能拿旧 bundle 直接上线。
+ *  package.json 也算构建输入（exports/files/dsh 元数据进 bundle 语义）。 */
+function libIsStale() {
+  if (!HAS_LIB) return false
+  const configPath = join(PROJECT_ROOT, 'tsdown.config.ts')
+  const configMtime = existsSync(configPath) ? statSync(configPath).mtimeMs : 0
+  const pkgPath = join(PROJECT_ROOT, 'package.json')
+  const pkgMtime = existsSync(pkgPath) ? statSync(pkgPath).mtimeMs : 0
+  const srcMtime = Math.max(newestMtimeMs(join(PROJECT_ROOT, 'src')), configMtime, pkgMtime)
+  const libMtime = Math.min(statSync(LIB_INDEX).mtimeMs, statSync(LIB_CLIENT).mtimeMs)
+  return srcMtime > libMtime
+}
+const STALE = HAS_LIB && libIsStale()
+
 if (!HAS_DEPS || flag('--rebuild')) {
   const code = exec('pnpm install', () => run('pnpm', ['install'], PROJECT_ROOT))
   if (code !== 0) process.exit(1)
 } else {
   log('  node_modules 已存在')
 }
-if (!HAS_LIB || flag('--rebuild')) {
+if (!HAS_LIB || flag('--rebuild') || STALE) {
+  if (STALE) log('  lib/ 落后于 src/（或 tsdown.config.ts / package.json），重新构建')
   const build = exec('pnpm run build', () => run('pnpm', ['run', 'build'], PROJECT_ROOT))
   if (build !== 0) process.exit(1)
 } else {
-  log('  lib/index.js + lib/client.js 已存在（--rebuild 可强制重建）')
+  log('  lib/index.js + lib/client.js 已存在且与 src 同步（--rebuild 可强制重建）')
 }
 
 step('冒烟自检（真实执行两个 bundle）')
@@ -178,9 +265,12 @@ if (!existsSync(PATCH_PATH)) {
   process.exit(1)
 }
 const patchText = readFileSync(PATCH_PATH, 'utf8')
+const EOL = patchText.includes('\r\n') ? '\r\n' : '\n'
 const lines = patchText.split(/\r?\n/)
+// 放宽到引号与行尾注释变体（手写 `id: "dsh-explorer"` 也算已在），避免重复块。
+const ROW_RE = /^\s*-\s*id:\s*["']?dsh-explorer["']?\s*(#.*)?$/
 
-const rowIndex = lines.findIndex(line => /^\s*-\s*id:\s*dsh-explorer\s*$/.test(line))
+const rowIndex = lines.findIndex(line => ROW_RE.test(line))
 if (rowIndex >= 0) {
   // 已存在：扫完整子块（缩进更深的续行），若被禁用则重新启用。
   const rowIndent = (lines[rowIndex].match(/^\s*/)?.[0] ?? '').length
@@ -194,12 +284,15 @@ if (rowIndex >= 0) {
   }
   let disabledIndex = -1
   for (let i = rowIndex; i < end; i++) {
-    if (/^\s*disabled:\s*true\s*$/.test(lines[i])) disabledIndex = i
+    // 放宽行内注释：`disabled: true  # 暂时停用` 也要能识别并重新启用。
+    if (/^\s*disabled:\s*true\s*(#.*)?$/.test(lines[i])) disabledIndex = i
   }
   if (disabledIndex >= 0) {
     const apply = () => {
+      const current = readFileSync(PATCH_PATH, 'utf8')
+      if (current !== patchText) throw new Error('patch 文件在读取后被改动，放弃写入（请重试）')
       lines.splice(disabledIndex, 1)
-      writeFileSync(PATCH_PATH, lines.join('\n'))
+      writeFileSync(PATCH_PATH, lines.join(EOL))
     }
     exec(`移除 dsh-explorer 行的 disabled: true`, apply)
     if (!DRY) log('  ✓ 已重新启用插件行')
@@ -214,10 +307,12 @@ if (rowIndex >= 0) {
     '      name: dsh-explorer',
   ]
   const apply = () => {
+    const current = readFileSync(PATCH_PATH, 'utf8')
+    if (current !== patchText) throw new Error('patch 文件在读取后被改动，放弃写入（请重试）')
     const body = patchText.trimEnd()
     // 卸载后可能留下合法空文档 `[]`；再拼一个 `- insert:` 会变成非法 YAML。
     const usable = body.length > 0 && body.trim() !== '[]'
-    writeFileSync(PATCH_PATH, `${usable ? `${body}\n\n` : ''}${block.join('\n')}\n`)
+    writeFileSync(PATCH_PATH, `${usable ? `${body}${EOL}${EOL}` : ''}${block.join(EOL)}${EOL}`)
   }
   exec('追加 dsh-explorer insert 块', apply)
   if (!DRY) log('  ✓ 已写入（watchUserPatches 会热重载组合）')
@@ -233,7 +328,11 @@ const SIDEBAR_DIR = harnessRoot === undefined
   : join(harnessRoot, 'packages', 'client', 'ui-sidebar', 'src', 'client')
 const SEAT_KEY = 'sidebar.workspaces.actions'
 
-/** 幂等文本补丁。返回 { status: 'already'|'applied' } 或 { error }。dry-run 不写盘。 */
+/**
+ * 幂等文本补丁。返回 { status: 'already'|'applied' } 或 { error }。dry-run 不写盘。
+ * 写盘前先留一次原始备份（.dshx-orig），同盘临时文件 + 原子换名，避免进程
+ * 中途被杀留下半截宿主源码（载荷目录通常没有 git 保护）。
+ */
 function patchSource(filePath, marker, patchFn) {
   if (!existsSync(filePath)) return { error: `找不到 ${filePath}` }
   const original = readFileSync(filePath, 'utf8')
@@ -245,7 +344,12 @@ function patchSource(filePath, marker, patchFn) {
     log(`  [dry-run] 写入 fork：${filePath}`)
     return { status: 'applied' }
   }
-  writeFileSync(filePath, next)
+  try {
+    backupOnce(filePath)
+    atomicWrite(filePath, next)
+  } catch (error) {
+    return { error: `写入失败（原文件未动或可自 .dshx-orig 恢复）：${filePath}: ${error.message}` }
+  }
   return { status: 'applied' }
 }
 
@@ -266,10 +370,8 @@ function anyPatchApplied(results) {
 if (wantWidthFork) {
   step('fork：右侧栏宽度上限 + 宽度记忆（ui-layout）')
   const err = patchSource(COLUMNS_PATH, FORK_MARKER, (source) => {
-    if (!/export const DETAILS_MAX = 520/.test(source)) {
-      console.error('  ✘ 未找到 `export const DETAILS_MAX = 520`，源码可能已变化，请手动处理')
-      return source
-    }
+    // 未命中时返回原文，由 patchSource 统一报错（避免双份日志）。
+    if (!/export const DETAILS_MAX = 520/.test(source)) return source
     return source.replace(
       /\/\*\* Details drag clamp ceiling\. \*\/\s*\n\s*export const DETAILS_MAX = 520/,
       '/** Details drag clamp ceiling.\n *  FORK（本机部署改动，DSH-Explorer 依赖）：上游为 520，插件层无法绕过\n *  store 内钳制；升级 DSH 会覆盖，重新执行 `pnpm plugin:install --forks`\n *  即可恢复。实际渲染仍受列宽让步链约束（中心列保持 >= 640）。 */\nexport const DETAILS_MAX = 1200',
@@ -325,7 +427,7 @@ if (wantWidthFork) {
   } else {
     process.exit(1)
   }
-} else if (harnessRoot !== undefined && existsSync(COLUMNS_PATH) && readFileSync(COLUMNS_PATH, 'utf8').includes(FORK_MARKER)) {
+} else if (harnessRoot !== undefined && fileIncludes(COLUMNS_PATH, FORK_MARKER)) {
   log('  提示：宽度 fork 已就位（如需重新应用见 README）')
 } else if (harnessRoot !== undefined) {
   log('  提示：如需"随意调整"右侧栏宽度，可加 --fork-width（改 harness 一行并重建）')
@@ -391,41 +493,47 @@ if (wantSidebarFork) {
   } else {
     process.exit(1)
   }
-} else if (harnessRoot !== undefined && existsSync(join(SIDEBAR_DIR, 'SidebarRoot.tsx')) && readFileSync(join(SIDEBAR_DIR, 'SidebarRoot.tsx'), 'utf8').includes('workspaceActions')) {
+} else if (harnessRoot !== undefined && fileIncludes(join(SIDEBAR_DIR, 'SidebarRoot.tsx'), 'workspaceActions')) {
   log('  提示：顶部动作条座位 fork 已就位')
 } else if (harnessRoot !== undefined) {
   log('  提示：如需"文件"按钮紧贴工作区（顶部动作条座位），加 --fork-ui（改 ui-sidebar 并重建）')
 }
 
-// ── 6. HTTP 验证（尽力而为） ───────────────────────────────────────────────
+// ── 6. HTTP 验证（尽力而为；dry-run 不发真实请求） ─────────────────────────
 step('线上验证（尽力而为，不阻塞安装）')
-const base = process.env.DSH_WEB_URL || 'http://127.0.0.1:3080'
-const fetchOpts = { signal: AbortSignal.timeout(3500) }
-try {
-  const rpc = await fetch(`${base}/dsh-explorer/rpc`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-dsh-explorer': '1' },
-    body: JSON.stringify({ sessionId: 'install-check', method: 'session.meta', args: {} }),
-    ...fetchOpts,
-  })
-  if (rpc.status === 200) {
-    log(`  ✓ Host RPC 路由已挂载（${base}/dsh-explorer/rpc）`)
-  } else {
-    log(`  △ Host RPC 路由返回 ${rpc.status}：若为首次安装，请重启 dsh web`)
+if (DRY) {
+  log('  [dry-run] 跳过线上验证')
+} else {
+  const base = process.env.DSH_WEB_URL || 'http://127.0.0.1:3080'
+  // 新闸要求同源回环 Origin；探测请求按真实客户端语义带上。
+  const origin = new URL(base).origin
+  const fetchOpts = { signal: AbortSignal.timeout(3500) }
+  try {
+    const rpc = await fetch(`${base}/dsh-explorer/rpc`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-dsh-explorer': '1', origin },
+      body: JSON.stringify({ sessionId: 'install-check', method: 'session.meta', args: {} }),
+      ...fetchOpts,
+    })
+    if (rpc.status === 200) {
+      log(`  ✓ Host RPC 路由已挂载（${base}/dsh-explorer/rpc）`)
+    } else {
+      log(`  △ Host RPC 路由返回 ${rpc.status}：若为首次安装，请重启 dsh web`)
+    }
+  } catch {
+    log(`  △ 无法访问 ${base}：请重启 dsh web 后按 README 验证`)
   }
-} catch {
-  log(`  △ 无法访问 ${base}：请重启 dsh web 后按 README 验证`)
-}
-try {
-  const bundle = await fetch(`${base}/plugins/dsh-explorer/client.js`, fetchOpts)
-  const head = (await bundle.text()).slice(0, 40)
-  if (bundle.status === 200 && head.includes('__ModuleLoader__')) {
-    log('  ✓ 浏览器 bundle 已在服务（/plugins/dsh-explorer/client.js）')
-  } else {
-    log('  △ 浏览器 bundle 未就绪：重启 dsh web 后刷新页面')
+  try {
+    const bundle = await fetch(`${base}/plugins/dsh-explorer/client.js`, fetchOpts)
+    const head = (await bundle.text()).slice(0, 40)
+    if (bundle.status === 200 && head.includes('__ModuleLoader__')) {
+      log('  ✓ 浏览器 bundle 已在服务（/plugins/dsh-explorer/client.js）')
+    } else {
+      log('  △ 浏览器 bundle 未就绪：重启 dsh web 后刷新页面')
+    }
+  } catch {
+    log('  △ 无法访问 bundle 路由（见上）')
   }
-} catch {
-  log('  △ 无法访问 bundle 路由（见上）')
 }
 
 // ── 完成 ───────────────────────────────────────────────────────────────────

@@ -44,14 +44,19 @@ interface RenderCtx {
 
 function safeUrl(dest: string, image: boolean): string {
   const url = dest.trim().replace(/^<([\s\S]*)>$/, '$1').trim()
-  const scheme = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(url)
+  // WHATWG URL 解析会剥掉 href 里任意位置的 tab/换行等 C0 控制字符——
+  // 不先剥净就判协议，会被 `java<TAB>script:` 绕过（点击按
+  // javascript: 执行）。检测与返回值都用净化后的串（空格保留，仅相对
+  // 路径语义相关；控制字符对合法链接无意义）。
+  const cleaned = url.replace(/[\u0000-\u001f]+/g, '')
+  const scheme = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(cleaned)
   if (scheme !== null) {
     const id = scheme[1].toLowerCase()
-    if (id === 'http' || id === 'https' || id === 'mailto') return url
-    if (image && id === 'data' && /^data:image\/(?:png|jpe?g|gif|webp|bmp);/i.test(url)) return url
+    if (id === 'http' || id === 'https' || id === 'mailto') return cleaned
+    if (image && id === 'data' && /^data:image\/(?:png|jpe?g|gif|webp|bmp);/i.test(cleaned)) return cleaned
     return '#'
   }
-  return url
+  return cleaned
 }
 
 function attr(text: string): string {
@@ -841,7 +846,11 @@ function parseBlocks(
 // ─── 入口 ────────────────────────────────────────────────────────────────────
 
 export function renderMarkdown(markdown: string): string {
-  const normalized = markdown.replace(/\r\n?/g, '\n')
+  // 预清私有区（PUA）字符：内部哨兵（\uE1xx 段）占用该区段，用户输入若携带
+  // PUA 字符会与哨兵序号碰撞，导致占位被错误展开（标签重复展开的文本畸变，
+  // 无 XSS）。只在最上游总入口清一次，覆盖 front matter / 代码块 / 行内全部
+  // 文本路径，不漏不重。
+  const normalized = markdown.replace(/[\uE000-\uF8FF]/g, '').replace(/\r\n?/g, '\n')
   let lines = normalized.split('\n')
 
   const head: string[] = []

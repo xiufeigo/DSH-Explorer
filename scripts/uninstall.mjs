@@ -3,34 +3,74 @@
  * DSH-Explorer 卸载器（幂等，可重复执行）。
  *
  * 流程：移除 profile patch 里的插件行（热重载生效）→ 删除两个包解析 junction
- *      → 若 harness 含本安装器写入的宽度 FORK 标记，默认回退并重建（--keep-fork 跳过）。
+ *      → 若 harness 含本安装器写入的宽度 FORK 与顶部动作条座位 FORK 标记，
+ *        默认回退并重建（--keep-fork 全部保留）。回退前留 .dshx-orig 备份。
  *
  * 用法：
  *   node scripts/uninstall.mjs            # 完整卸载
- *   node scripts/uninstall.mjs --keep-fork # 保留宽度 fork 改动
+ *   node scripts/uninstall.mjs --keep-fork # 保留 harness fork 改动
  *   node scripts/uninstall.mjs --dry-run   # 只打印计划，不执行
  */
 
 import { spawnSync } from 'node:child_process'
 import {
-  existsSync, lstatSync, readFileSync, unlinkSync, writeFileSync,
+  existsSync, lstatSync, readFileSync, readlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { linkPointsTo, locateHarness, shellLine } from './harness.mjs'
+import {
+  atomicWrite, backupOnce, linkPointsTo, locateHarness,
+  sameResolved, shellLine, stripNtPrefix,
+} from './harness.mjs'
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const ROW_ID = 'dsh-explorer'
 
 const argv = process.argv.slice(2)
+const KNOWN_OPTS = new Set(['--keep-fork', '--dry-run', '--profile', '--harness'])
+for (const token of argv) {
+  const head = token.split('=')[0]
+  if (token.startsWith('--') && !KNOWN_OPTS.has(head)) {
+    console.error(`✘ 未知参数：${token}`)
+    console.error('  可用：--keep-fork --dry-run --profile <name> --harness <path>')
+    process.exit(1)
+  }
+}
 const flag = (name) => argv.includes(name)
 const opt = (name) => {
+  const eqForm = argv.find(token => token.startsWith(`${name}=`))
+  if (eqForm !== undefined) {
+    const value = eqForm.slice(name.length + 1)
+    return value.length > 0 ? value : undefined
+  }
   const i = argv.indexOf(name)
   return i >= 0 && argv[i + 1] !== undefined && !argv[i + 1].startsWith('--') ? argv[i + 1] : undefined
 }
+function requireValue(name, value) {
+  const present = argv.some(token => token === name || token.startsWith(`${name}=`))
+  if (present && value === undefined) {
+    console.error(`✘ ${name} 缺少取值（用法：${name} <value>）`)
+    process.exit(1)
+  }
+}
 const DRY = flag('--dry-run')
+const harnessFlag = opt('--harness')
+requireValue('--harness', harnessFlag)
 const PROFILE = opt('--profile') ?? 'web'
-const DSH_HOME = process.env.DSH_HOME || join(process.env.USERPROFILE || process.env.HOME || '', '.dsh')
+requireValue('--profile', opt('--profile'))
+// 与安装器同一规则：默认位置没有 profiles/ 结构时报错，不静默写错地方。
+let DSH_HOME
+if (process.env.DSH_HOME !== undefined && process.env.DSH_HOME.length > 0) {
+  DSH_HOME = process.env.DSH_HOME
+} else {
+  const fallback = join(process.env.USERPROFILE || process.env.HOME || '', '.dsh')
+  if (!existsSync(join(fallback, 'profiles'))) {
+    console.error(`✘ 未设置 DSH_HOME，且默认位置 ${fallback} 不含 profiles/ 目录`)
+    console.error('  请设置环境变量 DSH_HOME 指向 DSH 主目录（含 profiles/<profile>）后再试')
+    process.exit(1)
+  }
+  DSH_HOME = fallback
+}
 const PROFILE_DIR = join(DSH_HOME, 'profiles', PROFILE)
 const PATCH_PATH = join(PROFILE_DIR, 'cordis.patch.yml')
 // 与安装器一致的解析基准：junction 农场（profiles/node_modules）优先，兼容 per-profile 目录。
@@ -41,8 +81,9 @@ const JUNCTION_BASES = [
 
 const log = (...parts) => console.log(...parts)
 const step = (title) => console.log(`\n▶ ${title}`)
+// 卸载结束时汇总的残留提示（fork 回退未命中等）。
+const residueWarnings = []
 
-const harnessFlag = opt('--harness')
 const harnessRoot = locateHarness({
   explicit: harnessFlag,
   projectRoot: PROJECT_ROOT,
@@ -59,8 +100,11 @@ if (!existsSync(PATCH_PATH)) {
   log('  △ patch 文件不存在，跳过（可能已卸载）')
 } else {
   const text = readFileSync(PATCH_PATH, 'utf8')
+  const EOL = text.includes('\r\n') ? '\r\n' : '\n'
   const lines = text.split(/\r?\n/)
-  const rowIndex = lines.findIndex(line => /^\s*-\s*id:\s*dsh-explorer\s*$/.test(line))
+  // 放宽到引号与行尾注释变体，避免手写 `id: "dsh-explorer"` 删不掉。
+  const ROW_RE = /^\s*-\s*id:\s*["']?dsh-explorer["']?\s*(#.*)?$/
+  const rowIndex = lines.findIndex(line => ROW_RE.test(line))
   if (rowIndex < 0) {
     log('  ✓ 插件行不存在（已卸载）')
   } else {
@@ -82,12 +126,18 @@ if (!existsSync(PATCH_PATH)) {
     while (end > rowIndex + 1 && lines[end - 1].trim() === '') end--
 
     const applyRemove = () => {
+      const current = readFileSync(PATCH_PATH, 'utf8')
+      if (current !== text) throw new Error('patch 文件在读取后被改动，放弃写入（请重试）')
       lines.splice(start, end - start)
-      // 若所在 insert 块已无子行，连 insert 行一并移除。
+      // 若所在 insert 块已无子行，连 insert 行一并移除。向上有界探测，
+      // 跳过空行与注释（避免中间隔注释时留下 `insert: null`）。
       const insertIndex = (() => {
-        for (let i = start - 1; i >= 0; i--) {
-          if (/^\s*- insert:\s*$/.test(lines[i])) return i
-          if (lines[i].trim() !== '') break
+        for (let i = start - 1; i >= Math.max(0, start - 6); i--) {
+          const trimmed = lines[i].trim()
+          if (trimmed === '' || trimmed.startsWith('#')) continue
+          // 放宽行内注释与空格变体：`- insert:  # 说明` 也算 insert 行。
+          if (/^\s*-\s*insert:\s*(#.*)?$/.test(lines[i])) return i
+          break
         }
         return -1
       })()
@@ -95,7 +145,7 @@ if (!existsSync(PATCH_PATH)) {
         let hasChild = false
         for (let i = insertIndex + 1; i < lines.length; i++) {
           const line = lines[i]
-          if (line.trim() === '') continue
+          if (line.trim() === '' || line.trim().startsWith('#')) continue
           if (/^-\s+/.test(line)) break // 下一个顶层条目
           if (/^\s+-\s+id:/.test(line)) { hasChild = true; break }
         }
@@ -104,8 +154,8 @@ if (!existsSync(PATCH_PATH)) {
           lines.splice(insertIndex, 1)
         }
       }
-      const cleaned = lines.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd()
-      writeFileSync(PATCH_PATH, `${cleaned.length > 0 ? `${cleaned}\n` : '[]\n'}`)
+      const cleaned = lines.join(EOL).replace(/(\r?\n){3,}/g, `${EOL}${EOL}`).trimEnd()
+      writeFileSync(PATCH_PATH, cleaned.length > 0 ? `${cleaned}${EOL}` : `[]${EOL}`)
     }
     exec('移除 dsh-explorer 行（含注释与空 insert 块）', applyRemove)
     if (!DRY) log('  ✓ 已移除（watchUserPatches 热重载，Host 路由随即下线）')
@@ -114,6 +164,24 @@ if (!existsSync(PATCH_PATH)) {
 
 // ── 2. 删除包解析 junction ─────────────────────────────────────────────────
 step('删除包解析 junction')
+/**
+ * removeJunction 的兜底判定：链接目标无法经 linkPointsTo 解析到本项目时
+ *（死链、NT 前缀变体等），读 readlink 原始文本——剥净 `\\?\` / `\??\`
+ * 前缀后按链接所在目录 resolve：resolve 相等或以项目 basename 结尾即视为
+ * 指向本项目（目标已不存在的死链同样适用）。
+ */
+function rawLinkPointsToProject(link) {
+  let raw
+  try { raw = readlinkSync(link) } catch { return false }
+  const cleaned = stripNtPrefix(raw).trim()
+  if (cleaned.length === 0) return false
+  const resolved = resolve(dirname(link), cleaned)
+  if (sameResolved(resolved, PROJECT_ROOT)) return true
+  const base = basename(PROJECT_ROOT).toLowerCase()
+  const lower = resolved.toLowerCase()
+  return lower.endsWith(`${sep}${base}`) || lower.endsWith(`/${base}`)
+}
+
 function removeJunction(link) {
   try {
     const stat = lstatSync(link)
@@ -121,19 +189,26 @@ function removeJunction(link) {
       log(`  △ ${link} 不是链接，跳过（避免误删普通目录）`)
       return
     }
-    const currentOk = (() => {
-      try { return linkPointsTo(link, PROJECT_ROOT) } catch { return false }
-    })()
+    let currentOk = false
+    try { currentOk = linkPointsTo(link, PROJECT_ROOT) } catch { /* 坏链 / 读取失败 */ }
+    let viaRawText = false
     if (!currentOk) {
-      log(`  △ ${link} 不是指向本项目的链接，跳过`)
-      return
+      // 二次判定：原始链接文本指向本项目（含目标已不存在的死链）则允许删。
+      viaRawText = rawLinkPointsToProject(link)
+      if (!viaRawText) {
+        log(`  △ ${link} 不是指向本项目的链接，跳过`)
+        residueWarnings.push(`${link} 链接残留（未确认指向本项目，未删除）`)
+        return
+      }
     }
     if (DRY) {
       log(`  [dry-run] 删除 junction：${link}`)
       return
     }
     unlinkSync(link)
-    log(`  ✓ 已删除：${link}`)
+    log(viaRawText
+      ? `  ✓ 已删除（原始链接文本指向本项目）：${link}`
+      : `  ✓ 已删除：${link}`)
   } catch (error) {
     if (error.code === 'ENOENT') {
       log(`  ✓ 不存在（跳过）：${link}`)
@@ -225,8 +300,99 @@ if (!flag('--keep-fork')) {
   log('\n（--keep-fork：保留宽度 fork 改动）')
 }
 
+// ── 4. 顶部动作条座位 fork 回退（--fork-ui 写入的 ui-sidebar 改动） ────────
+if (!flag('--keep-fork')) {
+  step('检查顶部动作条座位 fork（sidebar.workspaces.actions）')
+  if (harnessRoot === undefined) {
+    log('  △ 无法定位 harness，跳过（手动确认 ui-sidebar 是否残留 FORK 改动）')
+  } else {
+    const SIDEBAR_DIR = join(harnessRoot, 'packages', 'client', 'ui-sidebar', 'src', 'client')
+    const SEAT_KEY = 'sidebar.workspaces.actions'
+    let needSidebarRebuild = false
+
+    /** 单文件回退：按标记判断存在性，回退未命中宁可不动文件并记残留。 */
+    function revertFile(label, filePath, marker, revertFn) {
+      if (!existsSync(filePath)) {
+        log(`  △ 找不到 ${label}，跳过`)
+        return
+      }
+      const source = readFileSync(filePath, 'utf8')
+      if (!source.includes(marker)) {
+        log(`  ✓ ${label} 无该 fork，跳过`)
+        return
+      }
+      if (DRY) {
+        log(`  [dry-run] 回退 ${label} 的 fork`)
+        needSidebarRebuild = true
+        return
+      }
+      const next = revertFn(source)
+      if (next === source || next.includes(marker)) {
+        log(`  ✘ ${label} 回退未命中（源码可能已变），未改文件`)
+        residueWarnings.push(`${filePath} 仍含 ${marker} 标记`)
+        return
+      }
+      try { backupOnce(filePath) } catch { /* 备份失败不阻断回退 */ }
+      atomicWrite(filePath, next)
+      log(`  ✓ 已回退 ${label}`)
+      needSidebarRebuild = true
+    }
+
+    revertFile('contract/slots.ts', join(SIDEBAR_DIR, 'contract', 'slots.ts'), SEAT_KEY, (source) => {
+      let out = source.replace(
+        /\n[ \t]*\/\*\* FORK（本机部署改动，DSH-Explorer 依赖）：工作区上方动作条座位，见 README。 \*\/\n[ \t]*'sidebar\.workspaces\.actions': \{ kind: 'list'; scope: 'root'; owner: SidebarFooterActionOwnerProps \}/,
+        '',
+      )
+      out = out.replace(
+        "'sidebar.workspaces' | 'sidebar.workspaces.actions' | 'sidebar.settings'",
+        "'sidebar.workspaces' | 'sidebar.settings'",
+      )
+      return out
+    })
+    revertFile('index.ts', join(SIDEBAR_DIR, 'index.ts'), SEAT_KEY, (source) => source.replace(
+      /\n[ \t]*\/\/ FORK（DSH-Explorer）：工作区上方动作条座位。\n[ \t]*'sidebar\.workspaces\.actions': \{ kind: 'list', scope: 'root' \},/,
+      '',
+    ))
+    revertFile('SidebarRoot.tsx', join(SIDEBAR_DIR, 'SidebarRoot.tsx'), 'workspaceActions', (source) => source.replace(
+      /[ \t]*\{\/\* FORK（DSH-Explorer）：工作区上方的紧凑动作条[\s\S]*?\{renderSlot\('sidebar\.workspaces\.actions', \{ wide \}\)\}[\s\S]*?\)\}\n\n/,
+      '',
+    ))
+    revertFile('SidebarRoot.module.css', join(SIDEBAR_DIR, 'SidebarRoot.module.css'), '.workspaceActions', (source) => source.replace(
+      /\n\n\/\* FORK（DSH-Explorer）：工作区上方动作条座位[\s\S]*?\.workspaceActions:empty \{[^}]*\}/,
+      '',
+    ))
+
+    if (needSidebarRebuild && !DRY) {
+      const code = run('pnpm', ['--filter', '@deepseek-ai/dsh-client-ui-sidebar', 'run', 'bundle'], harnessRoot)
+      if (code === 0) log('  ✓ 已重建 ui-sidebar 客户端 bundle（刷新页面生效）')
+      else log('  ✘ 重建失败，请手动执行 pnpm --filter @deepseek-ai/dsh-client-ui-sidebar run bundle')
+    }
+  }
+} else {
+  log('\n（--keep-fork：保留宽度与座位 fork 改动）')
+}
+
+// ── 残留终检：fork 标记仍在即显式告警，不再假装「卸载完成」 ───────────────
+if (harnessRoot !== undefined) {
+  const probes = [
+    [join(harnessRoot, 'packages', 'client', 'ui-sidebar', 'src', 'client', 'contract', 'slots.ts'), 'sidebar.workspaces.actions'],
+    [join(harnessRoot, 'packages', 'client', 'ui-sidebar', 'src', 'client', 'SidebarRoot.tsx'), 'workspaceActions'],
+  ]
+  for (const [file, marker] of probes) {
+    try {
+      if (readFileSync(file, 'utf8').includes(marker) && !residueWarnings.some(w => w.includes(file))) {
+        residueWarnings.push(`${file} 仍含 ${marker} 标记`)
+      }
+    } catch { /* 文件不存在即无残留 */ }
+  }
+}
+
 console.log('\n════════════════════════════════════════')
 console.log(DRY ? '  dry-run 结束（未做任何修改）' : '  卸载完成')
+if (residueWarnings.length > 0) {
+  console.log('  ⚠ 检测到 fork 残留（回退未命中或 --keep-fork）：')
+  for (const warning of residueWarnings) console.log(`    - ${warning}`)
+}
 console.log('  建议重启 dsh web 一次，彻底清掉 Host 模块缓存')
 console.log('════════════════════════════════════════')
 
@@ -235,7 +401,12 @@ function exec(description, fn) {
     log(`  [dry-run] ${description}`)
     return
   }
-  fn()
+  try {
+    fn()
+  } catch (error) {
+    console.error(`  ✘ ${description} 失败：${error.message}`)
+    process.exit(1)
+  }
 }
 
 function run(cmd, args, cwd) {

@@ -42,6 +42,13 @@ function getCtx(): AudioContext | null {
   }
 }
 
+export function disposeSoundPlayer(): void {
+  if (ctx !== null) {
+    try { void ctx.close() } catch { /* ignore */ }
+    ctx = null
+  }
+}
+
 /** Resume a suspended AudioContext (required after user gesture). */
 function ensureRunning(audioCtx: AudioContext): void {
   if (audioCtx.state === 'suspended') {
@@ -174,13 +181,23 @@ const SOUNDS: Record<SoundId, () => void> = {
   ]),
 }
 
+/** 音效冷却：短窗口内的批量事件只响一次，避免叠爆音。 */
+const SOUND_COOLDOWN_MS = 200
+let lastSoundAt = 0
+
 /**
  * Play a notification sound by id.
  * Uses the sound assignment from user preferences.
+ * Throttled: plays at most once per SOUND_COOLDOWN_MS.
  */
 export function playNotificationSound(soundId: SoundId): void {
+  if (soundId === 'none') return
   const player = SOUNDS[soundId]
-  if (player !== undefined) player()
+  if (player === undefined) return
+  const now = Date.now()
+  if (now - lastSoundAt < SOUND_COOLDOWN_MS) return
+  lastSoundAt = now
+  player()
 }
 
 /**

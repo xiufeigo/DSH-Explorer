@@ -165,12 +165,12 @@ export function ExplorerSettingsCard(): JSX.Element {
               )
               : null}
 
-            {/* ── 系统通知 ── */}
-            <div className="dshx-set-section-title">系统通知</div>
+            {/* ── 提示音 ── */}
+            <div className="dshx-set-section-title">提示音</div>
             <div className="dshx-set-field dshx-set-notif-row">
               <div className="dshx-set-notif-info">
                 <span className="dshx-set-label">智能体</span>
-                <span className="dshx-set-hint">当智能体完成或需要注意时显示系统通知</span>
+                <span className="dshx-set-hint">当智能体完成或需要注意时播放提示音</span>
               </div>
               <Toggle
                 checked={prefs.notifyAgent}
@@ -180,7 +180,7 @@ export function ExplorerSettingsCard(): JSX.Element {
             <div className="dshx-set-field dshx-set-notif-row">
               <div className="dshx-set-notif-info">
                 <span className="dshx-set-label">权限</span>
-                <span className="dshx-set-hint">当需要权限时显示系统通知</span>
+                <span className="dshx-set-hint">当需要权限时播放提示音</span>
               </div>
               <Toggle
                 checked={prefs.notifyPermission}
@@ -190,7 +190,7 @@ export function ExplorerSettingsCard(): JSX.Element {
             <div className="dshx-set-field dshx-set-notif-row">
               <div className="dshx-set-notif-info">
                 <span className="dshx-set-label">错误</span>
-                <span className="dshx-set-hint">发生错误时显示系统通知</span>
+                <span className="dshx-set-hint">发生错误时播放提示音</span>
               </div>
               <Toggle
                 checked={prefs.notifyError}
@@ -199,7 +199,7 @@ export function ExplorerSettingsCard(): JSX.Element {
             </div>
 
             {/* ── 音效 ── */}
-            <div className="dshx-set-section-title">音效</div>
+            <div className="dshx-set-section-title">音效选型</div>
             <div className="dshx-set-field dshx-set-notif-row">
               <div className="dshx-set-notif-info">
                 <span className="dshx-set-label">智能体</span>

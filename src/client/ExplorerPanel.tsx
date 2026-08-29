@@ -45,6 +45,16 @@ const PAGE_LABEL: Record<ExplorerPage, string> = {
   sources: '来源',
 }
 
+/** 关闭脏 tab 前的确认：window.confirm 在沙箱/受限环境可能直接抛错，
+ *  异常时视为确认，保证脏 tab 永远关得掉。 */
+function confirmCloseDirtyTab(name: string): boolean {
+  try {
+    return window.confirm(`「${name}」有未保存修改，确定关闭吗？`)
+  } catch {
+    return true
+  }
+}
+
 const PAGE_IDS: ReadonlySet<string> = new Set(Object.keys(PAGE_LABEL))
 
 export function ExplorerPanel({
@@ -233,11 +243,17 @@ export function ExplorerPanel({
               aria-label={`关闭 ${tab.name}`}
               onClick={event => {
                 event.stopPropagation()
+                if (tab.dirty && !confirmCloseDirtyTab(tab.name)) {
+                  return
+                }
                 store.closeTab(tab.id)
               }}
               onKeyDown={event => {
                 if (event.key === 'Enter' || event.key === ' ') {
                   event.stopPropagation()
+                  if (tab.dirty && !confirmCloseDirtyTab(tab.name)) {
+                    return
+                  }
                   store.closeTab(tab.id)
                 }
               }}

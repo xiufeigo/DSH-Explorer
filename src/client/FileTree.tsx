@@ -16,7 +16,7 @@ import {
   IconFolderClose16, IconFolderOpen16, IconTriangleRightFill14,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { FileGlyph } from './fileGlyph'
-import { openFileTab, rpc, rpcWithSessionRetry } from './rpc'
+import { isTransientSessionError, openFileTab, rpc, rpcWithSessionRetry } from './rpc'
 import { useExplorer, type ExplorerStore } from './store'
 
 interface TreeEntry {
@@ -46,6 +46,8 @@ function fingerprint(entries: TreeEntry[]): string {
 // ── 展开状态记忆（按 cwd 存 localStorage） ─────────────────────────────────
 
 const TREE_OPEN_KEY = 'dsh-explorer:tree-open'
+/** 最多记住多少个 cwd 的展开状态：超出删最早写入的（键序即写入序）。 */
+const TREE_OPEN_KEY_CAP = 40
 
 function readSavedOpen(cwd: string): string[] {
   try {
@@ -62,14 +64,18 @@ function readSavedOpen(cwd: string): string[] {
 function saveOpen(cwd: string, paths: string[]): void {
   try {
     const raw = localStorage.getItem(TREE_OPEN_KEY)
-    const map: Record<string, unknown> = raw !== null ? JSON.parse(raw) : {}
-    for (const key of Object.keys(map)) {
-      if (!Array.isArray(map[key])) delete map[key]
+    const parsed: Record<string, unknown> = raw !== null ? JSON.parse(raw) : {}
+    // 重建 map：当前 cwd 挪到最后再写，对象键序即写入先后记录；
+    // 超上限时从最前面（最早写入）开始删。
+    const map: Record<string, unknown> = {}
+    for (const key of Object.keys(parsed)) {
+      if (key === cwd || !Array.isArray(parsed[key])) continue
+      map[key] = parsed[key]
     }
     map[cwd] = paths.slice(0, 150)
     const keys = Object.keys(map)
-    if (keys.length > 40) {
-      for (const key of keys.slice(0, keys.length - 40)) delete map[key]
+    if (keys.length > TREE_OPEN_KEY_CAP) {
+      for (const key of keys.slice(0, keys.length - TREE_OPEN_KEY_CAP)) delete map[key]
     }
     localStorage.setItem(TREE_OPEN_KEY, JSON.stringify(map))
   } catch { /* ignore */ }
@@ -99,9 +105,25 @@ const NAME_BAD = /[\\/:*?"<>|]/
 //   2) 恢复最多展开 RESTORE_DIR_CAP 个目录、并发 ≤LIST_CONCURRENCY；
 //   3) 恢复等 SWITCH_SETTLE_MS 错峰，不和切换过渡抢主线程。
 const TREE_CHILD_CAP = 120
+const TREE_MAX_RENDER_CAP = 2000
 const RESTORE_DIR_CAP = 24
 const LIST_CONCURRENCY = 8
+/** 轮询比对子目录的并发上限：比恢复路径更保守（分批串行，防请求风暴）。 */
+const POLL_LIST_CONCURRENCY = 4
 const SWITCH_SETTLE_MS = 350
+/** 自动轮询节奏：基础 3s；会话级错误指数退避 3→6→12→…→30s，成功后复位。 */
+const POLL_BASE_MS = 3000
+const POLL_MAX_MS = 30000
+
+/**
+ * 会话级错误判定：会话缺失/卸载、网络失败、超时等「整条链路暂时不可用」类错误。
+ * 轮询遇到这类错误应退避降频，而不是 3s 一次反复敲打；单个目录自身的
+ * 路径错误（如目录被删）不在此列。
+ */
+function isSessionLevelError(error: string): boolean {
+  if (isTransientSessionError(error)) return true
+  return /failed to fetch|load failed|network|aborted|timeout|timed out|超时|http \d{3}/i.test(error)
+}
 
 function delay(signal: AbortSignal | undefined, ms: number): Promise<void> {
   return new Promise(resolve => {
@@ -152,6 +174,7 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
     lastCwdRef.current = cwd
     const ac = new AbortController()
     if (cwdChanged) {
+      pollDelay.current = POLL_BASE_MS // 新目录树：轮询退避复位
       setRoot(null)
       setChildren(new Map())
       setLoading(new Map())
@@ -206,44 +229,62 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
     saveOpen(cwd, Array.from(children.keys()))
   }, [children, cwd])
 
-  /** 原地刷新：重拉根目录与所有已展开目录，指纹没变不 set，展开状态不动。 */
-  const refreshRef = useRef<() => Promise<void>>(async () => {})
+  /**
+   * 原地刷新：重拉根目录与所有已展开目录，指纹没变不 set，展开状态不动。
+   * 返回 true = 本次刷新健康（轮询可复位基础间隔）；false = 遇到会话级错误
+   * （会话缺失/卸载、网络失败等），轮询应指数退避。
+   */
+  const busyRef = useRef(false)
+  const refreshRef = useRef<() => Promise<boolean>>(async () => true)
   refreshRef.current = async () => {
-    if (cwd === undefined || cwd.length === 0) return
-    if (sessionId === undefined || sessionId.length === 0) return
-    const rootRes = await rpcWithSessionRetry<ListResult>(sessionId, 'fs.list', { path: cwd })
-    if (rootRes.error !== undefined) return // 静默保留旧内容
-    const nextRoot = rootRes.entries ?? []
-    const rootFp = fingerprint(nextRoot)
-    if (rootFp !== lastRootFp.current) {
-      lastRootFp.current = rootFp
-      setRoot(nextRoot)
-    }
-    const openPaths = Array.from(childrenRef.current.keys())
-    if (openPaths.length === 0) return
-    // 分批 ≤8 并发：已展开目录可能很多，避免一次打满
-    const updates: Array<{ path: string; res: ListResult }> = []
-    for (let start = 0; start < openPaths.length; start += LIST_CONCURRENCY) {
-      const batch = openPaths.slice(start, start + LIST_CONCURRENCY)
-      updates.push(...await Promise.all(batch.map(async path => ({
-        path,
-        res: await rpc<ListResult>(sessionId, 'fs.list', { path }),
-      }))))
-    }
-    setChildren(current => {
-      const next = new Map(current)
-      let changed = false
-      for (const { path, res } of updates) {
-        if (res.error !== undefined) continue
-        const entries = res.entries ?? []
-        const fp = fingerprint(entries)
-        if (fp === dirFps.current.get(path)) continue
-        dirFps.current.set(path, fp)
-        next.set(path, entries)
-        changed = true
+    if (busyRef.current) return true
+    if (cwd === undefined || cwd.length === 0) return true
+    if (sessionId === undefined || sessionId.length === 0) return true
+    busyRef.current = true
+    try {
+      const rootRes = await rpcWithSessionRetry<ListResult>(sessionId, 'fs.list', { path: cwd })
+      if (rootRes.error !== undefined) {
+        // 静默保留旧内容；会话级错误上报给轮询退避
+        return !isSessionLevelError(rootRes.error)
       }
-      return changed ? next : current
-    })
+      const nextRoot = rootRes.entries ?? []
+      const rootFp = fingerprint(nextRoot)
+      if (rootFp !== lastRootFp.current) {
+        lastRootFp.current = rootFp
+        setRoot(nextRoot)
+      }
+      const openPaths = Array.from(childrenRef.current.keys())
+      if (openPaths.length === 0) return true
+      // 分批串行、每批 ≤4 并发：已展开目录可能很多，防轮询请求风暴
+      const updates: Array<{ path: string; res: ListResult }> = []
+      for (let start = 0; start < openPaths.length; start += POLL_LIST_CONCURRENCY) {
+        const batch = openPaths.slice(start, start + POLL_LIST_CONCURRENCY)
+        const results = await Promise.all(batch.map(async path => ({
+          path,
+          res: await rpc<ListResult>(sessionId, 'fs.list', { path }),
+        })))
+        // 任一会话级错误（会话不存在/卸载、网络失败等）立即中止本轮并上报退避
+        if (results.some(({ res }) => res.error !== undefined && isSessionLevelError(res.error))) return false
+        updates.push(...results)
+      }
+      setChildren(current => {
+        const next = new Map(current)
+        let changed = false
+        for (const { path, res } of updates) {
+          if (res.error !== undefined) continue
+          const entries = res.entries ?? []
+          const fp = fingerprint(entries)
+          if (fp === dirFps.current.get(path)) continue
+          dirFps.current.set(path, fp)
+          next.set(path, entries)
+          changed = true
+        }
+        return changed ? next : current
+      })
+      return true
+    } finally {
+      busyRef.current = false
+    }
   }
 
   // 手动刷新（treeTick）：跳过首次，避免与 loadRoot 重复
@@ -253,13 +294,29 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
     void refreshRef.current()
   }, [store.treeTick])
 
-  // 自动跟随：轮询指纹，页面隐藏时跳过
+  /** 当前轮询间隔：错误指数退避 3→6→12→…→30s，成功一次复位 3s。 */
+  const pollDelay = useRef(POLL_BASE_MS)
+
+  // 自动跟随：轮询指纹，页面隐藏时跳过；失败按 pollDelay 指数退避
   useEffect(() => {
-    const timer = setInterval(() => {
-      if (document.hidden) return
-      void refreshRef.current()
-    }, 3000)
-    return () => clearInterval(timer)
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const schedule = (): void => {
+      timer = setTimeout(() => {
+        if (stopped) return
+        if (document.hidden) { schedule(); return }
+        void refreshRef.current().catch(() => false).then(ok => {
+          if (stopped) return
+          pollDelay.current = ok ? POLL_BASE_MS : Math.min(pollDelay.current * 2, POLL_MAX_MS)
+          schedule()
+        })
+      }, pollDelay.current)
+    }
+    schedule()
+    return () => {
+      stopped = true
+      if (timer !== null) clearTimeout(timer)
+    }
   }, [])
 
   const reloadDir = useCallback(async (parent: string): Promise<TreeEntry[] | null> => {
@@ -329,13 +386,17 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
     event.stopPropagation()
     // 文件夹行：新建目标在该文件夹内部；文件行：在其所在目录
     const createIn = entry.type === 'directory' ? entry.path : parent
-    setMenu({ x: event.clientX, y: event.clientY, entry, parent: createIn })
+    const x = Math.max(8, Math.min(event.clientX, window.innerWidth - 180))
+    const y = Math.max(8, Math.min(event.clientY, window.innerHeight - 200))
+    setMenu({ x, y, entry, parent: createIn })
   }, [])
 
   const onBackgroundContextMenu = useCallback((event: MouseEvent) => {
     if (cwd === undefined || cwd.length === 0) return
     event.preventDefault()
-    setMenu({ x: event.clientX, y: event.clientY, entry: null, parent: cwd })
+    const x = Math.max(8, Math.min(event.clientX, window.innerWidth - 180))
+    const y = Math.max(8, Math.min(event.clientY, window.innerHeight - 200))
+    setMenu({ x, y, entry: null, parent: cwd })
   }, [cwd])
 
   useEffect(() => {
@@ -395,10 +456,11 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
   }, [])
 
   // 每层默认只渲染前 TREE_CHILD_CAP 行；超过折叠为「显示全部」行。
-  // 没有这层上限，恢复展开记忆可能把几万行的目录在切换帧里同步挂载。
+  // 「显示全部」最多渲染 TREE_MAX_RENDER_CAP 行，超出截断并提示。
   const renderEntries = (allEntries: TreeEntry[], depth: number, parent: string): JSX.Element[] => {
     const capLifted = showAllDirs.has(parent)
-    const entries = capLifted ? allEntries : allEntries.slice(0, TREE_CHILD_CAP)
+    const effectiveLimit = capLifted ? TREE_MAX_RENDER_CAP : TREE_CHILD_CAP
+    const entries = allEntries.slice(0, effectiveLimit)
     const rows = entries.map(entry => {
       const isDir = entry.type === 'directory'
       const isOpen = children.has(entry.path)
@@ -452,6 +514,17 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
           title="显示该目录的全部条目"
         >
           <span className="dshx-tree-name">…还有 {allEntries.length - TREE_CHILD_CAP} 项（点击全部显示）</span>
+        </div>,
+      )
+    } else if (capLifted && allEntries.length > TREE_MAX_RENDER_CAP) {
+      rows.push(
+        <div
+          key={`${parent}::__capped__`}
+          className="dshx-tree-row more"
+          style={{ paddingLeft: 8 + depth * 22, opacity: 0.6 }}
+          title={`已达最大渲染条数（${TREE_MAX_RENDER_CAP} 项），其余项已截断`}
+        >
+          <span className="dshx-tree-name">…已展示前 {TREE_MAX_RENDER_CAP} 项，其余 {allEntries.length - TREE_MAX_RENDER_CAP} 项已截断</span>
         </div>,
       )
     }

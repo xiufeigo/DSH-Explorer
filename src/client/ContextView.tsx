@@ -2,8 +2,8 @@
  * 上下文视图：顶部 ToDo List，下方为会话概览 + 模型上下文清单。
  */
 
-import { useCallback, useEffect, useState } from 'react'
-import { rpc } from './rpc'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { isTransientSessionError, rpc } from './rpc'
 
 interface TodoItem {
   content: string
@@ -74,6 +74,11 @@ function contextOccupancy(pressure: {
 
 export function ContextView({ sessionId, useProjection }: { sessionId: string; useProjection?: (key: string) => any }): JSX.Element {
   const [data, setData] = useState<ContextData>({})
+  const [error, setError] = useState<string | null>(null)
+  // todo 与 meta 各有独立取号：共用一个序号时，挂载阶段 load() 后紧跟
+  // loadMeta() 会把 todo 的请求序号顶掉，首屏 todo 响应被判过期而丢弃。
+  const todoSeq = useRef(0)
+  const metaSeq = useRef(0)
   const goalProjection = useProjection !== undefined ? useProjection('goal') : undefined
   const planProjection = useProjection !== undefined ? useProjection('plan') : undefined
   const pressure = useProjection !== undefined ? useProjection('contextPressure') : undefined
@@ -83,19 +88,45 @@ export function ContextView({ sessionId, useProjection }: { sessionId: string; u
   const planActive: boolean | undefined = planProjection?.active
   const occupancy = contextOccupancy(pressure as { projectedTokens?: number; pressureTokens?: number; contextWindow?: number } | undefined)
 
+  /** 明确错误（非瞬时）置 error 态；瞬时错误（会话尚未挂载）等重试即可。 */
+  const surfaceError = (message: string | undefined): void => {
+    if (message === undefined || isTransientSessionError(message)) return
+    setError(message)
+  }
+
   const load = useCallback(() => {
+    if (typeof document !== 'undefined' && document.hidden) return
+    const my = ++todoSeq.current
     void rpc<{ todos: TodoItem[] }>(sessionId, 'todo.list').then(todo => {
+      if (my !== todoSeq.current) return
+      if (todo.error !== undefined) {
+        surfaceError(todo.error)
+        return
+      }
+      setError(null)
       setData(current => ({ ...current, todos: todo.todos ?? [] }))
     })
   }, [sessionId])
 
   const loadMeta = useCallback(() => {
+    const my = ++metaSeq.current
     void rpc<{ cwd: string; preset?: string; id: string }>(sessionId, 'session.meta').then(meta => {
+      if (my !== metaSeq.current) return
+      if (meta.error !== undefined) {
+        surfaceError(meta.error)
+        return
+      }
+      setError(null)
       setData(current => ({ ...current, cwd: meta.cwd, preset: meta.preset, id: meta.id }))
     })
     // assemble() 会拼装全量提示词文本，比较贵：只在挂载和手动刷新时调用，
-    // 不放进轮询里。
+    // 不放进轮询里。与 session.meta 共用同一取号即可。
     void rpc<{ sections: ManifestSection[]; contexts: ManifestSection[]; tools: string[]; variables: string[] }>(sessionId, 'context.meta').then(manifest => {
+      if (my !== metaSeq.current) return
+      if (manifest.error !== undefined) {
+        surfaceError(manifest.error)
+        return
+      }
       setData(current => ({
         ...current,
         sections: manifest.sections ?? [],
@@ -110,7 +141,19 @@ export function ContextView({ sessionId, useProjection }: { sessionId: string; u
     load()
     loadMeta()
     const timer = setInterval(load, 6000)
-    return () => clearInterval(timer)
+    // 回前台刷新加 0-300ms 随机 jitter，避免多个组件同刻齐射 RPC
+    let visTimer = 0
+    const onVis = (): void => {
+      if (document.hidden) return
+      if (visTimer !== 0) window.clearTimeout(visTimer)
+      visTimer = window.setTimeout(() => { visTimer = 0; load() }, Math.round(Math.random() * 300))
+    }
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      clearInterval(timer)
+      if (visTimer !== 0) window.clearTimeout(visTimer)
+      document.removeEventListener('visibilitychange', onVis)
+    }
   }, [load, loadMeta])
 
   const todos = data.todos ?? []
@@ -122,6 +165,18 @@ export function ContextView({ sessionId, useProjection }: { sessionId: string; u
   return (
     <div className="dshx-scroll">
       <div className="dshx-ctx">
+        {error !== null && (
+          <div className="dshx-error" style={{ padding: '4px 8px', fontSize: 12, display: 'flex', gap: 8, alignItems: 'center', flex: 'none' }}>
+            <span style={{ flex: 1 }}>{error}</span>
+            <button
+              type="button"
+              className="dshx-btn small"
+              onClick={() => { setError(null); load(); loadMeta() }}
+            >
+              重试
+            </button>
+          </div>
+        )}
         {/* ── ToDo ─────────────────────────────────────────────────────────── */}
         <div className="dshx-section">
           <div className="dshx-section-title">

@@ -60,9 +60,10 @@ try {
   ok(`host half: require("dsh-explorer") exposes { inject: [${plugin.inject.join(', ')}], apply }`)
 
   const registered = []
+  const routes = []
   const ctx = {
     get(name) {
-      if (name === 'webServer') return { register: () => () => {} }
+      if (name === 'webServer') return { register: (route) => { routes.push(route); return () => {} } }
       if (name === 'fs') return {}
       if (name === 'shell') return {}
       if (name === 'sessions') return { get: () => undefined }
@@ -87,6 +88,16 @@ try {
     on() { return () => {} },
   }
   plugin.apply(ctx)
+  // 路由挂载断言：register 被吞掉时，路径写错也会全绿 —— 必须核对实际入参。
+  const rpcRoute = routes.find(route => route.path === '/dsh-explorer/rpc')
+  if (rpcRoute === undefined || rpcRoute.kind !== 'exact' || typeof rpcRoute.handler !== 'function') {
+    throw new Error(`host apply did not register exact /dsh-explorer/rpc route (got ${JSON.stringify(routes.map(r => r.path))})`)
+  }
+  const ptyRoute = routes.find(route => route.path === '/dsh-explorer/pty')
+  if (ptyRoute === undefined || ptyRoute.kind !== 'exact' || typeof ptyRoute.handler !== 'function') {
+    throw new Error('host apply did not register exact /dsh-explorer/pty route')
+  }
+  ok('host half: registers exact /dsh-explorer/rpc + /dsh-explorer/pty routes')
   const ns = registered.find(row => row.ns === 'dsh-explorer')
   if (ns === undefined) throw new Error('host apply did not settings.register("dsh-explorer")')
   if (typeof ns.schema !== 'function') throw new Error('explorer settings schema is not callable')
@@ -213,10 +224,13 @@ if (failures > 0) {
 
 // ── 3. RPC 跨站防护闸 ─────────────────────────────────────────────────────
 // handleRpc 的前置分支不依赖任何服务，可以纯 mock 直测：
-// 同源 OPTIONS 放行、跨源 OPTIONS 拒绝、无校验头的 POST 拒绝。
+// 同源回环 OPTIONS 放行、跨源拒绝、无校验头拒绝、缺 Origin 拒绝、
+// 同源但非回环（DNS rebinding）拒绝。
 try {
-  const { handleRpc } = require('dsh-explorer')
+  const { handleRpc, handlePtyStream } = require('dsh-explorer')
   if (typeof handleRpc !== 'function') throw new Error('handleRpc not exported')
+  // P1-11：handlePtyStream 必须保持导出，冒烟直测闸分支。
+  if (typeof handlePtyStream !== 'function') throw new Error('handlePtyStream not exported')
 
   const makeReq = (method, headers, body) => {
     const req = new EventEmitter()
@@ -232,18 +246,20 @@ try {
     return req
   }
   const makeRes = () => {
-    const res = { statusCode: 0, headers: {}, body: '' }
+    const res = { statusCode: 0, headers: {}, body: '', onError: [] }
     res.writeHead = (code, headers) => { res.statusCode = code; Object.assign(res.headers, headers) }
     res.end = (text) => { res.body = String(text ?? '') }
+    res.on = (event, cb) => { res.onError.push([event, cb]); return res }
     return res
   }
   const noServices = { sessions: { get: () => undefined } }
+  const LOOP = { origin: 'http://127.0.0.1:3080', host: '127.0.0.1:3080' }
 
   {
     const res = makeRes()
-    await handleRpc(makeReq('OPTIONS', { origin: 'http://127.0.0.1:3080', host: '127.0.0.1:3080' }, null), res, noServices, new Map())
+    await handleRpc(makeReq('OPTIONS', { ...LOOP }, null), res, noServices, new Map())
     if (res.statusCode !== 204) throw new Error(`same-origin OPTIONS expected 204, got ${res.statusCode}`)
-    ok('rpc gate: same-origin OPTIONS preflight → 204')
+    ok('rpc gate: same-origin loopback OPTIONS preflight → 204')
   }
   {
     const res = makeRes()
@@ -253,16 +269,60 @@ try {
   }
   {
     const res = makeRes()
+    await handleRpc(makeReq('OPTIONS', { origin: 'http://evil.com:3080', host: 'evil.com:3080' }, null), res, noServices, new Map())
+    if (res.statusCode !== 403) throw new Error(`rebinding OPTIONS (sameHost, non-loopback) expected 403, got ${res.statusCode}`)
+    ok('rpc gate: DNS-rebinding OPTIONS (same host, non-loopback) → 403')
+  }
+  {
+    const res = makeRes()
     await handleRpc(makeReq('POST', { 'content-type': 'application/json' }, '{"method":"fs.list"}'), res, noServices, new Map())
     if (res.statusCode !== 403) throw new Error(`header-less POST expected 403, got ${res.statusCode}`)
     ok('rpc gate: POST without x-dsh-explorer header → 403')
   }
   {
     const res = makeRes()
-    await handleRpc(makeReq('POST', { 'content-type': 'application/json', 'x-dsh-explorer': '1' }, '{"sessionId":"nope","method":"fs.list"}'), res, noServices, new Map())
+    await handleRpc(makeReq('POST', { 'content-type': 'application/json', 'x-dsh-explorer': '1', ...LOOP }, '{"sessionId":"nope","method":"fs.list"}'), res, noServices, new Map())
     if (res.statusCode !== 200) throw new Error(`gated POST expected 200, got ${res.statusCode}`)
     if (!res.body.includes('会话不存在')) throw new Error(`gated POST body unexpected: ${res.body}`)
-    ok('rpc gate: POST with header reaches dispatch (session guard answers)')
+    ok('rpc gate: POST with header + loopback origin reaches dispatch (session guard answers)')
+  }
+  {
+    const res = makeRes()
+    await handleRpc(makeReq('POST', { 'content-type': 'application/json', 'x-dsh-explorer': '1', host: '127.0.0.1:3080' }, '{"method":"fs.list"}'), res, noServices, new Map())
+    if (res.statusCode !== 403) throw new Error(`POST without Origin expected 403, got ${res.statusCode}`)
+    ok('rpc gate: POST with header but missing Origin → 403')
+  }
+  {
+    const res = makeRes()
+    await handleRpc(makeReq('POST', { 'content-type': 'application/json', 'x-dsh-explorer': '1', origin: 'http://evil.com:3080', host: 'evil.com:3080' }, '{"method":"fs.list"}'), res, noServices, new Map())
+    if (res.statusCode !== 403) throw new Error(`rebinding POST expected 403, got ${res.statusCode}`)
+    ok('rpc gate: DNS-rebinding POST (same host, non-loopback) → 403')
+  }
+  {
+    const res = makeRes()
+    await handleRpc(makeReq('POST', { 'content-type': 'application/json', 'x-dsh-explorer': '1', origin: 'http://localhost:3080', host: 'localhost:3080' }, '{"sessionId":"nope","method":"fs.list"}'), res, noServices, new Map())
+    if (res.statusCode !== 200) throw new Error(`localhost POST expected 200, got ${res.statusCode}`)
+    ok('rpc gate: localhost loopback variant also passes')
+  }
+  {
+    // handlePtyStream 与 RPC 同一道闸：无自定义头 → 403。
+    const res = makeRes()
+    await handlePtyStream(makeReq('POST', { 'content-type': 'application/json' }, '{"sessionId":"x","id":"t"}'), res, noServices)
+    if (res.statusCode !== 403) throw new Error(`header-less pty stream expected 403, got ${res.statusCode}`)
+    ok('pty stream gate: POST without x-dsh-explorer header → 403')
+  }
+  {
+    // 带头 + 回环同源 + 会话缺失 → 进 dispatch，由会话守卫应答 200。
+    // sv.pty 必须已定义（否则先撞「终端服务未就绪」），给空壳即可走不到 attach。
+    const res = makeRes()
+    const sv = { sessions: { get: () => undefined }, pty: {} }
+    await handlePtyStream(
+      makeReq('POST', { 'content-type': 'application/json', 'x-dsh-explorer': '1', ...LOOP }, '{"sessionId":"nope","id":"t1"}'),
+      res, sv,
+    )
+    if (res.statusCode !== 200) throw new Error(`missing-session pty stream expected 200, got ${res.statusCode}`)
+    if (!res.body.includes('会话不存在')) throw new Error(`pty stream body unexpected: ${res.body}`)
+    ok('pty stream: header + loopback origin reaches dispatch (session guard answers)')
   }
 } catch (error) {
   fail('rpc gate checks', error)
@@ -336,6 +396,16 @@ try {
     ok('payload fork: second run is idempotent (marker short-circuits)')
   }
   {
+    // max 漂移：载荷已被打到 1000，本进程期望 1200 → 按既有标记的 max 重打。
+    const drifted = rewriteClampSites(UPSTREAM, 1000)
+    if (drifted === null) throw new Error('rewrite to 1000 should succeed')
+    const files = { [BUNDLE]: drifted.text }
+    const status = applyPayloadFork({ bases: BASES, io: makeIo(files), max: 1200 })
+    if (status.status !== 'patched' || status.sites !== 2) throw new Error(`expected patched(2) on max drift, got ${JSON.stringify(status)}`)
+    if (!files[BUNDLE].includes('clampWidth(px, 300, 1200)')) throw new Error('drifted bundle not re-raised to 1200')
+    ok('payload fork: max drift re-patches from the stamped max')
+  }
+  {
     const files = { [BUNDLE]: 'export const DETAILS_MAX = 520 // upstream changed shape' }
     const status = applyPayloadFork({ bases: BASES, io: makeIo(files) })
     if (status.status !== 'skipped') throw new Error(`expected skipped, got ${JSON.stringify(status)}`)
@@ -346,6 +416,31 @@ try {
     const status = applyPayloadFork({ bases: ['C:/definitely/missing'], io: makeIo({}) })
     if (status.status !== 'missing') throw new Error(`expected missing, got ${JSON.stringify(status)}`)
     ok('payload fork: absent payload reports missing instead of throwing')
+  }
+  {
+    // P2-4 新语义：rename 失败不再直写降级（目标文件可能正被服务器读取，
+    // 直写有截断风险）——放弃写入、保留原文件、返回 failed；io 提供 remove
+    // 时顺带清理临时文件。
+    const files = { [BUNDLE]: UPSTREAM }
+    const io = makeIo(files)
+    io.rename = () => { throw new Error('EPERM: rename denied') }
+    io.remove = (path) => { delete files[path] }
+    const status = applyPayloadFork({ bases: BASES, io })
+    if (status.status !== 'failed' || !String(status.reason).includes('重命名失败')) {
+      throw new Error(`expected failed(重命名失败), got ${JSON.stringify(status)}`)
+    }
+    if (files[BUNDLE] !== UPSTREAM) throw new Error('rename failure must not direct-write the bundle')
+    if (files[`${BUNDLE}.dshx-tmp`] !== undefined) throw new Error('temp file should be removed when io.remove exists')
+
+    // io 未提供 remove：跳过清理但同样绝不直写。
+    const files2 = { [BUNDLE]: UPSTREAM }
+    const io2 = makeIo(files2)
+    io2.rename = () => { throw new Error('EPERM: rename denied') }
+    const status2 = applyPayloadFork({ bases: BASES, io: io2 })
+    if (status2.status !== 'failed' || files2[BUNDLE] !== UPSTREAM) {
+      throw new Error(`io without remove must still fail without direct-write, got ${JSON.stringify(status2)}`)
+    }
+    ok('payload fork: rename failure abandons the write, keeps original, cleans temp via io.remove')
   }
 } catch (error) {
   fail('payload fork checks', error)
@@ -681,6 +776,55 @@ try {
   delete globalThis.document
 } catch (error) {
   fail('workspace recency order', error)
+  process.exit(1)
+}
+
+// ── 6. git 路径解码（中文文件名 / C 风格八进制转义） ──────────────────────
+try {
+  const { unquotePath } = require('dsh-explorer')
+  if (typeof unquotePath !== 'function') throw new Error('unquotePath not exported')
+  const cases = [
+    ['plain.txt', 'plain.txt'],
+    ['"a\\"b.txt"', 'a"b.txt'],
+    ['"a\\nb.txt"', 'a\nb.txt'],
+    // 「文」= U+6587 → UTF-8 E6 96 87
+    ['"\\346\\226\\207.txt"', '文.txt'],
+    // 「中文 文件」连续多字节跨字符 + 空格：字节必须攒批再统一 UTF-8 解码
+    ['"\\344\\270\\255\\346\\226\\207 \\346\\226\\207\\344\\273\\266.md"', '中文 文件.md'],
+  ]
+  for (const [input, expected] of cases) {
+    const actual = unquotePath(input)
+    if (actual !== expected) throw new Error(`unquotePath(${JSON.stringify(input)}) = ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`)
+  }
+  ok('git pathspec: C-style octal escapes decode to UTF-8 (Chinese filenames)')
+} catch (error) {
+  fail('unquotePath checks', error)
+  process.exit(1)
+}
+
+// ── 7. shellSafePath（P0-1 回归修复：按平台放行路径分隔符） ───────────────
+// win32 绝对路径必含反斜杠 → 放行；POSIX 拒绝 `\`。元字符黑名单与长度/
+// 空值校验与 shellSafe 一致。
+try {
+  const { shellSafePath } = require('dsh-explorer')
+  if (typeof shellSafePath !== 'function') throw new Error('shellSafePath not exported')
+  const win = process.platform === 'win32'
+
+  const abs = shellSafePath('C:\\a\\b')
+  const absExpected = win ? 'C:\\a\\b' : null
+  if (abs !== absExpected) throw new Error(`shellSafePath('C:\\a\\b') => ${JSON.stringify(abs)}, expected ${JSON.stringify(absExpected)}`)
+  if (shellSafePath('C:/a/b') !== 'C:/a/b') throw new Error('forward-slash path should pass on every platform')
+  if (shellSafePath('relative/dir') !== 'relative/dir') throw new Error('plain relative path should pass')
+
+  const rejects = ['C:\\a"b', 'a;rm -rf', 'a|b', 'a`b', "a'b", 'a$b', 'a&b', 'a<b', 'a>b', 'a^b', 'a%b', 'a!b', 'a\u0001b', 'a b\tc', '']
+  for (const bad of rejects) {
+    if (shellSafePath(bad) !== null) throw new Error(`shellSafePath(${JSON.stringify(bad)}) should be null`)
+  }
+  if (shellSafePath('x'.repeat(4097)) !== null) throw new Error('over-long path should be rejected')
+  if (shellSafePath(123) !== null) throw new Error('non-string input should be rejected')
+  ok(`shellSafePath: platform-aware separators + metachar blacklist (P0-1 regression guard, win32=${win})`)
+} catch (error) {
+  fail('shellSafePath checks', error)
   process.exit(1)
 }
 

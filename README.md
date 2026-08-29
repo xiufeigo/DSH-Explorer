@@ -69,6 +69,8 @@ dsh plugin --profile web add <本仓库路径>
 
 这会把包写进 profile 的 `dsh.profile.bundles`。`pnpm plugin:install` 仍是本机捷径：junction + 直接写 profile 的 `cordis.patch.yml` 行，不必经过 `dsh plugin add`。
 
+构建挂在 `prepack`（`pnpm pack` / 发布打包前自动构建，`--prod` 安装不再触发构建失败）；git / 本地路径直装不会自动触发构建——`pnpm plugin:install` 会自检并按需补构建，手工安装请先 `pnpm run build`。
+
 应能看到：左侧 **[工作区 | 文件]**、会话头 **摘要 / 终端 / 面板**、对话左侧消息大纲、右侧 **审查 / 上下文**。
 
 常用参数：`--profile <name>`（默认 `web`）、`--harness <path>`、`--rebuild`、`--dry-run`。
@@ -76,8 +78,8 @@ dsh plugin --profile web add <本仓库路径>
 ### 卸载
 
 ```powershell
-pnpm plugin:uninstall                # 去掉 patch 行和 junction，并回退宽度 fork
-pnpm plugin:uninstall --keep-fork    # 保留宽度 fork
+pnpm plugin:uninstall                # 去掉 patch 行和 junction，同时回退宽度与座位两类 fork
+pnpm plugin:uninstall --keep-fork    # 保留宽度与座位两类 fork 改动
 pnpm plugin:uninstall --dry-run
 ```
 
@@ -98,14 +100,17 @@ pnpm run build       # 产出 lib/index.js + lib/client.js
 pnpm run watch       # 开发时增量构建
 pnpm run typecheck
 pnpm run verify      # 冒烟：按运行时方式真正执行两个 bundle
-node scripts/md-selfcheck.mjs   # Markdown 渲染 + 高亮器语法自检（61 项断言）
+node scripts/md-selfcheck.mjs   # Markdown 渲染 + 高亮器语法自检（71 项断言）
 ```
 
 `verify` 会：
 
 - Host：按 cordis Loader 的方式 `require('dsh-explorer')`，断言带 `inject` 的插件对象；
 - 浏览器：模拟 `window.__ModuleLoader__.load`，注入真实 React 后执行工厂；
-- 顺带抽测 RPC 跨站闸（同源 OPTIONS、跨源拒绝、无自定义头 POST 拒绝）；
+- 抽测 RPC 闸：同源回环 OPTIONS / POST 放行、跨源拒绝、无自定义头 POST 拒绝、缺 Origin 拒绝、DNS rebinding（Host 同源但非回环）拒绝；
+- 断言路由挂载：`webServer.register` 实际收到 `/dsh-explorer/rpc` 与 `/dsh-explorer/pty` 的 exact 路径 / kind（防止 register 被吞掉仍全绿）；
+- 抽测 `unquotePath`：C 风格八进制转义还原中文文件名（git `core.quotePath` 路径解码）；
+- 抽测载荷自愈钩子：补丁 / 幂等 / 跳过 / 缺载荷 / **max 漂移按标记重打**；
 - 断言 `dsh.bundle.patch` 与客户端工厂内联了 `.dshx-root` 样式（不能再 `require` 独立 CSS 文件）。
 
 客户端 bundle 的 `exports` 垫片写在 tsdown `banner` 里（`intro` 会被静默丢掉）。缺这一步时浏览器会 `exports is not defined`，整页 Failed to load plugins，所以发版前务必 `verify`。
@@ -129,6 +134,8 @@ scripts/smoke.mjs        verify 冒烟
 
 浏览器半边经 `package.json` 的 `dsh.client` 由模块表扫描加载；Host 半边靠 `dsh.bundle.patch` 指向的 [`cordis.patch.yml`](./cordis.patch.yml)（`dsh plugin add` 会把本包列入 `dsh.profile.bundles`）。`pnpm plugin:install` 仍会把同一行写进 profile 的 patch。手册示例见 [`cordis.patch.example.yml`](./cordis.patch.example.yml)。
 
+注意：`./client` 导出（`lib/client.js`）是浏览器专属产物，仅供壳的 `window.__ModuleLoader__` 以工厂形式消费，Node 侧不可直接 require / import（没有 `exports` 垫片与模块表，加载即报错）。
+
 ### 插槽
 
 | 座位 | 用途 |
@@ -141,7 +148,7 @@ scripts/smoke.mjs        verify 冒烟
 
 ### RPC（`POST /dsh-explorer/rpc`）
 
-必须带自定义头 `x-dsh-explorer: 1`（触发浏览器 preflight，跨站过不了闸）。
+必须带自定义头 `x-dsh-explorer: 1`（触发浏览器 preflight，跨站过不了闸）。闸内再做**同源回环 Origin 校验**（防 DNS rebinding）：`Origin` 必须与 `Host` 同源且主机名在回环白名单（`127.0.0.1` / `localhost` / `::1`）；跨源、缺 `Origin`、「同源但非回环」一律 403。
 
 | 方法 | 作用 |
 | --- | --- |

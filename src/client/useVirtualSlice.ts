@@ -38,6 +38,15 @@ export function useVirtualSlice(count: number, itemH: number, resetKey: string, 
     }
   }, [resetKey])
 
+  // 数据量突变（如切换文件/列表缩短）时把 scrollTop 夹取到新总量内，
+  // 否则滚动条停在旧位置 → 可视区落在空白里（白屏/跳顶）。
+  useEffect(() => {
+    const wrap = wrapRef.current
+    if (wrap === null) return
+    const maxScroll = Math.max(0, count * itemH - viewH)
+    if (wrap.scrollTop > maxScroll) wrap.scrollTop = maxScroll
+  }, [count, itemH, viewH])
+
   const visible = Math.ceil(Math.max(viewH, 1) / itemH) + overscan * 2
   const last = Math.max(0, count - 1)
   const from = Math.min(start, last)

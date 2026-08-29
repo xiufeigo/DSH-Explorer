@@ -5,6 +5,39 @@
 
 export const SUMMARY_CARD_WIDTH = 300
 
+interface HostRegistry {
+  createdElements: HTMLElement[]
+  observers: ResizeObserver[]
+  modifiedScrollers: HTMLElement[]
+}
+
+const hostRegistry: HostRegistry = {
+  createdElements: [],
+  observers: [],
+  modifiedScrollers: [],
+}
+
+export function disposeConversationHost(): void {
+  for (const observer of hostRegistry.observers) {
+    try { observer.disconnect() } catch { /* ignore */ }
+  }
+  hostRegistry.observers = []
+
+  for (const el of hostRegistry.createdElements) {
+    try { el.remove() } catch { /* ignore */ }
+  }
+  hostRegistry.createdElements = []
+
+  for (const scroller of hostRegistry.modifiedScrollers) {
+    try {
+      scroller.classList.remove('dshx-has-chrome')
+      scroller.style.removeProperty('--dshx-scrollport-h')
+      delete scroller.dataset.dshxRo
+    } catch { /* ignore */ }
+  }
+  hostRegistry.modifiedScrollers = []
+}
+
 export function conversationScroll(): HTMLElement | null {
   const el = document.querySelector('[data-conversation-scroll]')
   return el instanceof HTMLElement ? el : null
@@ -28,6 +61,10 @@ export function ensureHost(attr: string, className: string): HTMLElement | null 
   host.setAttribute(attr, '')
   host.className = className
   scroller.insertBefore(host, scroller.firstChild)
+  hostRegistry.createdElements.push(host)
+  if (!hostRegistry.modifiedScrollers.includes(scroller)) {
+    hostRegistry.modifiedScrollers.push(scroller)
+  }
   scroller.classList.add('dshx-has-chrome')
   const applyHeight = (): void => {
     scroller.style.setProperty('--dshx-scrollport-h', `${scroller.clientHeight}px`)
@@ -44,6 +81,7 @@ export function ensureHost(attr: string, className: string): HTMLElement | null 
       })
     })
     observer.observe(scroller)
+    hostRegistry.observers.push(observer)
   }
   return host
 }
@@ -64,6 +102,7 @@ export function ensureTermHost(): HTMLElement | null {
   host.setAttribute('data-dshx-term-host', '')
   host.className = 'dshx-term-host'
   root.appendChild(host)
+  hostRegistry.createdElements.push(host)
   return host
 }
 

@@ -2,18 +2,21 @@
  * 右侧栏：当前会话引用到 / 搜索到的来源与页面。
  */
 
-import { useEffect, useState } from 'react'
-import { rpc } from './rpc'
+import { useEffect, useRef, useState } from 'react'
+import { rpc, safeExternalUrl } from './rpc'
 import type { SourceGroup } from './SummaryCard'
 
 export function SourcesView({ sessionId }: { sessionId: string }): JSX.Element {
   const [groups, setGroups] = useState<SourceGroup[]>([])
   const [error, setError] = useState<string | null>(null)
   const [open, setOpen] = useState<Record<string, boolean>>({})
+  const reqSeq = useRef(0)
 
   useEffect(() => {
     const load = (): void => {
+      const my = ++reqSeq.current
       void rpc<{ groups?: SourceGroup[]; error?: string }>(sessionId, 'session.sources').then(res => {
+        if (my !== reqSeq.current) return
         if (res.error !== undefined && res.error !== '') setError(res.error)
         setGroups(res.groups ?? [])
       })
@@ -56,7 +59,7 @@ export function SourcesView({ sessionId }: { sessionId: string }): JSX.Element {
                   <a
                     key={page.url}
                     className="dshx-source-page"
-                    href={page.url}
+                    href={safeExternalUrl(page.url)}
                     target="_blank"
                     rel="noreferrer"
                     title={page.url}

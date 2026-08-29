@@ -26,11 +26,16 @@ import { SidebarFiles } from './SidebarFiles'
 import { SummaryToggle } from './SummaryToggle'
 import { TerminalToggle } from './TerminalToggle'
 import { installDetailsWidthMemory } from './detailsWidth'
+import { disposeConversationHost } from './conversationHost'
+import { disposeSoundPlayer } from './soundPlayer'
 import { createExplorerStore, type ExplorerStore } from './store'
 import { injectStyles } from './styles'
-import { installChatFileOpen, rememberHostOpenPath } from './chatFileOpen'
+import { installChatFileOpen, rememberHostOpenPath, resetHostOpenPath } from './chatFileOpen'
 import { installNarrowOverlay, overlayAwareOpenDetails } from './narrowPanel'
-import { installWorkspaceRecencyOrder } from './workspaceRecencyOrder'
+import {
+  installWorkspaceRecencyOrder,
+  __resetForReload as resetWorkspaceRecencyOrderForReload,
+} from './workspaceRecencyOrder'
 import { installWorkspacePinOverlay } from './workspacePinOverlay'
 
 interface SlotsLike {
@@ -73,17 +78,26 @@ export { parentDir } from './chatFileOpen'
 export {
   installWorkspaceRecencyOrder,
   __setPinsForTests,
+  __resetForReload,
   getWorkspacePinSummary,
   resetWorkspacePinOrder,
   commitWorkspaceOrderIntent,
   beginWorkspaceDragHold,
   endWorkspaceDragHold,
 } from './workspaceRecencyOrder'
+export { resetHostOpenPath } from './chatFileOpen'
 export { installWorkspacePinOverlay } from './workspacePinOverlay'
 
 export function apply(ctx: ExplorerClientContext): void {
   // Wrap attachPanels before the first paint so reopening details restores width.
-  installDetailsWidthMemory(ctx.layout)
+  ctx.effect(() => installDetailsWidthMemory(ctx.layout), 'dsh-explorer: details width memory')
+  ctx.effect(() => () => {
+    disposeConversationHost()
+    disposeSoundPlayer()
+    // 模块单例复位：插件重载后旧实例的缓存/注册不能残留给新实例
+    resetHostOpenPath()
+    resetWorkspaceRecencyOrderForReload()
+  }, 'dsh-explorer: host and sound cleanup')
   installLongTaskProbe()
   if (typeof document !== 'undefined') {
     ctx.effect(() => injectStyles(), 'dsh-explorer: styles')
@@ -158,10 +172,14 @@ export function apply(ctx: ExplorerClientContext): void {
   }
   ctx.slots.inject('sidebar.workspaces.actions', () => {
     topSeatActive = true
-    return ctx.slots.register(
+    const dispose = ctx.slots.register(
       { name: 'sidebar.workspaces.actions', id: 'dsh-explorer-files', order: 10, inject: () => ({ store, toggleFiles }) },
       FilesToggle as never,
-    )
+    ) as () => void
+    return () => {
+      topSeatActive = false
+      if (typeof dispose === 'function') dispose()
+    }
   })
   ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register(
     {
@@ -225,4 +243,12 @@ export function apply(ctx: ExplorerClientContext): void {
   } catch (error) {
     console.error('dsh-explorer: settings card inject failed', error)
   }
+
+  ctx.effect(() => () => {
+    if (fileTreeEntry !== null) {
+      fileTreeEntry()
+      fileTreeEntry = null
+    }
+    store.setFilesMode(false)
+  }, 'dsh-explorer: file-mode safety net')
 }

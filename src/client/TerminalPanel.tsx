@@ -96,6 +96,36 @@ function TermPane({ sessionId, tab, active, visible, height, onMeta }: {
         applyTermLook(term, fit)
       })()
     })
+    // 键盘输入只注册一次：读写都走 tab.ptyId 当前值，重挂流/新开都复用
+    // （若随 attach 注册，重挂失败转新开时会叠两份导致输入翻倍）。
+    term.onData(data => {
+      if (tab.ptyId !== null) void rpc(sessionId, 'pty.write', { id: tab.ptyId, data })
+    })
+
+    /** 挂流到既有进程：只接 NDJSON 输出，不重新 pty.open。返回是否挂成功。 */
+    const attach = async (ptyId: string): Promise<boolean> => {
+      try {
+        await readNdjson(sessionId, ptyId, row => {
+          if (row.t === 'out' && typeof row.d === 'string') term.write(row.d)
+          if (row.t === 'err' && typeof row.m === 'string') term.writeln(`\r\n\x1b[31m${row.m}\x1b[0m`)
+          if (row.t === 'exit') {
+            term.writeln('\r\n\x1b[90m[进程已结束]\x1b[0m')
+            // 进程已退出：清掉 ptyId 并 touch，避免重挂载时去挂一条死流
+            if (tab.ptyId !== null) {
+              tab.ptyId = null
+              onMeta()
+            }
+          }
+        }, abort.signal)
+        return true
+      } catch (error) {
+        if (abort.signal.aborted) return false
+        const message = error instanceof Error ? error.message : String(error)
+        if (message.includes('abort')) return false
+        term.writeln(`\r\n\x1b[31m${message}\x1b[0m`)
+        return false
+      }
+    }
 
     const start = async (): Promise<void> => {
       try { await waitTermFont(getPrefs()) } catch { /* ignore */ }
@@ -103,9 +133,23 @@ function TermPane({ sessionId, tab, active, visible, height, onMeta }: {
       applyTermLook(term, fit)
       const cols = Math.max(20, term.cols)
       const rows = Math.max(8, term.rows)
+      // 切会话/卸载不杀进程（termBags 按会话持久）：重挂载时 ptyId 还在就直接
+      // 把流挂回既有进程，不重新 pty.open。
+      const existing = tab.ptyId
+      if (existing !== null) {
+        if (await attach(existing)) return
+        if (abort.signal.aborted) return
+        // 挂流失败（宿主重启后进程被回收等）：清掉死 id，落到下面新开
+        tab.ptyId = null
+        onMeta()
+      }
       const res = await rpc<{ id?: string; title?: string; error?: string }>(sessionId, 'pty.open', { cols, rows })
       if (abort.signal.aborted) {
-        if (typeof res.id === 'string') void rpc(sessionId, 'pty.close', { id: res.id })
+        // 已卸载也不杀刚开出的进程：记下 ptyId 保活，重挂载可挂回（宿主闲置回收兜底）
+        if (typeof res.id === 'string' && tab.ptyId === null) {
+          tab.ptyId = res.id
+          onMeta()
+        }
         return
       }
       if (res.error !== undefined || typeof res.id !== 'string') {
@@ -117,30 +161,16 @@ function TermPane({ sessionId, tab, active, visible, height, onMeta }: {
       tab.ptyId = res.id
       if (typeof res.title === 'string' && res.title.length > 0) tab.title = res.title
       onMeta()
-      term.onData(data => {
-        if (tab.ptyId !== null) void rpc(sessionId, 'pty.write', { id: tab.ptyId, data })
-      })
-      try {
-        await readNdjson(sessionId, res.id, row => {
-          if (row.t === 'out' && typeof row.d === 'string') term.write(row.d)
-          if (row.t === 'err' && typeof row.m === 'string') term.writeln(`\r\n\x1b[31m${row.m}\x1b[0m`)
-          if (row.t === 'exit') term.writeln('\r\n\x1b[90m[进程已结束]\x1b[0m')
-        }, abort.signal)
-      } catch (error) {
-        if (abort.signal.aborted) return
-        const message = error instanceof Error ? error.message : String(error)
-        if (message.includes('abort')) return
-        term.writeln(`\r\n\x1b[31m${message}\x1b[0m`)
-      }
+      void attach(res.id)
     }
     void start()
 
     return () => {
       abort.abort()
       stopPrefs()
-      const ptyId = tab.ptyId
-      if (ptyId !== null) void rpc(sessionId, 'pty.close', { id: ptyId })
-      tab.ptyId = null
+      // 卸载/切会话不发 pty.close：仅断流、销毁 xterm。ptyId 保留在 store，
+      // 重挂载时重新挂流；仅用户点 ✕ 关 tab（closeTab 路径）才杀进程。
+      // 孤儿进程由宿主 10 分钟闲置回收兜底。
       term.dispose()
       rec.current = null
     }
@@ -181,12 +211,22 @@ export function TerminalPanel({ sessionId, store }: { sessionId: string; store: 
       if (drag.current === null) return
       store.setTerminalHeight(drag.current.startH + (drag.current.startY - event.clientY))
     }
-    const onUp = (): void => { drag.current = null }
+    // 正常松手与异常结束（pointercancel / 窗口失焦）同样收尾：落盘并提交高度
+    const finish = (): void => {
+      if (drag.current !== null) {
+        drag.current = null
+        store.commitTerminalHeight()
+      }
+    }
     window.addEventListener('pointermove', onMove)
-    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointerup', finish)
+    window.addEventListener('pointercancel', finish)
+    window.addEventListener('blur', finish)
     return () => {
       window.removeEventListener('pointermove', onMove)
-      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointerup', finish)
+      window.removeEventListener('pointercancel', finish)
+      window.removeEventListener('blur', finish)
     }
   }, [store])
 
@@ -197,6 +237,13 @@ export function TerminalPanel({ sessionId, store }: { sessionId: string; store: 
   const closeTab = (localId: string, event: { preventDefault(): void; stopPropagation(): void }): void => {
     event.preventDefault()
     event.stopPropagation()
+    // 只有用户点 ✕ 关 tab 才杀进程；卸载/切会话保活（见 TermPane 清理注释）
+    const target = store.termBag(sessionId).tabs.find(t => t.localId === localId)
+    if (target !== undefined && target.ptyId !== null) {
+      const ptyId = target.ptyId
+      target.ptyId = null
+      void rpc(sessionId, 'pty.close', { id: ptyId })
+    }
     store.closeTermTab(sessionId, localId)
   }
 
@@ -210,6 +257,8 @@ export function TerminalPanel({ sessionId, store }: { sessionId: string; store: 
         onPointerDown={event => {
           event.preventDefault()
           drag.current = { startY: event.clientY, startH: store.terminalHeight }
+          // 指针捕获：指针移出把手也不丢 move/up；捕获失败退回 window 监听兜底
+          try { event.currentTarget.setPointerCapture(event.pointerId) } catch { /* ignore */ }
         }}
       />
       <div className="dshx-term-tabs" role="tablist" aria-label="终端">

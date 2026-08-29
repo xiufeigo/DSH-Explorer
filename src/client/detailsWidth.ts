@@ -80,18 +80,23 @@ export function getAttachedPanelActions(): PanelActions | null {
   return attachedPanelActions
 }
 
-/** 必须在首屏 render / attachPanels 之前调用。 */
-export function installDetailsWidthMemory(layout: object): void {
+/** 必须在首屏 render / attachPanels 之前调用。返回还原函数。 */
+export function installDetailsWidthMemory(layout: object): () => void {
   const proto = Object.getPrototypeOf(layout) as {
     attachPanels?: (actions: PanelActions) => void
     __dshxDetailsMemory?: boolean
   }
-  if (proto.__dshxDetailsMemory === true) return
+  if (proto.__dshxDetailsMemory === true) return () => {}
   const origAttach = proto.attachPanels
-  if (typeof origAttach !== 'function') return
+  if (typeof origAttach !== 'function') return () => {}
   proto.attachPanels = function wrappedAttach(this: unknown, actions: PanelActions) {
     attachedPanelActions = actions
     return origAttach.call(this, wrapActions(actions))
   }
   proto.__dshxDetailsMemory = true
+  return () => {
+    proto.attachPanels = origAttach
+    delete proto.__dshxDetailsMemory
+    attachedPanelActions = null
+  }
 }

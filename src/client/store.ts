@@ -22,6 +22,9 @@ export interface FileTab {
   dirty: boolean
   loading: boolean
   error: string | null
+  /** 打开/载入时记录的磁盘基准版本（Host fs.read 的 version，可能缺失）。
+   *  保存时作为 `expected` 传给 fs.write 做 CAS，防止盲覆盖外部改动。 */
+  baseVersion?: string | null
 }
 
 export interface TermTab {
@@ -87,6 +90,7 @@ export interface ExplorerStore {
   setSummaryFloat(open: boolean): void
   setTerminalOn(on: boolean): void
   setTerminalHeight(h: number): void
+  commitTerminalHeight(): void
   termBag(sessionId: string): TermBag
   addTermTab(sessionId: string): TermTab
   closeTermTab(sessionId: string, localId: string): void
@@ -230,6 +234,7 @@ export function createExplorerStore(): ExplorerStore {
         dirty: false,
         loading: true,
         error: null,
+        baseVersion: null,
       }
       this.tabs = [...this.tabs, tab]
       this.active = tab.id
@@ -331,8 +336,11 @@ export function createExplorerStore(): ExplorerStore {
     setTerminalHeight(h) {
       const next = Math.min(560, Math.max(140, Math.round(h)))
       this.terminalHeight = next
-      try { localStorage.setItem(TERM_HEIGHT_KEY, String(next)) } catch { /* ignore */ }
       notify()
+    },
+
+    commitTerminalHeight() {
+      try { localStorage.setItem(TERM_HEIGHT_KEY, String(this.terminalHeight)) } catch { /* ignore */ }
     },
 
     termBag(sessionId) {
@@ -378,7 +386,8 @@ export function createExplorerStore(): ExplorerStore {
     patchTab(id, patch) {
       const tab = this.tabs.find(t => t.id === id)
       if (tab === undefined) return
-      Object.assign(tab, patch)
+      // 不可变更新：原地改对象会让 memo / 依赖比较全部失效
+      this.tabs = this.tabs.map(t => (t.id === id ? { ...t, ...patch } : t))
       notify()
     },
 

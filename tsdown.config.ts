@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { basename, dirname, resolve as resolvePath } from 'node:path'
 import { defineConfig } from 'tsdown'
@@ -36,7 +37,10 @@ const cssModulesInline = {
     const fileId = virtualId.slice(CSS_VIRTUAL_PREFIX.length, -CSS_VIRTUAL_SUFFIX.length)
     this.addWatchFile(fileId)
     const css = await readFile(fileId, 'utf8')
-    const tagId = `dsh-explorer/${basename(fileId)}`
+    // tagId 掺入路径哈希：不同目录的同名 .module.css 不会互抢同一个
+    // style[data-plugin-css] 标签（当前仓库只有一个，防撞于未来）。
+    const hash = createHash('sha1').update(fileId).digest('hex').slice(0, 8)
+    const tagId = `dsh-explorer/${basename(fileId)}-${hash}`
     return [
       `const css = ${JSON.stringify(css)};`,
       `const tagId = ${JSON.stringify(tagId)};`,
@@ -63,7 +67,9 @@ export default defineConfig([
     target: 'es2022',
     fixedExtension: false,
     dts: false,
-    clean: false,
+    // 清掉陈旧产物（改名/换入口后的残留）。client 半边在同一 lib 目录
+    // 随后构建且 clean:false，不会误删 host 产物。
+    clean: true,
     sourcemap: true,
   },
   // ── Browser (client) half ───────────────────────────────────────────────
@@ -79,7 +85,9 @@ export default defineConfig([
     external: CLIENT_EXTERNALS,
     // Everything that is NOT a platform module must be inlined: a require()
     // the module table cannot answer is a guaranteed runtime throw.
-    noExternal: (id: string) => (CLIENT_EXTERNALS.includes(id) ? undefined : true),
+    // 显式 false（而非依赖 undefined 的隐式语义），上游行为变化也不会把
+    // react 误内联。
+    noExternal: (id: string) => (CLIENT_EXTERNALS.includes(id) ? false : true),
     define: {
       'process.env.NODE_ENV': JSON.stringify('production'),
       'import.meta.env.MODE': JSON.stringify('production'),

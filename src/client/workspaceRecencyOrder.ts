@@ -198,6 +198,18 @@ export function __setPinsForTests(state: WorkspacePinState | null): void {
   pinsCache = state
 }
 
+/**
+ * 插件重载复位：清掉模块单例的内存缓存与订阅集合（不动 localStorage /
+ * 宿主注册顺序等宿主状态），防止旧实例残留干扰新实例。
+ * 注意：只清缓存不改排序逻辑。下划线前缀 = 非公开 API。
+ */
+export function __resetForReload(): void {
+  pinsCache = null
+  pinsListeners.clear()
+  orderSource = null
+  dragHold = false
+}
+
 // ── 时间口径 ────────────────────────────────────────────────────────────────
 
 /** 是否至少有一个工作区的活动时间来自真实会话 updatedAt（而非 createdAt 回退）。 */

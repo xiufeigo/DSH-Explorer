@@ -4,7 +4,7 @@
  * except for this file.
  */
 
-import { existsSync, readlinkSync } from 'node:fs'
+import { copyFileSync, existsSync, readlinkSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve, sep } from 'node:path'
 
 export function looksLikeHarness(root) {
@@ -60,22 +60,59 @@ export function locateHarness({ explicit, projectRoot, junctionBases }) {
   return tries.find(looksLikeHarness)
 }
 
+/**
+ * 剥掉 `\\?\` / `\??\` NT 设备命名空间前缀再比较：Windows junction 的
+ * 链接目标常以 `\??\C:\…` 存储，扩展长度路径则带 `\\?\`。这类串直接
+ * 进 resolve 会被当成「当前盘根相对」拼出错误路径，造成同路径误判。
+ */
+export function stripNtPrefix(value) {
+  return String(value).replace(/^\\{1,2}\?{1,2}\\/, '')
+}
+
 export function sameResolved(a, b) {
-  const left = resolve(a)
-  const right = resolve(b)
+  const left = resolve(stripNtPrefix(a))
+  const right = resolve(stripNtPrefix(b))
   return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right
 }
 
-/** Junction / symlink 是否指向 target（相对链接按链接所在目录解析）。 */
+/** Junction / symlink 是否指向 target（相对链接按链接所在目录解析；NT 前缀先剥净）。 */
 export function linkPointsTo(linkPath, target) {
-  const current = readlinkSync(linkPath)
+  const current = stripNtPrefix(readlinkSync(linkPath))
   return sameResolved(resolve(dirname(linkPath), current), target)
 }
 
 export function shellLine(cmd, args) {
   const tokens = [cmd, ...args].map(token => {
-    if (!/[ \t"@]/.test(token)) return token
-    return `"${String(token).replace(/"/g, '\\"')}"`
+    const text = String(token)
+    // cmd.exe 的元字符无法靠引号完全中和（`&` 在引号外断行、`%` 变量展开）。
+    // 本脚本的 token 全是固定值；一旦出现元字符说明被外部路径污染，拒绝执行。
+    if (/[&|<>^%!]/.test(text)) {
+      throw new Error(`命令行参数含 shell 元字符，拒绝拼接：${text}`)
+    }
+    if (!/[ \t"@]/.test(text)) return text
+    return `"${text.replace(/"/g, '\\"')}"`
   })
   return tokens.join(' ')
+}
+
+/** 原始备份只写一次（卸载/排查时可手工还原）。返回备份路径。 */
+export function backupOnce(filePath, suffix = '.dshx-orig') {
+  const backup = `${filePath}${suffix}`
+  if (!existsSync(backup)) copyFileSync(filePath, backup)
+  return backup
+}
+
+/**
+ * 同盘临时文件 + 原子换名，避免半截文件被读到；换名失败退回直写并清理
+ * 临时文件。与 src/payloadFork.ts 的写入策略同源。
+ */
+export function atomicWrite(filePath, text) {
+  const tmp = `${filePath}.dshx-tmp`
+  writeFileSync(tmp, text, 'utf8')
+  try {
+    renameSync(tmp, filePath)
+  } catch {
+    writeFileSync(filePath, text, 'utf8')
+    try { rmSync(tmp, { force: true }) } catch { /* 尽力清理 */ }
+  }
 }

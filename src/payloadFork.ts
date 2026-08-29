@@ -21,14 +21,25 @@ import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'nod
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 
-/** 已打过补丁的文件尾部标记；同时是幂等跳过的判据。 */
-export const FORK_MARKER = '/* dsh-explorer payload fork: details clamp 300..1200 (self-healing at plugin startup) */'
+/**
+ * 宽度上限契约：这里的 1200 与 src/client/detailsWidth.ts 的 DETAILS_MAX
+ * 必须一致（客户端按它记忆拖拽宽度，host 自愈按它重写钳制点位），
+ * 改动时两边同步。
+ */
+export function forkMarkerFor(max: number): string {
+  return `/* dsh-explorer payload fork: details clamp 300..${max} (self-healing at plugin startup) */`
+}
+
+/** 已打过补丁的文件尾部标记；同时是幂等跳过的判据。1200 ↔ src/client/detailsWidth.ts DETAILS_MAX。 */
+export const FORK_MARKER = forkMarkerFor(1200)
 
 export interface PayloadForkIo {
   exists(path: string): boolean
   read(path: string): string
   write(path: string, text: string): void
   rename(from: string, to: string): void
+  /** 可选：清理临时文件。缺省时跳过清理，不影响主流程。 */
+  remove?(path: string): void
 }
 
 export const defaultIo: PayloadForkIo = {
@@ -36,6 +47,7 @@ export const defaultIo: PayloadForkIo = {
   read: path => readFileSync(path, 'utf8'),
   write: (path, text) => writeFileSync(path, text, 'utf8'),
   rename: (from, to) => renameSync(from, to),
+  remove: path => rmSync(path, { force: true }),
 }
 
 export interface PayloadForkOptions {
@@ -89,6 +101,13 @@ export function locateLayoutBundle(io: PayloadForkIo = defaultIo, extraBases: re
 
   bases.push(...extraBases)
 
+  // 显式覆盖（env / extraBases）优先于 Node 解析：多载荷共存时，
+  // require.resolve 可能抢先命中另一份 bundle，覆盖必须说了算。
+  for (const base of bases) {
+    const found = climbForBundle(base, io)
+    if (found !== undefined) return found
+  }
+
   // 最稳的一条：从 CLI 入口（bin.js）按 Node 解析规则找，与服务器模块表同源。
   try {
     const entry = process.argv[1]
@@ -107,10 +126,9 @@ export function locateLayoutBundle(io: PayloadForkIo = defaultIo, extraBases: re
     dirname(process.execPath),
     join(dirname(process.execPath), '..', 'app'),
   ].filter(row => row.length > 0)
-  bases.push(...starts)
 
-  for (const base of bases) {
-    const found = climbForBundle(base, io)
+  for (const start of starts) {
+    const found = climbForBundle(start, io)
     if (found !== undefined) return found
   }
   return undefined
@@ -119,17 +137,22 @@ export function locateLayoutBundle(io: PayloadForkIo = defaultIo, extraBases: re
 /**
  * 纯函数：把 bundle 文本里的 520 钳制改成 max。返回 null 表示没有可命中点位
  * （源码 fork 已存在 / 上游结构变化），调用方据此跳过而不是盲写。
+ * 默认 1200 ↔ src/client/detailsWidth.ts 的 DETAILS_MAX。
  */
-export function rewriteClampSites(source: string, max = 1200): { text: string; sites: number } | null {
+export function rewriteClampSites(source: string, max = 1200, fromMax = 520): { text: string; sites: number } | null {
+  // 入口防守：非有限数字会拼出畸形正则与输出文本，直接按无点位处理。
+  if (!Number.isFinite(max) || !Number.isFinite(fromMax)) return null
   // 每次调用用全新正则，避免 /g 的 lastIndex 跨调用串状态。
-  const pattern = /\bclampWidth\((px|details),\s*300,\s*520\)/g
+  const pattern = new RegExp(`\\bclampWidth\\((px|details),\\s*300,\\s*${fromMax}\\)`, 'g')
   let sites = 0
   const text = source.replace(pattern, match => {
     sites++
-    return match.replace(/520\s*\)$/, `${max})`)
+    return match.replace(new RegExp(`${fromMax}\\s*\\)$`), `${max})`)
   })
   if (sites === 0) return null
-  return { text: `${text}\n${FORK_MARKER}\n`, sites }
+  const oldMarkerRegex = /\/\* dsh-explorer payload fork: details clamp 300\.\.\d+ \(self-healing at plugin startup\) \*\/\n?/g
+  const cleaned = text.replace(oldMarkerRegex, '').trimEnd()
+  return { text: `${cleaned}\n${forkMarkerFor(max)}\n`, sites }
 }
 
 /**
@@ -138,6 +161,7 @@ export function rewriteClampSites(source: string, max = 1200): { text: string; s
  */
 export function applyPayloadFork(options: PayloadForkOptions = {}): PayloadForkStatus {
   const io = options.io ?? defaultIo
+  // 缺省 1200 ↔ src/client/detailsWidth.ts 的 DETAILS_MAX。
   const max = options.max ?? 1200
   let path: string | undefined
   try {
@@ -148,10 +172,21 @@ export function applyPayloadFork(options: PayloadForkOptions = {}): PayloadForkS
     options.onLocated?.(path)
 
     const source = io.read(path)
-    if (source.includes(FORK_MARKER)) return { status: 'already', path }
+    const existingMarkerMatch = source.match(/\/\* dsh-explorer payload fork: details clamp 300\.\.(\d+) \(self-healing at plugin startup\) \*\//)
+    let fromMax = 520
+    if (existingMarkerMatch !== null) {
+      const existingMax = Number(existingMarkerMatch[1])
+      if (existingMax === max) {
+        return { status: 'already', path }
+      }
+      fromMax = existingMax
+    }
 
-    const rewritten = rewriteClampSites(source, max)
+    const rewritten = rewriteClampSites(source, max, fromMax)
     if (rewritten === null) {
+      if (existingMarkerMatch !== null) {
+        return { status: 'skipped', path, reason: `已存在补丁标记（max=${existingMarkerMatch[1]}）但未找到 300–${fromMax} 钳制点位` }
+      }
       return { status: 'skipped', path, reason: 'bundle 中没有 300–520 钳制点位（可能已是源码 fork 或上游结构变化）' }
     }
 
@@ -159,14 +194,16 @@ export function applyPayloadFork(options: PayloadForkOptions = {}): PayloadForkS
     const backup = `${path}.dshx-orig`
     if (!io.exists(backup)) io.write(backup, source)
 
-    // 同盘临时文件 + 原子换名，避免半截文件被服务器端出去；换名失败退回直写。
+    // 同盘临时文件 + 原子换名，避免半截文件被服务器读出去。
     const tmp = `${path}.dshx-tmp`
     io.write(tmp, rewritten.text)
     try {
       io.rename(tmp, path)
     } catch {
-      io.write(path, rewritten.text)
-      try { rmSync(tmp, { force: true }) } catch { /* 尽力清理 */ }
+      // 换名失败：放弃本次写入（绝不直写——目标文件可能正被服务器读取，
+      // 直写有截断风险）。保留原文件，下次启动自愈会重试；尽力清掉临时文件。
+      try { io.remove?.(tmp) } catch { /* 尽力清理 */ }
+      return { status: 'failed', path, reason: '重命名失败，保持原文件待下次自愈' }
     }
     return { status: 'patched', path, sites: rewritten.sites }
   } catch (error) {

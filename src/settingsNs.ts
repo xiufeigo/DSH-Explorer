@@ -98,6 +98,7 @@ export const explorerSettingsSchema = Object.assign(parseSection, {
   } satisfies StandardSchema,
   toJSON: () => ({
     type: 'object',
+    additionalProperties: false,
     properties: {
       termTheme: { type: 'string', enum: [...THEMES], default: DEFAULT_SECTION.termTheme },
       termFontSize: { type: 'number', default: DEFAULT_SECTION.termFontSize },

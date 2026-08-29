@@ -4,3 +4,5 @@ lib/
 .DS_Store
 .env
 .env.*
+.tmp-mdcheck/
+.tmp-xsscheck/

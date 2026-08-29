@@ -1,14 +1,19 @@
 /**
  * Markdown / 高亮 自检脚本：把 src/client 的 Markdown.ts + highlight.ts
  * 用 TypeScript transpile 成 CJS 后逐条断言渲染输出。
+ *
+ * 约束声明：Markdown.ts / highlight.ts 必须保持零第三方依赖、可 CJS 执行
+ *（本自检用 TypeScript transpile + CJS 沙箱运行它们）。引入 ESM-only 或
+ * npm 依赖会同时破坏本脚本与壳浏览器模块表加载，禁止。
+ *
  * 用法：node scripts/md-selfcheck.mjs
  */
 import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const root = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/(?=[A-Za-z]:)/, '')), '..')
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const require = createRequire(import.meta.url)
 const ts = require('typescript')
 
@@ -163,6 +168,63 @@ check(
   'javascript: 链接被拦截',
   renderMarkdown('[x](javascript:alert(1))'),
   t => t.includes('href="#"') && !t.includes('javascript:'),
+)
+// 协议白名单的 tab/控制字符绕过（浏览器解析 href 前会剥掉 C0 字符，
+// 必须先剥净再判协议；见 Markdown.ts safeUrl 注释）
+const noJs = t => !/java\s*script:/i.test(t) && !/vbscript:/i.test(t)
+check(
+  'XSS: 裸目的地内嵌 tab 的 javascript:',
+  renderMarkdown('[x](java\tscript:alert(1))'),
+  t => noJs(t) && t.includes('href="#"'),
+)
+check(
+  'XSS: 尖括号目的地内嵌 tab 的 javascript:',
+  renderMarkdown('[x](<java\tscript:alert(1)>)'),
+  t => noJs(t) && t.includes('href="#"'),
+)
+check(
+  'XSS: 图片 src 内嵌 tab 的 javascript:',
+  renderMarkdown('![x](<java\tscript:alert(4)>)'),
+  t => noJs(t) && t.includes('src="#"'),
+)
+check(
+  'XSS: C0 控制字符分隔的 javascript:',
+  renderMarkdown('[x](jav\u0001ascript:alert(5))'),
+  t => noJs(t) && t.includes('href="#"'),
+)
+check(
+  'XSS: vbscript: 被拦截',
+  renderMarkdown('[x](vbscript:msgbox(1))'),
+  t => t.includes('href="#"') && !t.includes('vbscript:'),
+)
+check(
+  'XSS: data:text/html 被拦截',
+  renderMarkdown('[x](data:text/html;base64,PHNjcmlwdD4=)'),
+  t => t.includes('href="#"') && !t.includes('data:text/html'),
+)
+check(
+  'XSS 修复不误伤：含空格相对路径保留',
+  renderMarkdown('[x](docs/my file.md)'),
+  t => t.includes('href="docs/my file.md"'),
+)
+check(
+  'XSS 修复不误伤：图片 data: 白名单仍放行',
+  renderMarkdown('![i](data:image/png;base64,AAA)'),
+  t => t.includes('src="data:image/png;base64,AAA"'),
+)
+
+// PUA 哨兵预清（P3-1）：内部哨兵占用 \uE1xx 私有区段，用户输入若携带
+// PUA 字符会与哨兵序号碰撞导致标签重复展开（文本畸变）。入口预清后，
+// 渲染输出不得残留任何私有区字符。
+check(
+  'PUA：含 \uE100 的输入与合法链接同存，输出无哨兵残留',
+  renderMarkdown('[t](https://x.y)\uE100 tail'),
+  t => t.includes('href="https://x.y"') && !/\uE[\dA-F]{3}/.test(t),
+)
+check(
+  'PUA：预清不破坏正常渲染',
+  renderMarkdown('# T\uE123\n\ntext'),
+  t => t.includes('<h1>T</h1>') && t.includes('<p>text</p>') && !/\uE[\dA-F]{3}/.test(t),
 )
 
 // 引用链接与脚注

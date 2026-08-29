@@ -39,6 +39,14 @@ const STATUS_LABEL: Record<string, string> = {
   'untracked-removed': '未跟踪·已删',
 }
 
+/** 复合状态码（如 MM/AM）：首字符为暂存区状态，次字符为工作区状态。 */
+function statusTooltip(status: string): string {
+  if (status.length === 2 && status[0] in STATUS_LABEL && status[1] in STATUS_LABEL) {
+    return `暂存区：${STATUS_LABEL[status[0]]} · 工作区：${STATUS_LABEL[status[1]]}`
+  }
+  return STATUS_LABEL[status] ?? status
+}
+
 function lineClass(line: string): string {
   if (line.startsWith('@@')) return 'hunk'
   if (line.startsWith('+') && !line.startsWith('+++')) return 'add'
@@ -73,11 +81,32 @@ interface ReviewCacheEntry {
 }
 
 const reviewListCache = new Map<string, ReviewCacheEntry>()
+const REVIEW_LIST_CACHE_MAX = 30
 const reviewPatchCache = new Map<string, string | null>()
 const REVIEW_PATCH_CACHE_MAX = 32
 
 function reviewListKey(sessionId: string, mode: ReviewMode): string {
   return `${sessionId}:${mode}`
+}
+
+/** LRU 读取：命中即移到尾部刷新使用顺序（Map 迭代序 = 插入序）。 */
+function reviewListCacheGet(key: string): ReviewCacheEntry | undefined {
+  const hit = reviewListCache.get(key)
+  if (hit === undefined) return undefined
+  reviewListCache.delete(key)
+  reviewListCache.set(key, hit)
+  return hit
+}
+
+/** LRU 写入：超限淘汰最早使用项（头部）。 */
+function reviewListCacheSet(key: string, entry: ReviewCacheEntry): void {
+  if (reviewListCache.has(key)) reviewListCache.delete(key)
+  reviewListCache.set(key, entry)
+  while (reviewListCache.size > REVIEW_LIST_CACHE_MAX) {
+    const oldest = reviewListCache.keys().next().value
+    if (oldest === undefined) break
+    reviewListCache.delete(oldest)
+  }
 }
 
 function rememberPatch(key: string, patch: string | null): void {
@@ -181,7 +210,7 @@ const FileRow = memo(function FileRow({ path, status, active, onSelect }: {
       onClick={() => onSelect(path)}
       title={path}
     >
-      <span className={`dshx-badge ${status}`}>{STATUS_LABEL[status] ?? status}</span>
+      <span className={`dshx-badge ${status}`} title={statusTooltip(status)}>{STATUS_LABEL[status] ?? status}</span>
       <span className="dshx-file-name">{path}</span>
     </div>
   )
@@ -246,16 +275,19 @@ export const ReviewView = memo(function ReviewView({ sessionId, store, visible =
   const mode = useReviewMode(store)
   const setMode = (next: ReviewMode): void => { store.setReviewMode(next) }
   const cacheKey = reviewListKey(sessionId, mode)
-  const [data, setData] = useState<ReviewData | null>(() => reviewListCache.get(cacheKey)?.data ?? null)
-  const [selectedPath, setSelectedPath] = useState<string | null>(() => reviewListCache.get(cacheKey)?.selectedPath ?? null)
+  const [data, setData] = useState<ReviewData | null>(() => reviewListCacheGet(cacheKey)?.data ?? null)
+  const [selectedPath, setSelectedPath] = useState<string | null>(() => reviewListCacheGet(cacheKey)?.selectedPath ?? null)
   const [patch, setPatch] = useState<string | null>(null)
   const [patchLoading, setPatchLoading] = useState(false)
   const [panes, togglePane] = useReviewPanes()
-  const listSig = useRef(reviewListCache.get(cacheKey)?.sig ?? '')
+  const listSig = useRef(reviewListCacheGet(cacheKey)?.sig ?? '')
+  const reqSeq = useRef(0)
+  /** git.fileDiff 按文件取号：慢 patch 晚归时不得覆盖更新的请求结果。 */
+  const diffSeq = useRef<Map<string, number>>(new Map())
   const sourceRef = useRef(cacheKey)
   if (sourceRef.current !== cacheKey) {
     sourceRef.current = cacheKey
-    const hit = reviewListCache.get(cacheKey)
+    const hit = reviewListCacheGet(cacheKey)
     if (hit !== undefined) {
       listSig.current = hit.sig
       setData(hit.data)
@@ -269,7 +301,10 @@ export const ReviewView = memo(function ReviewView({ sessionId, store, visible =
   const load = useCallback((force = false) => {
     if (typeof document !== 'undefined' && document.hidden) return
     const method = mode === 'git' ? 'git.diff' : mode === 'last' ? 'git.lastRound' : 'git.branch'
-    void rpcWithSessionRetry<ReviewData>(sessionId, method).then(result => {
+    const my = ++reqSeq.current
+    // 大仓库 diff 可能超过默认 15s，git 类统一放宽到 60s
+    void rpcWithSessionRetry<ReviewData>(sessionId, method, {}, undefined, { timeoutMs: 60_000 }).then(result => {
+      if (my !== reqSeq.current) return
       const files: ReviewFile[] = result.files ?? []
       const signature = `${result.error ?? ''}\n${result.branch ?? ''}\n${listSignature(files)}`
       const key = reviewListKey(sessionId, mode)
@@ -280,7 +315,7 @@ export const ReviewView = memo(function ReviewView({ sessionId, store, visible =
         const next = current !== null && files.some(file => file.path === current)
           ? current
           : files.find(file => !isUntracked(file))?.path ?? null
-        reviewListCache.set(key, { data: result, selectedPath: next, sig: signature })
+        reviewListCacheSet(key, { data: result, selectedPath: next, sig: signature })
         return next
       })
     })
@@ -290,10 +325,17 @@ export const ReviewView = memo(function ReviewView({ sessionId, store, visible =
     if (!visible) return
     load()
     const timer = setInterval(() => load(), 8000)
-    const onVis = (): void => { if (!document.hidden) load() }
+    // 回前台刷新加 0-300ms 随机 jitter，避免多个组件同刻齐射 RPC
+    let visTimer = 0
+    const onVis = (): void => {
+      if (document.hidden) return
+      if (visTimer !== 0) window.clearTimeout(visTimer)
+      visTimer = window.setTimeout(() => { visTimer = 0; load() }, Math.round(Math.random() * 300))
+    }
     document.addEventListener('visibilitychange', onVis)
     return () => {
       clearInterval(timer)
+      if (visTimer !== 0) window.clearTimeout(visTimer)
       document.removeEventListener('visibilitychange', onVis)
     }
   }, [load, visible])
@@ -325,11 +367,16 @@ export const ReviewView = memo(function ReviewView({ sessionId, store, visible =
       setPatchLoading(true)
     }
     let cancelled = false
+    // 按文件取号：快速切换文件/模式时，晚归的慢 patch 不得覆盖新请求
+    const seqs = diffSeq.current
+    const seq = (seqs.get(path) ?? 0) + 1
+    seqs.set(path, seq)
     void rpc<{ patch?: string | null; error?: string }>(sessionId, 'git.fileDiff', {
       path,
       mode,
-    }).then(result => {
+    }, { timeoutMs: 60_000 }).then(result => {
       if (cancelled) return
+      if (seqs.get(path) !== seq) return // 已有更新的请求：丢弃过期响应
       const next = typeof result.patch === 'string' && result.patch.length > 0 ? result.patch : null
       rememberPatch(patchKey, next)
       setPatchLoading(false)
@@ -363,6 +410,9 @@ export const ReviewView = memo(function ReviewView({ sessionId, store, visible =
               <span className="dshx-file-name">{commit.subject}</span>
             </div>
           ))}
+          {data.commits.length >= 50 && (
+            <div className="dshx-muted" style={{ padding: '4px 10px', fontSize: 11 }}>仅展示最近 50 条提交</div>
+          )}
         </div>
       )}
 

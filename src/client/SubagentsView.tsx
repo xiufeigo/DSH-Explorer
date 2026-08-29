@@ -4,7 +4,7 @@
  * openSubagent, so the center conversation stays put.
  */
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { agentHue, formatClock, relativeTime } from './conversationHost'
 import { rpc } from './rpc'
 import { useExplorer, type ExplorerStore } from './store'
@@ -52,21 +52,26 @@ export function SubagentsView({
   const [messages, setMessages] = useState<TranscriptMessage[]>([])
   const [error, setError] = useState<string | null>(null)
   const [now, setNow] = useState(() => Date.now())
+  const listReqSeq = useRef(0)
+  const transcriptReqSeq = useRef(0)
 
-  const catalog = useSessions !== undefined
-    ? useSessions((state: { subagentsByParent?: Record<string, { entries?: CatalogEntry[] }> }) => state.subagentsByParent?.[sessionId]) as { entries?: CatalogEntry[] } | undefined
-    : undefined
-  const summaries = useSessions !== undefined
-    ? useSessions((state: { byId?: Record<string, { title?: string; running?: boolean; updatedAt?: number }> }) => state.byId) as Record<string, { title?: string; running?: boolean; updatedAt?: number }> | undefined
-    : undefined
+  const useSessionsSafe = useSessions ?? (() => undefined)
+  const catalog = useSessionsSafe((state: { subagentsByParent?: Record<string, { entries?: CatalogEntry[] }> }) => state?.subagentsByParent?.[sessionId]) as { entries?: CatalogEntry[] } | undefined
+  const summaries = useSessionsSafe((state: { byId?: Record<string, { title?: string; running?: boolean; updatedAt?: number }> }) => state?.byId) as Record<string, { title?: string; running?: boolean; updatedAt?: number }> | undefined
 
   useEffect(() => {
     void refreshSubagents(sessionId)
     setSubagentCatalogOpen(sessionId, true)
+    const my = ++listReqSeq.current
     void rpc<{ agents?: AgentRow[] }>(sessionId, 'session.subagents').then(res => {
-      setHostAgents(res.agents ?? [])
+      if (my === listReqSeq.current) {
+        setHostAgents(res.agents ?? [])
+      }
     })
-    const timer = setInterval(() => setNow(Date.now()), 1000)
+    const timer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return
+      setNow(Date.now())
+    }, 1000)
     return () => {
       clearInterval(timer)
       setSubagentCatalogOpen(sessionId, false)
@@ -89,9 +94,11 @@ export function SubagentsView({
   const done = agents.filter(agent => agent.activity !== 'running')
 
   const loadTranscript = useCallback((id: string) => {
+    const my = ++transcriptReqSeq.current
     setError(null)
     setMessages([])
     void rpc<{ messages?: TranscriptMessage[]; error?: string }>(sessionId, 'session.transcript', { targetId: id }).then(res => {
+      if (my !== transcriptReqSeq.current) return
       if (res.error !== undefined && res.error !== '') setError(res.error)
       setMessages(res.messages ?? [])
     })

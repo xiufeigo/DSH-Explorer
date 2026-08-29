@@ -141,6 +141,8 @@ interface LastRound {
 
 const UNTRACKED_PREVIEW_CAP = 128 * 1024
 const UNTRACKED_PREVIEW_LIMIT = 100
+/** session.sources 每组页条目上限：达到后停收，防长会话把响应撑爆。 */
+const SOURCE_PAGES_CAP = 100
 
 function msg(error: unknown): string {
   if (error instanceof Error) return error.message
@@ -153,16 +155,58 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
+function makeBoundedMap<K, V>(cap: number): Map<K, V> {
+  const map = new Map<K, V>()
+  const originalSet = map.set.bind(map)
+  map.set = (key: K, value: V) => {
+    if (map.has(key)) {
+      map.delete(key)
+    } else if (map.size >= cap) {
+      const oldestKey = map.keys().next().value
+      if (oldestKey !== undefined) {
+        map.delete(oldestKey)
+      }
+    }
+    return originalSet(key, value)
+  }
+  return map
+}
+
+function shellSafe(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 4096) return null
+  if (/[\\'"`$;|&<>^%!\u0000-\u001f]/.test(value)) return null
+  return value
+}
+
+/**
+ * 路径参数校验：与 shellSafe 同一份元字符黑名单，但分隔符按平台处理——
+ * win32 允许 `\` 与 `/`（Windows 绝对路径必含反斜杠），POSIX 拒绝 `\`。
+ * mkdir 等文件系统路径参数走这里；git 分支名等标识符仍走 shellSafe。
+ */
+export function shellSafePath(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 4096) return null
+  if (/['"`$;|&<>^%!\u0000-\u001f]/.test(value)) return null
+  if (process.platform !== 'win32' && value.includes('\\')) return null
+  return value
+}
+
+function safeGitRef(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!/^[0-9a-f]{4,64}$/i.test(trimmed)) return null
+  return trimmed
+}
+
 async function runGit(
   shell: ShellService,
   policy: unknown,
   cwd: string,
   args: string,
   timeoutMs = 20000,
-): Promise<{ ok: boolean; text: string; error?: string }> {
+): Promise<{ ok: boolean; text: string; error?: string; truncated?: boolean }> {
   try {
     const spec = shell.resolve({
-      command: `git ${args}`,
+      command: `git -c core.quotePath=false ${args}`,
       workdir: cwd,
       timeoutMs,
       stdoutMaxBytes: 4 * 1024 * 1024,
@@ -174,22 +218,62 @@ async function runGit(
     const result = await shell.run(spec)
     if (result.exitCode !== 0) {
       const detail = result.stderr?.text?.trim() || `git 命令失败 (exit ${String(result.exitCode)})`
-      return { ok: false, text: '', error: detail }
+      return { ok: false, text: '', error: detail, truncated: result.stdout?.truncated === true }
     }
-    return { ok: true, text: result.stdout?.text ?? '' }
+    return { ok: true, text: result.stdout?.text ?? '', truncated: result.stdout?.truncated === true }
   } catch (error) {
     return { ok: false, text: '', error: msg(error) }
   }
 }
 
-/** Unquote a git porcelain path (`"a\"b"` → `a"b`). */
+/** Unquote a git porcelain path (`"a\"b"` → `a"b`, octal escapes `\NNN` → UTF-8 text). */
 function unquotePath(raw: string): string {
   const trimmed = raw.trim()
-  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
-    const inner = trimmed.slice(1, -1)
-    return inner.replace(/\\([\\"nt])/g, (_m, c: string) => (c === 'n' ? '\n' : c === 't' ? '\t' : c))
+  if (!trimmed.startsWith('"') || !trimmed.endsWith('"') || trimmed.length < 2) {
+    return trimmed
   }
-  return trimmed
+  const inner = trimmed.slice(1, -1)
+  let out = ''
+  let i = 0
+  while (i < inner.length) {
+    if (inner[i] === '\\' && i + 1 < inner.length) {
+      const nextChar = inner[i + 1]
+      if (/[0-7]/.test(nextChar)) {
+        const bytes: number[] = []
+        while (i < inner.length && inner[i] === '\\') {
+          const octalMatch = inner.slice(i + 1).match(/^[0-7]{1,3}/)
+          if (!octalMatch) break
+          const octalStr = octalMatch[0]
+          bytes.push(parseInt(octalStr, 8))
+          i += 1 + octalStr.length
+        }
+        if (bytes.length > 0) {
+          out += new TextDecoder('utf8').decode(new Uint8Array(bytes))
+        }
+        continue
+      }
+      if (nextChar === 'n') {
+        out += '\n'
+        i += 2
+      } else if (nextChar === 't') {
+        out += '\t'
+        i += 2
+      } else if (nextChar === '\\') {
+        out += '\\'
+        i += 2
+      } else if (nextChar === '"') {
+        out += '"'
+        i += 2
+      } else {
+        out += nextChar
+        i += 2
+      }
+    } else {
+      out += inner[i]
+      i++
+    }
+  }
+  return out
 }
 
 interface PorcelainEntry {
@@ -204,9 +288,26 @@ function parsePorcelainLine(line: string): PorcelainEntry | null {
   const x = line[0]
   const y = line[1]
   const rest = line.slice(3)
-  const arrow = rest.indexOf(' -> ')
-  if (arrow > 0) {
-    return { x, y, path: unquotePath(rest.slice(arrow + 4)), oldPath: unquotePath(rest.slice(0, arrow)) }
+  if (rest.startsWith('"')) {
+    const arrow = rest.indexOf('" -> "')
+    if (arrow > 0) {
+      return {
+        x,
+        y,
+        oldPath: unquotePath(rest.slice(0, arrow + 1)),
+        path: unquotePath(rest.slice(arrow + 5)),
+      }
+    }
+  } else {
+    const arrow = rest.indexOf(' -> ')
+    if (arrow > 0) {
+      return {
+        x,
+        y,
+        oldPath: unquotePath(rest.slice(0, arrow)),
+        path: unquotePath(rest.slice(arrow + 4)),
+      }
+    }
   }
   return { x, y, path: unquotePath(rest) }
 }
@@ -222,11 +323,13 @@ function statusCode(x: string, y: string): string {
 
 function splitDiffChunks(diff: string): Map<string, string> {
   const chunks = new Map<string, string>()
-  const re = /^diff --git a\/(.+?) b\/(.+?)\s*$/gm
+  const re = /^diff --git ("?a\/.*?"?)\s+("?b\/.*?"?)\s*$/gm
   const starts: Array<{ index: number; path: string }> = []
   let match: RegExpExecArray | null
   while ((match = re.exec(diff)) !== null) {
-    starts.push({ index: match.index, path: unquotePath(match[2]) })
+    const _pathA = unquotePath(match[1]).replace(/^a\//, '')
+    const pathB = unquotePath(match[2]).replace(/^b\//, '')
+    starts.push({ index: match.index, path: pathB })
   }
   for (let k = 0; k < starts.length; k++) {
     const end = k + 1 < starts.length ? starts[k + 1].index : diff.length
@@ -248,6 +351,9 @@ async function captureSnapshot(fs: FsService, shell: ShellService, policy: unkno
   const snapshot: Snapshot = { at: Date.now(), tracked: {}, untracked: {} }
 
   const diff = await runGit(shell, policy, cwd, 'diff HEAD --')
+  if (diff.truncated) {
+    console.warn('[dsh-explorer] git diff 输出被截断，上一回合快照可能不完整')
+  }
   if (diff.ok) {
     for (const [path, patch] of splitDiffChunks(diff.text)) snapshot.tracked[path] = patch
   }
@@ -273,7 +379,7 @@ async function captureSnapshot(fs: FsService, shell: ShellService, policy: unkno
   return snapshot
 }
 
-async function diffSnapshots(fs: FsService, start: Snapshot, end: Snapshot): Promise<LastRoundFile[]> {
+async function diffSnapshots(sv: Services, cwd: string, start: Snapshot, end: Snapshot): Promise<LastRoundFile[]> {
   const files: LastRoundFile[] = []
 
   for (const [path, patch] of Object.entries(end.tracked)) {
@@ -286,23 +392,27 @@ async function diffSnapshots(fs: FsService, start: Snapshot, end: Snapshot): Pro
   for (const [path, meta] of Object.entries(end.untracked)) {
     const before = start.untracked[path]
     if (before === undefined) {
-      files.push({ path, status: '??', patch: await previewUntracked(fs, path, end.at), truncated: false })
+      files.push({ path, status: '??', patch: await previewUntracked(sv, cwd, path), truncated: false })
     } else if (before.size !== meta.size || before.version !== meta.version) {
-      files.push({ path, status: '??~', patch: await previewUntracked(fs, path, end.at), truncated: false })
+      files.push({ path, status: '??~', patch: await previewUntracked(sv, cwd, path), truncated: false })
     }
   }
   for (const [path] of Object.entries(start.untracked)) {
-    if (!(path in end.untracked)) files.push({ path, status: 'untracked-removed', patch: null })
+    if (!(path in end.untracked)) {
+      if (path in end.tracked) continue
+      files.push({ path, status: 'untracked-removed', patch: null })
+    }
   }
   return files
 }
 
-async function previewUntracked(fs: FsService, path: string, _at: number): Promise<string | null> {
+async function previewUntracked(sv: Services, cwd: string, path: string): Promise<string | null> {
   try {
-    const target = await fs.resolve(path)
-    const info = await fs.stat(target)
+    const fenced = await resolveInside(sv, cwd, path)
+    if ('error' in fenced) return null
+    const info = await sv.fs.stat(fenced)
     if (!info || info.type !== 'file' || (info.size ?? 0) > UNTRACKED_PREVIEW_CAP) return null
-    return await fs.readText(target)
+    return await sv.fs.readText(fenced)
   } catch {
     return null
   }
@@ -313,7 +423,8 @@ async function previewUntracked(fs: FsService, path: string, _at: number): Promi
 async function resolveInside(sv: Services, cwd: string, path: string): Promise<FsTargetLike | { error: string }> {
   if (typeof path !== 'string' || path.length === 0) return { error: '缺少路径' }
   const root = await sv.fs.resolve(cwd)
-  const target = await sv.fs.resolve(path)
+  // 相对路径必须按会话工作目录解析，否则落到宿主启动目录，围栏判定失真。
+  const target = await sv.fs.resolve(path, { cwd })
   if (!sv.fs.contains(root, target)) return { error: '路径超出会话工作目录' }
   return target
 }
@@ -351,7 +462,14 @@ async function fsRead(sv: Services, cwd: string, args: Record<string, unknown>):
   if (size > 2 * 1024 * 1024) return { error: `文件过大（${formatSize(size)}），暂不支持预览与编辑`, size }
   try {
     const content = await sv.fs.readText(target)
-    return { content, truncated: false, path: target.displayPath, size }
+    // CAS 契约：附带版本指纹，编辑器保存时作为 expected 传回，防止盲覆盖外部改动。
+    return {
+      content,
+      truncated: false,
+      path: target.displayPath,
+      size,
+      version: info.version === undefined ? null : String(info.version),
+    }
   } catch (error) {
     return { error: `读取失败（可能是二进制文件）：${msg(error)}`, size }
   }
@@ -379,12 +497,16 @@ async function fsWrite(sv: Services, cwd: string, args: Record<string, unknown>)
   // runs under the explicit full-access mode with the session boundary kept.
   const policy = sv.sandboxPolicy?.resolve({ session: args.session === undefined ? undefined : args.session, mode: 'danger-full-access' })
   try {
-    await sv.fs.writeText(target, content, undefined, undefined, policy)
+    // CAS 契约：客户端回传读取时拿到的 expected 版本（任意值原样透传），
+    // 版本不符由 writeText 拒绝，避免覆盖外部并发改动。
+    await sv.fs.writeText(target, content, args.expected, undefined, policy)
     return { ok: true }
   } catch (error) {
     return { ok: false, error: msg(error) }
   }
 }
+
+const WINDOWS_RESERVED_NAMES = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$/i
 
 /** 新建文件 / 文件夹（文件树右键）。建文件复用 writeText——底层原子写会自动补齐父目录。 */
 async function fsCreate(sv: Services, cwd: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -393,7 +515,15 @@ async function fsCreate(sv: Services, cwd: string, args: Record<string, unknown>
   if ('error' in parent) return { error: parent.error }
   const name = typeof args.name === 'string' ? args.name.trim() : ''
   if (name.length === 0) return { error: '缺少名称' }
-  if (name === '.' || name === '..' || /[\\/:*?"<>|]/.test(name) || name.length > 200) {
+  if (
+    name === '.'
+    || name === '..'
+    || /[\\/:*?"<>|&%\u0000-\u001f]/.test(name)
+    || name.length > 200
+    || name.endsWith('.')
+    || name.endsWith(' ')
+    || WINDOWS_RESERVED_NAMES.test(name)
+  ) {
     return { error: '名称含非法字符或过长' }
   }
   const kind = args.kind === 'dir' ? 'dir' : 'file'
@@ -413,9 +543,12 @@ async function fsCreate(sv: Services, cwd: string, args: Record<string, unknown>
       await sv.fs.writeText(target, '', undefined, undefined, policy)
       return { ok: true }
     }
-    // 目录：fs 服务没有 mkdir，走 shell（与 git 同一条执行链）
+    // 目录：fs 服务没有 mkdir，走 shell（与 git 同一条执行链）。
+    // Windows 绝对路径必含反斜杠，这里走按平台放行分隔符的 shellSafePath。
     const abs = nativeFsPath(target)
-    const command = process.platform === 'win32' ? `mkdir "${abs}"` : `mkdir -p "${abs}"`
+    const safeAbs = shellSafePath(abs)
+    if (safeAbs === null) return { ok: false, error: '路径含不安全字符' }
+    const command = process.platform === 'win32' ? `mkdir "${safeAbs}"` : `mkdir -p "${safeAbs}"`
     const spec = sv.shell.resolve({
       command,
       workdir: cwd,
@@ -520,8 +653,14 @@ async function findBranchBase(
   candidates.push('origin/main', 'origin/master', 'main', 'master')
   let base = ''
   for (const candidate of candidates) {
-    const check = await runGit(sv.shell, policy, cwd, `rev-parse --verify "${candidate}"`, 10000)
-    if (check.ok) { base = candidate; break }
+    // `-` 开头的候选会被 git 按选项解析，直接拒绝（refname 本身也禁止前导 -）
+    if (candidate.startsWith('-')) continue
+    const safeCandidate = shellSafe(candidate)
+    if (safeCandidate === null) continue
+    // 注意：rev-parse --verify 不接受裸 `--` 分隔符（"Needed a single revision"），
+    // 用等价的 --end-of-options 隔断后续参数的选项语义。
+    const check = await runGit(sv.shell, policy, cwd, `rev-parse --verify --end-of-options "${safeCandidate}"`, 10000)
+    if (check.ok) { base = safeCandidate; break }
   }
   if (base.length === 0) {
     return { error: '未找到基准分支（尝试过 origin/main、main 等）', branch: branchName }
@@ -555,7 +694,11 @@ async function gitBranch(sv: Services, policy: unknown, cwd: string): Promise<Re
   if ('error' in found) {
     return { notRepo: found.branch === undefined, branch: found.branch ?? '', base: '', commits: [], files: [], error: found.error }
   }
-  const nameStatus = await runGit(sv.shell, policy, cwd, `diff --name-status -M "${found.merge}"...HEAD --`)
+  const safeMerge = safeGitRef(found.merge)
+  if (safeMerge === null) {
+    return { branch: found.branch, base: found.base, commits: [], files: [], error: '基准 commit hash 非法' }
+  }
+  const nameStatus = await runGit(sv.shell, policy, cwd, `diff --name-status -M "${safeMerge}"...HEAD --`)
   const files = nameStatus.ok
     ? parseNameStatus(nameStatus.text).map(file => listFile(file, true))
     : []
@@ -618,7 +761,9 @@ async function gitFileDiff(
   if (mode === 'branch') {
     const found = await findBranchBase(sv, policy, cwd)
     if ('error' in found) return { error: found.error, patch: null }
-    const diff = await runGit(sv.shell, policy, cwd, `diff "${found.merge}"...HEAD -- ${quoted}`)
+    const safeMerge = safeGitRef(found.merge)
+    if (safeMerge === null) return { error: '基准 commit hash 非法', patch: null }
+    const diff = await runGit(sv.shell, policy, cwd, `diff "${safeMerge}"...HEAD -- ${quoted}`)
     if (!diff.ok) return { error: diff.error, patch: null }
     return { path: rel, patch: diff.text.length > 0 ? diff.text : null }
   }
@@ -644,7 +789,7 @@ function safeBranchName(raw: unknown): string | null {
 
 function safeCommitMessage(raw: unknown): string | null {
   if (typeof raw !== 'string') return null
-  const message = raw.replace(/[\r\n]+/g, ' ').trim().replace(/[$`\\"]/g, '')
+  const message = raw.replace(/[\r\n]+/g, ' ').trim().replace(/[$`\\%"]/g, '')
   if (message.length === 0 || message.length > 2000) return null
   return message
 }
@@ -679,8 +824,14 @@ async function gitSummary(sv: Services, policy: unknown, cwd: string): Promise<R
   if (remoteHead.ok && remoteHead.text.trim().length > 0) candidates.unshift(remoteHead.text.trim())
   let base = ''
   for (const candidate of candidates) {
-    const check = await runGit(sv.shell, policy, cwd, `rev-parse --verify "${candidate}"`, 10000)
-    if (check.ok) { base = candidate; break }
+    // `-` 开头的候选会被 git 按选项解析，直接拒绝（refname 本身也禁止前导 -）
+    if (candidate.startsWith('-')) continue
+    const safeCandidate = shellSafe(candidate)
+    if (safeCandidate === null) continue
+    // 注意：rev-parse --verify 不接受裸 `--` 分隔符（"Needed a single revision"），
+    // 用等价的 --end-of-options 隔断后续参数的选项语义。
+    const check = await runGit(sv.shell, policy, cwd, `rev-parse --verify --end-of-options "${safeCandidate}"`, 10000)
+    if (check.ok) { base = safeCandidate; break }
   }
   const branchName = branch.ok ? branch.text.trim() : ''
   return {
@@ -708,7 +859,7 @@ function githubCompareUrl(remoteUrl: string, branch: string, base: string): stri
 async function gitCheckout(sv: Services, policy: unknown, cwd: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
   const name = safeBranchName(args.branch)
   if (name === null) return { ok: false, error: '无效的分支名' }
-  const result = await runGit(sv.shell, policy, cwd, `checkout "${name}"`)
+  const result = await runGit(sv.shell, policy, cwd, `checkout "${name}" --`)
   if (!result.ok) return { ok: false, error: result.error }
   return { ok: true, branch: name }
 }
@@ -835,17 +986,26 @@ function sessionSources(session: SessionLike): Record<string, unknown> {
     pages: Array<{ url: string; title: string; snippet: string }>
   }>()
 
+  // 每组 URL 去重走 Set（原先 pages.some 线性扫描是 O(N²)）。
+  const groupUrls = new Map<string, Set<string>>()
+
   const ensure = (name: string, title: string) => {
     const existing = groups.get(name)
     if (existing !== undefined) return existing
     const created = { name, title, searches: 0, fetches: 0, pages: [] as Array<{ url: string; title: string; snippet: string }> }
     groups.set(name, created)
+    groupUrls.set(name, new Set<string>())
     return created
   }
 
   const addPage = (group: ReturnType<typeof ensure>, url: string, title: string, snippet: string): void => {
+    if (group.pages.length >= SOURCE_PAGES_CAP) return
     if (url.length === 0 && title.length === 0) return
-    if (url.length > 0 && group.pages.some(page => page.url === url)) return
+    if (url.length > 0) {
+      const seen = groupUrls.get(group.name)
+      if (seen !== undefined && seen.has(url)) return
+      seen?.add(url)
+    }
     group.pages.push({ url, title: title.length > 0 ? title : url, snippet })
   }
 
@@ -914,10 +1074,18 @@ function todoList(session: SessionLike): Record<string, unknown> {
   return { todos }
 }
 
-async function contextMeta(sv: Services, _sessionId: string): Promise<Record<string, unknown>> {
-  if (sv.systemPrompt === undefined) return { sections: [], contexts: [], tools: [], variables: [] }
+async function contextMeta(sv: Services, session: SessionLike): Promise<Record<string, unknown>> {
+  const prompt = sv.systemPrompt
+  if (prompt === undefined) return { sections: [], contexts: [], tools: [], variables: [] }
   try {
-    const assembly = await sv.systemPrompt.assemble({})
+    let assembly
+    try {
+      // 显式带上会话，宿主可据此给出会话相关的清单段落。
+      assembly = await prompt.assemble({ session })
+    } catch {
+      // 部分宿主不接受非空上下文参数，回退空上下文再试一次。
+      assembly = await prompt.assemble({})
+    }
     const sections = (assembly.sections ?? []).map(section => ({
       name: section.name ?? '',
       chars: typeof section.text === 'string' ? section.text.length : 0,
@@ -944,11 +1112,12 @@ function readJsonBody(req: IncomingMessage, cap: number): Promise<unknown> {
     let size = 0
     let overflow = false
     req.on('data', (chunk: Buffer) => {
-      if (overflow) return // drain the rest without buffering
+      if (overflow) return
       size += chunk.length
       if (size > cap) {
         overflow = true
         chunks.length = 0
+        req.destroy()
         reject(new Error('请求体过大'))
         return
       }
@@ -1055,7 +1224,7 @@ async function handleRpc(req: IncomingMessage, res: ServerResponse, sv: Services
       case 'todo.list':
         return sendJson(res, todoList(session))
       case 'context.meta':
-        return sendJson(res, await contextMeta(sv, sessionId))
+        return sendJson(res, await contextMeta(sv, session))
       case 'session.sources':
         return sendJson(res, sessionSources(session))
       case 'session.subagents':
@@ -1071,8 +1240,8 @@ async function handleRpc(req: IncomingMessage, res: ServerResponse, sv: Services
       }
       case 'pty.open': {
         if (sv.pty === undefined) return sendJson(res, { error: '终端服务未就绪' })
-        const cols = typeof args.cols === 'number' ? args.cols : 120
-        const rows = typeof args.rows === 'number' ? args.rows : 32
+        const cols = typeof args.cols === 'number' && Number.isFinite(args.cols) ? args.cols : 120
+        const rows = typeof args.rows === 'number' && Number.isFinite(args.rows) ? args.rows : 32
         return sendJson(res, await sv.pty.open({ sessionId, cwd, cols, rows }))
       }
       case 'pty.write': {
@@ -1118,7 +1287,10 @@ export function apply(ctx: ExplorerContext): void {
   const sessions = ctx.get('sessions') as SessionsService | undefined
   // 这些服务已通过插件对象上的 inject 声明为硬依赖（冷启动时行会等到
   // webserver 等就绪后才 apply）；此处检查仅为类型收窄。
-  if (webServer === undefined || fs === undefined || shell === undefined || sessions === undefined) return
+  if (webServer === undefined || fs === undefined || shell === undefined || sessions === undefined) {
+    console.warn('dsh-explorer: required host service missing at apply, plugin inactive')
+    return
+  }
 
   // 载荷自愈钩子（见 src/payloadFork.ts）：趁页面还没拉客户端 bundle，
   // 先把桌面载荷里被更新覆盖掉的右侧栏宽度钳制补回来。失败只记日志。
@@ -1126,21 +1298,20 @@ export function apply(ctx: ExplorerContext): void {
 
   registerExplorerSettings(ctx)
 
-  const sandboxPolicy = ctx.get('sandboxPolicy') as SandboxPolicyService | undefined
   const pty = createPtyHub(() => ctx.get('subprocess') as SubprocessLike | undefined)
   const services: Services = {
     fs,
     shell,
     sessions,
-    systemPrompt: ctx.get('systemPrompt') as SystemPromptService | undefined,
-    sandboxPolicy,
-    persistence: ctx.get('sessionPersistence') as PersistenceLike | undefined,
-    policyFor: (session: SessionLike) => sandboxPolicy?.resolve({ session, mode: 'danger-full-access' }),
+    get systemPrompt() { return ctx.get('systemPrompt') as SystemPromptService | undefined },
+    get sandboxPolicy() { return ctx.get('sandboxPolicy') as SandboxPolicyService | undefined },
+    get persistence() { return ctx.get('sessionPersistence') as PersistenceLike | undefined },
+    policyFor: (session: SessionLike) => services.sandboxPolicy?.resolve({ session, mode: 'danger-full-access' }),
     pty,
   }
 
-  const pendingStarts = new Map<string, Snapshot>()
-  const lastRounds = new Map<string, LastRound>()
+  const pendingStarts = makeBoundedMap<string, Promise<Snapshot | null>>(8)
+  const lastRounds = makeBoundedMap<string, LastRound>(32)
 
   // 上一回合变更：turn/start 记起点快照，turn/end 记终点并冻结差异。
   ctx.effect(() => ctx.on('session/event', (session: SessionLike, event: { type?: string }) => {
@@ -1150,36 +1321,42 @@ export function apply(ctx: ExplorerContext): void {
     const cwd = session.header?.cwd
     if (typeof sessionId !== 'string' || typeof cwd !== 'string' || cwd.length === 0) return
     if (type === 'turn/start') {
-      void captureSnapshot(fs, shell, services.policyFor(session), cwd).then(snapshot => {
-        if (snapshot !== null) pendingStarts.set(sessionId, snapshot)
-      })
+      pendingStarts.set(sessionId, captureSnapshot(fs, shell, services.policyFor(session), cwd))
     } else {
-      const start = pendingStarts.get(sessionId)
-      if (start === undefined) return
-      pendingStarts.delete(sessionId)
-      void captureSnapshot(fs, shell, services.policyFor(session), cwd).then(end => {
+      void (async () => {
+        const startPromise = pendingStarts.get(sessionId)
+        if (startPromise === undefined) return
+        pendingStarts.delete(sessionId)
+        const start = await startPromise
+        if (start === null) return
+        const end = await captureSnapshot(fs, shell, services.policyFor(session), cwd)
         if (end === null) return
-        void diffSnapshots(fs, start, end).then(files => {
-          lastRounds.set(sessionId, { at: end.at, files })
-        })
-      })
+        const files = await diffSnapshots(services, cwd, start, end)
+        lastRounds.set(sessionId, { at: end.at, files })
+      })()
     }
   }), 'dsh-explorer: turn snapshots')
 
   ctx.effect(() => webServer.register({
     kind: 'exact',
     path: '/dsh-explorer/rpc',
-    handler: (req, res) => void handleRpc(req, res, services, lastRounds).catch(error => {
-      if (!res.headersSent) sendJson(res, { error: msg(error) })
-    }),
+    handler: (req, res) => {
+      res.on('error', () => {})
+      return void handleRpc(req, res, services, lastRounds).catch(error => {
+        if (!res.headersSent) sendJson(res, { error: msg(error) })
+      })
+    },
   }), 'dsh-explorer: rpc route')
 
   ctx.effect(() => webServer.register({
     kind: 'exact',
     path: '/dsh-explorer/pty',
-    handler: (req, res) => void handlePtyStream(req, res, services).catch(error => {
-      if (!res.headersSent) sendJson(res, { error: msg(error) })
-    }),
+    handler: (req, res) => {
+      res.on('error', () => {})
+      return void handlePtyStream(req, res, services).catch(error => {
+        if (!res.headersSent) sendJson(res, { error: msg(error) })
+      })
+    },
   }), 'dsh-explorer: pty stream')
 
   ctx.effect(() => () => { void pty.disposeAll() }, 'dsh-explorer: pty teardown')
@@ -1212,7 +1389,7 @@ async function handlePtyStream(req: IncomingMessage, res: ServerResponse, sv: Se
   await sv.pty.attach(sessionId, id, res)
 }
 
-export { handleRpc }
+export { handlePtyStream, handleRpc, unquotePath }
 
 // 载荷自愈钩子的公开面：smoke / 排查脚本直接从包根取用。
 export { applyPayloadFork, FORK_MARKER, locateLayoutBundle, rewriteClampSites } from './payloadFork'

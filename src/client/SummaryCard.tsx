@@ -4,9 +4,9 @@
  * and sources open the matching details page.
  */
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { agentHue } from './conversationHost'
-import { rpc, rpcWithSessionRetry } from './rpc'
+import { rpc, rpcWithSessionRetry, safeExternalUrl } from './rpc'
 import type { ExplorerStore, ReviewMode } from './store'
 
 export interface GitSummary {
@@ -82,18 +82,26 @@ export function SummaryCard({
   const [commitMsg, setCommitMsg] = useState('')
   const [busy, setBusy] = useState<string | null>(null)
   const [note, setNote] = useState<string | null>(null)
+  const reqSeq = useRef(0)
+  // 最新 sessionId 的镜像：异步动作 resolve 后用它判断会话是否已切走
+  const sessionIdRef = useRef(sessionId)
+  sessionIdRef.current = sessionId
 
-  const catalog = useSessions !== undefined
-    ? useSessions((state: { subagentsByParent?: Record<string, { entries?: CatalogEntry[] }> }) => state.subagentsByParent?.[sessionId]) as { entries?: CatalogEntry[] } | undefined
-    : undefined
+  const useSessionsSafe = useSessions ?? (() => undefined)
+  const catalog = useSessionsSafe((state: { subagentsByParent?: Record<string, { entries?: CatalogEntry[] }> }) => state?.subagentsByParent?.[sessionId]) as { entries?: CatalogEntry[] } | undefined
 
   const load = useCallback(() => {
-    void rpcWithSessionRetry<GitSummary>(sessionId, 'git.summary').then(setGit)
+    if (typeof document !== 'undefined' && document.hidden) return
+    const my = ++reqSeq.current
+    // 大仓库 git.summary 可能超过默认 15s，显式放宽
+    void rpcWithSessionRetry<GitSummary>(sessionId, 'git.summary', {}, undefined, { timeoutMs: 60_000 }).then(res => {
+      if (my === reqSeq.current) setGit(res)
+    })
     void rpcWithSessionRetry<{ groups?: SourceGroup[] }>(sessionId, 'session.sources').then(res => {
-      setSources(res.groups ?? [])
+      if (my === reqSeq.current) setSources(res.groups ?? [])
     })
     void rpcWithSessionRetry<{ agents?: SubagentRow[] }>(sessionId, 'session.subagents').then(res => {
-      setHostAgents(res.agents ?? [])
+      if (my === reqSeq.current) setHostAgents(res.agents ?? [])
     })
     void refreshSubagents(sessionId)
     setSubagentCatalogOpen(sessionId, true)
@@ -102,8 +110,18 @@ export function SummaryCard({
   useEffect(() => {
     load()
     const timer = setInterval(load, 8000)
+    // 回前台刷新加 0-300ms 随机 jitter，避免多个组件同刻齐射 RPC
+    let visTimer = 0
+    const onVis = (): void => {
+      if (document.hidden) return
+      if (visTimer !== 0) window.clearTimeout(visTimer)
+      visTimer = window.setTimeout(() => { visTimer = 0; load() }, Math.round(Math.random() * 300))
+    }
+    document.addEventListener('visibilitychange', onVis)
     return () => {
       clearInterval(timer)
+      if (visTimer !== 0) window.clearTimeout(visTimer)
+      document.removeEventListener('visibilitychange', onVis)
       setSubagentCatalogOpen(sessionId, false)
     }
   }, [load, sessionId, setSubagentCatalogOpen])
@@ -116,7 +134,32 @@ export function SummaryCard({
       activity: entry.activity ?? 'inactive',
       mode: entry.mode,
     }))
-  const agents = catalogAgents.length > 0 ? catalogAgents : hostAgents
+  // ── 子智能体主备数据源与迟滞 ─────────────────────────────────────────────
+  // 主源：catalog（宿主 live 投影）；备源：hostAgents（session.subagents 快照）。
+  // catalog 从有到无常是投影异步清空的一瞬：延迟一拍再回落备源，并用最近一次
+  // 非空快照填补空窗，避免两源交替生效造成列表闪烁。
+  const hasCatalog = catalogAgents.length > 0
+  const lastCatalogRef = useRef<SubagentRow[]>([])
+  if (hasCatalog) lastCatalogRef.current = catalogAgents
+  const [useCatalog, setUseCatalog] = useState(hasCatalog)
+  useEffect(() => {
+    // 会话切换：为新会话重启主备判定，旧会话快照立即作废
+    lastCatalogRef.current = []
+    setUseCatalog(false)
+  }, [sessionId])
+  useEffect(() => {
+    if (hasCatalog) {
+      setUseCatalog(true)
+      return
+    }
+    const timer = window.setTimeout(() => setUseCatalog(false), 1200)
+    return () => window.clearTimeout(timer)
+    // sessionId 也在依赖里：切会话后即使两侧都有 catalog（hasCatalog 不变），
+    // 也要跟随上面的复位重新判定
+  }, [hasCatalog, sessionId])
+  const agents = useCatalog && lastCatalogRef.current.length > 0
+    ? lastCatalogRef.current
+    : hostAgents
   const running = agents.filter(agent => agent.activity === 'running')
   const done = agents.filter(agent => agent.activity !== 'running')
   const previewSources = sources.slice(0, 3)
@@ -128,11 +171,15 @@ export function SummaryCard({
     onNavigate?.()
   }
 
+  // 异步动作发起时捕获 sessionId；resolve 后与最新会话比对，切走了就丢弃
+  // 对旧会话卡片的 UI 写入（busy 复位除外，否则新会话卡片卡在忙碌态）。
   const checkout = async (branch: string): Promise<void> => {
+    const actSession = sessionId
     setBusy('checkout')
     setNote(null)
     const res = await rpc<{ ok?: boolean; error?: string }>(sessionId, 'git.checkout', { branch })
     setBusy(null)
+    if (sessionIdRef.current !== actSession) return
     setBranchOpen(false)
     if (res.ok === true) {
       setNote(`已切换到 ${branch}`)
@@ -143,10 +190,12 @@ export function SummaryCard({
   }
 
   const commit = async (): Promise<void> => {
+    const actSession = sessionId
     setBusy('commit')
     setNote(null)
     const res = await rpc<{ ok?: boolean; error?: string; text?: string }>(sessionId, 'git.commit', { message: commitMsg })
     setBusy(null)
+    if (sessionIdRef.current !== actSession) return
     if (res.ok === true) {
       setCommitOpen(false)
       setCommitMsg('')
@@ -158,10 +207,12 @@ export function SummaryCard({
   }
 
   const push = async (): Promise<void> => {
+    const actSession = sessionId
     setBusy('push')
     setNote(null)
     const res = await rpc<{ ok?: boolean; error?: string; text?: string }>(sessionId, 'git.push')
     setBusy(null)
+    if (sessionIdRef.current !== actSession) return
     if (res.ok === true) {
       setNote(res.text && res.text.length > 0 ? res.text : '已推送')
       load()
@@ -267,7 +318,10 @@ export function SummaryCard({
             onClick={() => {
               go('review', { reviewMode: 'branch' })
               const url = git.compareUrl
-              if (typeof url === 'string' && url.length > 0) window.open(url, '_blank', 'noopener')
+              if (typeof url === 'string' && url.length > 0) {
+                const safe = safeExternalUrl(url)
+                if (safe !== '#') window.open(safe, '_blank', 'noopener')
+              }
             }}
           >
             <span className="dshx-summary-ico" aria-hidden>⇄</span>

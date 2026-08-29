@@ -108,8 +108,9 @@ export function installWorkspacePinOverlay(faces: WorkspacePinOverlayFaces): () 
   // 嵌套函数声明里的类型收窄不可靠，用确定类型的别名消掉可选性。
   const wsList: SnapshotStoreLike<WorkspacesSnapshotLike> = store
 
-  const dragBound = new WeakSet<Element>()
+  const boundRows = new Set<HTMLElement>()
   let observer: MutationObserver | null = null
+  let observedRoot: Element | null = null
   let styleEl: HTMLStyleElement | null = null
   let syncTimer: ReturnType<typeof setTimeout> | null = null
   let session: DragSession | null = null
@@ -300,6 +301,10 @@ export function installWorkspacePinOverlay(faces: WorkspacePinOverlayFaces): () 
 
   function sync(): void {
     if (disposed) return
+    // 观察目标可能失效（侧栏整块重挂载/容器被替换）：每个 sync 周期校验；
+    // 失效即回落重选，body 顶层监听期间发现容器出现则切换进容器。
+    if (observedRoot !== null && !document.contains(observedRoot)) attachObserver()
+    else if (observedRoot === document.body && container() !== null) attachObserver()
     const root = container()
     if (root === null) return
     if (getPrefs().sortWorkspacesByRecency !== true) {
@@ -307,6 +312,13 @@ export function installWorkspacePinOverlay(faces: WorkspacePinOverlayFaces): () 
       return
     }
     ensureStyle()
+    // 已离开文档的行：立即解绑并移出集合，避免强引用滞留孤儿节点
+    for (const row of boundRows) {
+      if (!document.contains(row)) {
+        row.removeEventListener('mousedown', onRowMouseDown)
+        boundRows.delete(row)
+      }
+    }
     // 旧版本注入的 📌 按钮已废弃，见到就拆（防热更新残留实例反复注入）。
     for (const node of root.querySelectorAll('.dshx-ws-pin-btn')) node.remove()
     // 标题 → 工作区 id 对照表（快照为准）。
@@ -322,9 +334,9 @@ export function installWorkspacePinOverlay(faces: WorkspacePinOverlayFaces): () 
       const id = title === undefined ? undefined : idByTitle.get(title)
       if (id === undefined) continue // 未分组等伪分组行：跳过
       row.setAttribute(ROW_ID_ATTR, id)
-      if (!dragBound.has(row)) {
+      if (!boundRows.has(row)) {
         row.addEventListener('mousedown', onRowMouseDown)
-        dragBound.add(row)
+        boundRows.add(row)
       }
       row.classList.toggle(PINNED_ROW_CLASS, isWorkspacePinned(id))
     }
@@ -338,9 +350,23 @@ export function installWorkspacePinOverlay(faces: WorkspacePinOverlayFaces): () 
     }, 80)
   }
 
-  try {
+  /**
+   * 选择观察目标（观察器风暴修复）：优先侧栏容器本身——工作区行的增删都发生
+   * 在它的子树里，监听范围小；容器尚未挂载时退而只盯 body 的顶层
+   * childList（subtree:false），等 sync 发现容器出现后再切进去。
+   * 绝不对 document.body 开 subtree 监听：流式输出期间每个 token 都会触发回调。
+   */
+  function attachObserver(): void {
+    const target = container() ?? document.body
+    if (observer !== null && observedRoot === target) return
+    observer?.disconnect()
     observer = new MutationObserver(scheduleSync)
-    observer.observe(document.body, { childList: true, subtree: true })
+    observer.observe(target, { childList: true, subtree: target !== document.body })
+    observedRoot = target
+  }
+
+  try {
+    attachObserver()
   } catch { /* 没有 MutationObserver 就只在事件点同步 */ }
 
   const unsubWorkspaces = wsList.subscribe(scheduleSync)
@@ -353,7 +379,12 @@ export function installWorkspacePinOverlay(faces: WorkspacePinOverlayFaces): () 
     if (syncTimer !== null) clearTimeout(syncTimer)
     observer?.disconnect()
     observer = null
+    observedRoot = null
     if (session !== null) endSession(false)
+    for (const row of boundRows) {
+      try { row.removeEventListener('mousedown', onRowMouseDown) } catch { /* ignore */ }
+    }
+    boundRows.clear()
     unsubWorkspaces()
     unsubPins()
     unsubPrefs()

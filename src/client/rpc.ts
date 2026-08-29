@@ -10,24 +10,56 @@ export interface RpcEnvelope<T = unknown> {
   [key: string]: any
 }
 
+export interface RpcOptions {
+  timeoutMs?: number
+}
+
+/** 仅允许 http: 与 https: 协议的外链，其它一律降级为 '#'。 */
+export function safeExternalUrl(url: string | undefined | null): string {
+  if (url === undefined || url === null || typeof url !== 'string') return '#'
+  const stripped = url.replace(/^[\u0000-\u0020]+/, '').trim()
+  if (stripped.length === 0) return '#'
+  try {
+    const parsed = new URL(stripped, 'http://localhost')
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      // 若原字符串不带协议（相对路径），new URL 会填上 http://localhost，需防御只有原始带 http:/https: 开头
+      if (/^https?:\/\//i.test(stripped)) {
+        return stripped
+      }
+    }
+  } catch {
+    /* 格式异常 */
+  }
+  return '#'
+}
+
 export async function rpc<T = unknown>(
   sessionId: string | undefined | null,
   method: string,
   args: Record<string, unknown> = {},
+  opts: RpcOptions = {},
 ): Promise<RpcEnvelope<T>> {
   if (sessionId === undefined || sessionId === null || sessionId.length === 0) {
     return { error: '当前没有打开的会话' }
   }
   try {
+    const signal = AbortSignal.timeout(opts.timeoutMs ?? 15000)
     const res = await fetch('/dsh-explorer/rpc', {
       method: 'POST',
       // 自定义头是 Host 侧的跨站校验闸：没有它路由直接 403。
       headers: { 'content-type': 'application/json', 'x-dsh-explorer': '1' },
       body: JSON.stringify({ sessionId, method, args }),
+      signal,
     })
     if (!res.ok) return { error: `RPC 请求失败 (HTTP ${res.status})` }
     return (await res.json()) as RpcEnvelope<T>
   } catch (error) {
+    if (error instanceof DOMException && error.name === 'TimeoutError') {
+      return { error: 'RPC 请求超时' }
+    }
+    if (error instanceof Error && error.name === 'TimeoutError') {
+      return { error: 'RPC 请求超时' }
+    }
     return { error: error instanceof Error ? error.message : String(error) }
   }
 }
@@ -59,12 +91,13 @@ export async function rpcWithSessionRetry<T = unknown>(
   method: string,
   args: Record<string, unknown> = {},
   signal?: AbortSignal,
+  opts: RpcOptions = {},
 ): Promise<RpcEnvelope<T>> {
   const deadline = Date.now() + 12000
   let last: RpcEnvelope<T> = { error: '当前没有打开的会话' }
   let wait = 200
   while (signal?.aborted !== true) {
-    last = await rpc<T>(sessionId, method, args)
+    last = await rpc<T>(sessionId, method, args, opts)
     if (last.error === undefined || !isTransientSessionError(last.error)) return last
     if (Date.now() >= deadline) return last
     await sleep(wait, signal)
@@ -77,6 +110,8 @@ export interface FsReadResult {
   content?: string
   truncated?: boolean
   size?: number
+  /** Host fsStatLite 提供的磁盘版本号（可能缺失：旧宿主 / 不支持的文件）。 */
+  version?: string
   error?: string
 }
 
@@ -90,7 +125,8 @@ export async function openFileTab(
 ): Promise<void> {
   const tab = store.openTab({ sessionId: sessionId ?? '', path, name, kind })
   if (!tab.loading) return // Already open with content.
-  const res = await rpc<FsReadResult>(sessionId, 'fs.read', { path })
+  // 大文件读取显式放宽超时（默认 15s 会误杀）
+  const res = await rpc<FsReadResult>(sessionId, 'fs.read', { path }, { timeoutMs: 30_000 })
   if (res.error !== undefined) {
     store.patchTab(tab.id, { loading: false, error: res.error, content: '' })
     return
@@ -100,6 +136,8 @@ export async function openFileTab(
     error: null,
     content: res.content ?? '',
     truncated: res.truncated === true,
+    // 记录磁盘基准版本，供编辑器保存时做 CAS（旧宿主缺失时为 null → 不做 CAS）
+    baseVersion: res.version ?? null,
   })
 }
 

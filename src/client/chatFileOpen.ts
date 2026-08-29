@@ -23,7 +23,9 @@ interface WorkspacesFace {
   openPath(path: string): Promise<void>
 }
 
-const SKIP_EXT = /\.(png|jpe?g|gif|webp|ico|bmp|pdf|zip|gz|tgz|7z|rar|woff2?|ttf|eot|mp[34]|wav|mov|avi|mkv|exe|dll|so|dylib|wasm|bin)$/i
+// 二进制/办公/存档类扩展名：不进面板编辑，直接交还系统默认应用。
+// （docx?/xlsx?/pptx?/sqlite3? 的问号同时覆盖无 x 老格式：doc、xls、ppt、sqlite）
+const SKIP_EXT = /\.(png|jpe?g|gif|webp|ico|bmp|pdf|zip|gz|tgz|7z|rar|woff2?|ttf|eot|mp[34]|wav|mov|avi|mkv|exe|dll|so|dylib|wasm|bin|docx?|xlsx?|pptx?|odt|ods|odp|db|sqlite3?|parquet|iso|dmg|lnk|class|jar|pyc)$/i
 
 function isAbsolute(path: string): boolean {
   return path.startsWith('/') || /^[A-Za-z]:[/\\]/.test(path) || path.startsWith('\\\\')
@@ -56,6 +58,11 @@ let hostOpenPath: ((path: string) => Promise<void>) | null = null
 /** Capture the platform opener before we wrap `workspaces.openPath`. */
 export function rememberHostOpenPath(workspaces: WorkspacesFace): void {
   if (hostOpenPath === null) hostOpenPath = workspaces.openPath.bind(workspaces)
+}
+
+/** 插件重载复位：清掉模块单例缓存的宿主打开器，由新实例重新捕获。 */
+export function resetHostOpenPath(): void {
+  hostOpenPath = null
 }
 
 /** Open a path with the OS default handler (Explorer for a folder). */

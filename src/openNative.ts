@@ -95,10 +95,6 @@ function explorerExe(): string {
   return join(process.env.SystemRoot || 'C:\\Windows', 'explorer.exe')
 }
 
-function comspec(): string {
-  return process.env.ComSpec || 'cmd.exe'
-}
-
 /**
  * Open a folder in Explorer and raise that window above the DSH UI.
  * A background Host is not allowed to steal focus with a bare explorer.exe
@@ -188,18 +184,23 @@ async function revealWindowsFolder(folder: string): Promise<void> {
     ], 30000)
   } catch {
     await spawnDetached(
-      comspec(),
-      ['/c', 'start', '', explorerExe(), winPath(folder)],
+      explorerExe(),
+      [winPath(folder)],
       true,
     )
   }
 }
 
 async function openWindowsFile(path: string): Promise<void> {
+  // 与 revealWindowsFolder 同走 -EncodedCommand（UTF-16LE base64），
+  // 消除 -Command 文本被 PowerShell 二次解析的注入面。
+  const script = `Invoke-Item -LiteralPath ${powershellLiteral(winPath(path))}`
   await runExec('powershell.exe', [
     '-NoProfile',
-    '-Command',
-    `Invoke-Item -LiteralPath ${powershellLiteral(winPath(path))}`,
+    '-WindowStyle',
+    'Hidden',
+    '-EncodedCommand',
+    encodedCommand(script),
   ])
 }
 

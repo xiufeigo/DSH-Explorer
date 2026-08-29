@@ -13,7 +13,7 @@ import { randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import Module, { createRequire } from 'node:module'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { PassThrough, type Readable } from 'node:stream'
 import { StringDecoder } from 'node:string_decoder'
 import { fileURLToPath } from 'node:url'
@@ -84,20 +84,24 @@ function collectSearchFiles(): string[] {
   return files
 }
 
-function walkForNodePty(startFile: string): NodePtyAddon | undefined {
+function walkForNodePty(startFile: string, recordFailure?: (msg: string) => void): NodePtyAddon | undefined {
   let dir = dirname(startFile)
   for (let i = 0; i < 14; i++) {
-    const fromHere = tryRequirePty(join(dir, 'package.json'))
+    const pkgPath = join(dir, 'package.json')
+    const fromHere = tryRequirePty(pkgPath)
     if (fromHere !== undefined) return fromHere
+    if (recordFailure && existsSync(pkgPath)) recordFailure(pkgPath)
     const localPkg = join(dir, 'packages', 'subprocess', 'subprocess-local', 'package.json')
     if (existsSync(localPkg)) {
       const fromLocal = tryRequirePty(localPkg)
       if (fromLocal !== undefined) return fromLocal
+      if (recordFailure) recordFailure(localPkg)
     }
     const nested = join(dir, 'node_modules', '@deepseek-ai', 'dsh-subprocess-local', 'package.json')
     if (existsSync(nested)) {
       const fromNested = tryRequirePty(nested)
       if (fromNested !== undefined) return fromNested
+      if (recordFailure) recordFailure(nested)
     }
     const parent = dirname(dir)
     if (parent === dir) break
@@ -117,14 +121,25 @@ function loadNodePtyFromCache(): NodePtyAddon | undefined {
   return undefined
 }
 
+let loggedDebugProbe = false
+
 function loadNodePty(): NodePtyAddon | undefined {
   const cached = loadNodePtyFromCache()
   if (cached !== undefined) return cached
+  const probeFailures: string[] = []
+  const recordFailure = process.env.DSH_EXPLORER_DEBUG ? (msg: string) => probeFailures.push(msg) : undefined
+
   for (const file of collectSearchFiles()) {
     const direct = tryRequirePty(file)
     if (direct !== undefined) return direct
-    const found = walkForNodePty(file)
+    if (recordFailure) recordFailure(`direct ${file}`)
+    const found = walkForNodePty(file, recordFailure)
     if (found !== undefined) return found
+  }
+
+  if (process.env.DSH_EXPLORER_DEBUG && !loggedDebugProbe && probeFailures.length > 0) {
+    loggedDebugProbe = true
+    console.warn(`[dsh-explorer] 未找到可用 node-pty，候选路径探测失败汇总:\n  ${probeFailures.join('\n  ')}`)
   }
   return undefined
 }
@@ -166,8 +181,23 @@ function spawnPiped(file: string, args: string[], cwd: string, env: Record<strin
     cwd,
     env,
     windowsHide: true,
+    detached: process.platform !== 'win32',
     stdio: ['pipe', 'pipe', 'pipe'],
   })
+  if (process.platform === 'win32') {
+    child.once('spawn', () => {
+      try {
+        const base = basename(file).toLowerCase()
+        if (base.includes('pwsh') || base.includes('powershell')) {
+          child.stdin?.write('[Console]::InputEncoding=[Text.Encoding]::UTF8;[Console]::OutputEncoding=[Text.Encoding]::UTF8\r')
+        } else if (base === 'cmd' || base === 'cmd.exe') {
+          child.stdin?.write('chcp 65001 >nul\r')
+        }
+      } catch {
+        /* ignore */
+      }
+    })
+  }
   const output = new PassThrough()
   child.stdout?.on('data', chunk => { output.write(chunk) })
   child.stderr?.on('data', chunk => { output.write(chunk) })
@@ -193,6 +223,14 @@ function spawnPiped(file: string, args: string[], cwd: string, env: Record<strin
           stdio: 'ignore',
         })
         return
+      }
+      if (pid > 0) {
+        try {
+          process.kill(-pid, 'SIGTERM')
+          return
+        } catch {
+          /* fallback to child.kill */
+        }
       }
       try { child.kill() } catch { /* already gone */ }
     },
@@ -289,50 +327,107 @@ async function shellArgv(subprocess: SubprocessLike): Promise<string[]> {
 }
 
 function emit(pty: LivePty, line: Record<string, unknown>): void {
-  for (const listener of pty.listeners) listener(line)
+  // 单个监听器抛错不得中断其它监听器（如某个 attach 的 res 已坏）。
+  for (const listener of pty.listeners) {
+    try {
+      listener(line)
+    } catch { /* 隔离单个监听器异常 */ }
+  }
 }
 
 export function createPtyHub(getSubprocess: () => SubprocessLike | undefined): PtyHub {
   const live = new Map<string, LivePty>()
+  const idleTimers = new Map<string, NodeJS.Timeout>()
+  /** 在飞 open 的同步预占位（sessionId → 个数）：>= 8 判定时一并计入，防并发突破上限。 */
+  const pendingOpens = new Map<string, number>()
+
+  function releasePending(sessionId: string): void {
+    const left = (pendingOpens.get(sessionId) ?? 1) - 1
+    if (left <= 0) pendingOpens.delete(sessionId)
+    else pendingOpens.set(sessionId, left)
+  }
+
+  function clearIdleTimer(id: string): void {
+    const timer = idleTimers.get(id)
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      idleTimers.delete(id)
+    }
+  }
+
+  function scheduleIdleTimer(id: string): void {
+    clearIdleTimer(id)
+    const timer = setTimeout(() => {
+      idleTimers.delete(id)
+      const record = live.get(id)
+      if (record === undefined || record.closed) return
+      live.delete(id)
+      record.closed = true
+      void record.handle.terminate().catch(() => {})
+      emit(record, { t: 'exit', code: null })
+      record.listeners.clear()
+    }, 10 * 60 * 1000)
+    idleTimers.set(id, timer)
+  }
 
   const hub: PtyHub = {
     async open({ sessionId, cwd, cols, rows }) {
       const subprocess = getSubprocess()
       if (subprocess === undefined) return { error: '当前 Host 没有终端后端' }
-      const argv = await shellArgv(subprocess)
-      const id = `pty-${randomBytes(8).toString('hex')}`
-      try {
-        const handle = await spawnUserTerminal(subprocess, argv, cwd, clip(cols, 20, 300), clip(rows, 8, 120))
-        const record: LivePty = {
-          id,
-          sessionId,
-          cwd,
-          handle,
-          listeners: new Set(),
-          closed: false,
+      let sessionCount = 0
+      for (const item of live.values()) {
+        if (item.sessionId === sessionId && !item.closed) {
+          sessionCount++
         }
-        const decoder = new StringDecoder('utf8')
-        handle.output.on('data', (chunk: Buffer | string) => {
-          const text = typeof chunk === 'string' ? chunk : decoder.write(chunk)
-          if (text.length > 0) emit(record, { t: 'out', d: text })
-        })
-        handle.output.on('end', () => {
-          const tail = decoder.end()
-          if (tail.length > 0) emit(record, { t: 'out', d: tail })
-        })
-        void handle.done.then(outcome => {
-          record.closed = true
-          emit(record, { t: 'exit', code: outcome.exitCode })
-          live.delete(id)
-        }).catch((error: unknown) => {
-          record.closed = true
-          emit(record, { t: 'err', m: error instanceof Error ? error.message : String(error) })
-          live.delete(id)
-        })
-        live.set(id, record)
-        return { id, pid: handle.pid, cwd, title: tabTitle(cwd) }
-      } catch (error) {
-        return { error: error instanceof Error ? error.message : String(error) }
+      }
+      // 计数与占位必须同步完成：原实现先查数再两次 await，并发 open 会突破 8 上限。
+      const pending = pendingOpens.get(sessionId) ?? 0
+      if (sessionCount + pending >= 8) {
+        return { error: '该会话终端数已达上限（8）' }
+      }
+      pendingOpens.set(sessionId, pending + 1)
+      try {
+        const argv = await shellArgv(subprocess)
+        const id = `pty-${randomBytes(8).toString('hex')}`
+        try {
+          const handle = await spawnUserTerminal(subprocess, argv, cwd, clip(cols, 20, 300), clip(rows, 8, 120))
+          const record: LivePty = {
+            id,
+            sessionId,
+            cwd,
+            handle,
+            listeners: new Set(),
+            closed: false,
+          }
+          const decoder = new StringDecoder('utf8')
+          handle.output.on('data', (chunk: Buffer | string) => {
+            const text = typeof chunk === 'string' ? chunk : decoder.write(chunk)
+            if (text.length > 0) emit(record, { t: 'out', d: text })
+          })
+          handle.output.on('end', () => {
+            const tail = decoder.end()
+            if (tail.length > 0) emit(record, { t: 'out', d: tail })
+          })
+          void handle.done.then(outcome => {
+            clearIdleTimer(id)
+            record.closed = true
+            emit(record, { t: 'exit', code: outcome.exitCode })
+            live.delete(id)
+          }).catch((error: unknown) => {
+            clearIdleTimer(id)
+            record.closed = true
+            emit(record, { t: 'err', m: error instanceof Error ? error.message : String(error) })
+            live.delete(id)
+          })
+          live.set(id, record)
+          // open 成功即挂闲置回收：客户端从不 attach 也会 10 分钟后回收进程。
+          scheduleIdleTimer(id)
+          return { id, pid: handle.pid, cwd, title: tabTitle(cwd) }
+        } catch (error) {
+          return { error: error instanceof Error ? error.message : String(error) }
+        }
+      } finally {
+        releasePending(sessionId)
       }
     },
 
@@ -340,17 +435,31 @@ export function createPtyHub(getSubprocess: () => SubprocessLike | undefined): P
       const record = live.get(id)
       if (record === undefined || record.sessionId !== sessionId) return { error: '终端不存在' }
       if (record.closed) return { error: '终端已退出' }
-      if (data.length === 0) return { ok: true }
-      if (data.length > 32 * 1024) return { error: '写入过长' }
+      clearIdleTimer(id)
+      // 清掉闲置定时器后，如果当前没有任何 attach 监听，必须重排，否则进程永不回收。
+      const rearm = (): void => {
+        if (!record.closed && record.listeners.size === 0) scheduleIdleTimer(id)
+      }
+      if (data.length === 0) {
+        rearm()
+        return { ok: true }
+      }
+      if (data.length > 32 * 1024) {
+        rearm()
+        return { error: '写入过长' }
+      }
       try {
         await record.handle.write(data)
+        rearm()
         return { ok: true }
       } catch (error) {
+        rearm()
         return { error: error instanceof Error ? error.message : String(error) }
       }
     },
 
     async close(sessionId, id) {
+      clearIdleTimer(id)
       const record = live.get(id)
       if (record === undefined) return { ok: true }
       if (record.sessionId !== sessionId) return { error: '终端不存在' }
@@ -367,6 +476,7 @@ export function createPtyHub(getSubprocess: () => SubprocessLike | undefined): P
     },
 
     async attach(sessionId, id, res) {
+      clearIdleTimer(id)
       const record = live.get(id)
       if (record === undefined || record.sessionId !== sessionId) {
         res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' })
@@ -378,15 +488,35 @@ export function createPtyHub(getSubprocess: () => SubprocessLike | undefined): P
         'cache-control': 'no-cache, no-transform',
         'x-accel-buffering': 'no',
       })
+      // 背压：慢客户端导致 res.write 返回 false 时暂停输出流，drain 后恢复；
+      // 无法暂停的输出流（实现不支持）就容忍，最多在内核侧多缓冲。
+      let paused = false
       const writeLine = (line: Record<string, unknown>): void => {
         if (res.writableEnded) return
-        res.write(`${JSON.stringify(line)}\n`)
+        let accepted = true
+        try {
+          accepted = res.write(`${JSON.stringify(line)}\n`) !== false
+        } catch {
+          return
+        }
+        if (accepted || paused) return
+        paused = true
+        try { record.handle.output.pause() } catch { /* 暂停不支持则容忍 */ }
+        res.once('drain', () => {
+          paused = false
+          try { record.handle.output.resume() } catch { /* 忽略 */ }
+        })
       }
       record.listeners.add(writeLine)
       const ping = setInterval(() => { writeLine({ t: 'ping' }) }, 15000)
       const drop = (): void => {
         clearInterval(ping)
         record.listeners.delete(writeLine)
+        // 本客户端若暂停过输出流，断开时恢复，避免卡住后续 attach。
+        try { record.handle.output.resume() } catch { /* 忽略 */ }
+        if (record.listeners.size === 0 && !record.closed) {
+          scheduleIdleTimer(id)
+        }
       }
       res.on('close', drop)
       res.on('error', drop)
@@ -394,6 +524,10 @@ export function createPtyHub(getSubprocess: () => SubprocessLike | undefined): P
     },
 
     async disposeAll() {
+      for (const timer of idleTimers.values()) {
+        clearTimeout(timer)
+      }
+      idleTimers.clear()
       const ids = [...live.keys()]
       await Promise.all(ids.map(async id => {
         const record = live.get(id)
@@ -409,16 +543,37 @@ export function createPtyHub(getSubprocess: () => SubprocessLike | undefined): P
   return hub
 }
 
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1'])
+
+function hostNameOf(host: string): string {
+  const trimmed = host.trim()
+  if (trimmed.startsWith('[')) {
+    const end = trimmed.indexOf(']')
+    if (end !== -1) return trimmed.slice(1, end).toLowerCase()
+  }
+  const colon = trimmed.indexOf(':')
+  if (colon !== -1) return trimmed.slice(0, colon).toLowerCase()
+  return trimmed.toLowerCase()
+}
+
+/**
+ * 跨站与安全网关：
+ * - 自定义头（x-dsh-explorer: 1）拦截简单请求与表单型 CSRF。
+ * - Origin 与 Host 同源校验 + 回环白名单（127.0.0.1 / localhost / ::1）防御 DNS rebinding。
+ * - 已知限制：本地信任模型下 sessionId 仍是凭据，同一台机器上的其它本地进程若能读取 sessionId 仍可发起请求。
+ */
 export function gateExplorerRequest(req: IncomingMessage, res: ServerResponse, methods = 'POST, OPTIONS'): boolean {
   const origin = req.headers.origin
   const host = req.headers.host
+  const isLoopback = typeof host === 'string' && LOOPBACK_HOSTS.has(hostNameOf(host))
   const sameHost = typeof origin === 'string' && origin.length > 0 && typeof host === 'string'
     && ((): boolean => {
-      try { return new URL(origin).host === host } catch { return false }
+      // 两侧统一小写比较：URL().host 恒为小写，而 Host 头可能带大写。
+      try { return new URL(origin).host.toLowerCase() === host.toLowerCase() } catch { return false }
     })()
 
   if (req.method === 'OPTIONS') {
-    if (sameHost) {
+    if (sameHost && isLoopback) {
       res.writeHead(204, {
         'access-control-allow-origin': origin,
         'access-control-allow-methods': methods,
@@ -432,9 +587,14 @@ export function gateExplorerRequest(req: IncomingMessage, res: ServerResponse, m
     }
     return false
   }
-  if (req.method !== 'POST' || req.headers['x-dsh-explorer'] !== '1') {
-    res.writeHead(req.method === 'POST' ? 403 : 405, { 'content-type': 'text/plain; charset=utf-8' })
-    res.end(req.method === 'POST' ? 'forbidden' : 'POST only')
+  if (req.method !== 'POST') {
+    res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8' })
+    res.end('POST only')
+    return false
+  }
+  if (req.headers['x-dsh-explorer'] !== '1' || typeof origin !== 'string' || origin.length === 0 || !sameHost || !isLoopback) {
+    res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' })
+    res.end('forbidden')
     return false
   }
   return true

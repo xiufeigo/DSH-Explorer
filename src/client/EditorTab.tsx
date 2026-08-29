@@ -11,6 +11,9 @@ import { renderMarkdown } from './Markdown'
 import { openFileTab, rpc } from './rpc'
 import type { ExplorerStore, FileTab } from './store'
 
+/** 击键防抖窗口：脏标立即入库，正文延迟这么久再写，减少全栏重渲染。 */
+const CONTENT_DEBOUNCE_MS = 250
+
 function isMarkdown(name: string): boolean {
   return /\.(md|markdown|mdown|mkd)$/i.test(name)
 }
@@ -188,15 +191,35 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
   const [untracked, setUntracked] = useState(false)
   const [staleDisk, setStaleDisk] = useState<string | null>(null)
   const loadedOnce = useRef(false)
+  /** 外部修改提示条对应内容的磁盘版本号（载入最新版本时写回基准）。 */
+  const staleVersionRef = useRef<string | null>(null)
+  /** 击键防抖：脏标立即入库，正文延迟写入（见 onChange / flushContent）。 */
+  const flushTimer = useRef<{ id: string; content: string; timer: number } | null>(null)
+
+  /** 立即把防抖中的正文写入 store（保存 / 切走 / 卸载前调用，草稿不丢）。 */
+  const flushContent = useCallback(() => {
+    const pending = flushTimer.current
+    if (pending === null) return
+    flushTimer.current = null
+    window.clearTimeout(pending.timer)
+    store.patchTab(pending.id, { content: pending.content })
+  }, [store])
+
+  // 卸载兜底：组件移除前把未落库的正文写回
+  useEffect(() => () => { flushContent() }, [flushContent])
 
   useEffect(() => {
     if (!tab.loading && !loadedOnce.current && tab.content !== value) {
       setValue(tab.content)
       loadedOnce.current = true
+    } else if (!tab.loading && !tab.dirty && tab.content !== value) {
+      setValue(tab.content)
     }
-  }, [tab.loading, tab.content, value])
+  }, [tab.loading, tab.dirty, tab.content, value])
 
   useEffect(() => {
+    // 切 tab：旧 tab 防抖中的正文先落库，草稿不丢
+    flushContent()
     loadedOnce.current = false
     setMode('view')
     setPatch(null)
@@ -205,20 +228,24 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
     setSaveError(null)
     setDesktopError(null)
     setStaleDisk(null)
-  }, [tab.id])
+    staleVersionRef.current = null
+  }, [tab.id, flushContent])
 
   // 外部修改跟随：查看态/干净编辑态自动套用；有未保存修改只提示不强改。
   const dirtyRef = useRef(tab.dirty)
   dirtyRef.current = tab.dirty
   const followExternalChange = useCallback(() => {
-    void rpc<{ content?: string }>(sessionId, 'fs.read', { path: tab.path }).then(res => {
+    // 大文件读取显式放宽超时（默认 15s 会误杀）
+    void rpc<{ content?: string; version?: string }>(sessionId, 'fs.read', { path: tab.path }, { timeoutMs: 30_000 }).then(res => {
       if (res.error !== undefined || typeof res.content !== 'string') return
+      const version = typeof res.version === 'string' ? res.version : null
       if (dirtyRef.current) {
+        staleVersionRef.current = version // 「载入最新版本」时用它重建基准
         setStaleDisk(res.content) // 提示条按钮主动载入，绝不覆盖用户正在写的内容
         return
       }
       setValue(res.content)
-      store.patchTab(tab.id, { content: res.content, error: null })
+      store.patchTab(tab.id, { content: res.content, error: null, baseVersion: version })
     })
   }, [sessionId, tab.path, tab.id, store])
   const rebase = useExternalFollow({
@@ -232,10 +259,11 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
   useEffect(() => {
     if (tab.loading) return
     let cancelled = false
+    // 大文件/大仓库 diff 放宽超时
     void rpc<{ patch?: string | null; untracked?: boolean }>(sessionId, 'git.fileDiff', {
       path: tab.path,
       mode: 'git',
-    }).then(res => {
+    }, { timeoutMs: 60_000 }).then(res => {
       if (cancelled) return
       setUntracked(res.untracked === true)
       setPatch(typeof res.patch === 'string' && res.patch.length > 0 ? res.patch : null)
@@ -244,20 +272,40 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
   }, [sessionId, tab.path, tab.loading, tab.content])
 
   const save = useCallback(async () => {
+    // 外部已修改提示条仍在：先确认，避免盲覆盖冲掉 agent 刚写的内容
+    if (staleDisk !== null) {
+      let confirmed = true
+      try {
+        confirmed = window.confirm('磁盘文件已被外部修改，保存将覆盖外部改动。确定保存？')
+      } catch {
+        /* 受限环境 confirm 不可用：视为确认，不把保存通道堵死 */
+      }
+      if (!confirmed) return
+    }
+    flushContent() // 防抖中的正文先落库，保存失败切走时草稿也不丢
     setSaving(true)
     setSaveError(null)
-    const res = await rpc<{ ok?: boolean }>(sessionId, 'fs.write', { path: tab.path, content: value })
+    const args: Record<string, unknown> = { path: tab.path, content: value }
+    // CAS：带上打开/载入时的基准版本，版本不匹配由 Host 拒绝并提示刷新
+    if (tab.baseVersion !== null && tab.baseVersion !== undefined) args.expected = tab.baseVersion
+    const res = await rpc<{ ok?: boolean; version?: string }>(sessionId, 'fs.write', args)
     setSaving(false)
     if (res.error !== undefined) {
       setSaveError(res.error)
       return
     }
-    store.patchTab(tab.id, { dirty: false, content: value })
+    staleVersionRef.current = null
+    store.patchTab(tab.id, {
+      dirty: false,
+      content: value,
+      // 保存成功：响应带回新版本则作为新基准；没带回则置空（旧宿主不做 CAS）
+      baseVersion: typeof res.version === 'string' ? res.version : null,
+    })
     // 写盘成功：基准重建，避免把「自己的保存」误判成外部修改；
     // 挂起的磁盘提示也一并撤销。
     rebase()
     setStaleDisk(null)
-  }, [sessionId, tab.id, tab.path, value, store, rebase])
+  }, [sessionId, tab.id, tab.path, tab.baseVersion, value, store, rebase, staleDisk, flushContent])
 
   const onKeyDown = useCallback((event: KeyboardEvent<HTMLTextAreaElement>) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
@@ -318,14 +366,22 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
       {staleDisk !== null && (
         <div className="dshx-stale-bar">
           <span>文件已在磁盘上被修改</span>
-          <button type="button" className="dshx-btn small" onClick={() => setStaleDisk(null)}>忽略</button>
+          <button
+            type="button"
+            className="dshx-btn small"
+            onClick={() => { setStaleDisk(null); staleVersionRef.current = null }}
+          >
+            忽略
+          </button>
           <button
             type="button"
             className="dshx-btn small primary"
             onClick={() => {
               setValue(staleDisk)
-              store.patchTab(tab.id, { content: staleDisk, error: null })
+              // 内容换成磁盘最新的同时重建版本基准
+              store.patchTab(tab.id, { content: staleDisk, error: null, baseVersion: staleVersionRef.current })
               setStaleDisk(null)
+              staleVersionRef.current = null
               rebase()
             }}
           >
@@ -346,7 +402,16 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
           loading={tab.loading}
           onChange={next => {
             setValue(next)
-            store.patchTab(tab.id, { dirty: true })
+            // 脏标立即入库（保存按钮 / 未保存徽标 / 外部跟随守卫都靠它）；
+            // 正文防抖 ~250ms 再写 store，避免每键全栏重渲染 + 整串拷贝
+            if (!tab.dirty) store.patchTab(tab.id, { dirty: true })
+            const pending = flushTimer.current
+            if (pending !== null) window.clearTimeout(pending.timer)
+            const timer = window.setTimeout(() => {
+              flushTimer.current = null
+              store.patchTab(tab.id, { content: next })
+            }, CONTENT_DEBOUNCE_MS)
+            flushTimer.current = { id: tab.id, content: next, timer }
           }}
           onKeyDown={onKeyDown}
         />
@@ -375,7 +440,8 @@ export function PreviewTab({ tab, sessionId, store }: { tab: FileTab; sessionId:
   // 外部更新跟随：fileFollow 每 2s 探指纹（fs.stat，失败回退 fs.list 父目录，
   // 与宿主是否重启无关），变化就静默重读。预览只读，不会和编辑冲突。
   const pullLatest = useCallback(async () => {
-    const read = await rpc<{ content?: string }>(sessionId, 'fs.read', { path: tab.path })
+    // 大文件读取显式放宽超时（默认 15s 会误杀）
+    const read = await rpc<{ content?: string }>(sessionId, 'fs.read', { path: tab.path }, { timeoutMs: 30_000 })
     if (read.error !== undefined || typeof read.content !== 'string') return
     store.patchTab(tab.id, { content: read.content, error: null })
     setContent(read.content)
@@ -387,7 +453,7 @@ export function PreviewTab({ tab, sessionId, store }: { tab: FileTab; sessionId:
   })
 
   const reload = useCallback(() => {
-    void rpc<{ content?: string }>(sessionId, 'fs.read', { path: tab.path }).then(res => {
+    void rpc<{ content?: string }>(sessionId, 'fs.read', { path: tab.path }, { timeoutMs: 30_000 }).then(res => {
       if (res.error === undefined && res.content !== undefined) {
         store.patchTab(tab.id, { content: res.content, error: null })
         setContent(res.content)
