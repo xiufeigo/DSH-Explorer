@@ -554,7 +554,12 @@ export function installWorkspaceRecencyOrder(faces: RecencyOrderFaces): () => vo
       if (disposed) return
       if (applying) {
         // 看门狗：enforce 卡死（如 RPC 永不返回）超过上限就强制解锁。
-        if (!(applyingAt > 0 && Date.now() - applyingAt > ENFORCE_WATCHDOG_MS)) return
+        if (!(applyingAt > 0 && Date.now() - applyingAt > ENFORCE_WATCHDOG_MS)) {
+          // enforce 进行中到达的变化不能丢：标记补跑，由其 finally 兜底重排
+          // （rerunQueued 原来的唯一写入点在 enforce 并发分支，实际不可达）。
+          rerunQueued = true
+          return
+        }
         applying = false
         applyingAt = 0
       }
@@ -598,7 +603,10 @@ export function installWorkspaceRecencyOrder(faces: RecencyOrderFaces): () => vo
 
   const unsubPrefs = subscribePrefs(() => schedule())
 
-  orderSource = () => displayedIds(wsList.getSnapshot())
+  // 只认领自己注册的 orderSource：双安装器并存（HMR/未 dispose 的旧实例）时，
+  // 先退场的实例不得把后来者的读取口清空（否则 commitWorkspaceOrderIntent 静默失效）。
+  const myOrderSource = (): string[] => displayedIds(wsList.getSnapshot())
+  orderSource = myOrderSource
   schedule()
 
   return () => {
@@ -606,7 +614,7 @@ export function installWorkspaceRecencyOrder(faces: RecencyOrderFaces): () => vo
     if (timer !== null) clearTimeout(timer)
     timer = null
     pinsListeners.delete(onPinsChanged)
-    if (orderSource !== null) orderSource = null
+    if (orderSource === myOrderSource) orderSource = null
     unsubWorkspaces()
     unsubSessions()
     unsubPrefs()

@@ -58,6 +58,8 @@ export interface PayloadForkOptions {
   io?: PayloadForkIo
   /** 定位成功后的回调（测试断言用）。 */
   onLocated?: (path: string) => void
+  /** 期望命中的 clamp 点位数（默认 2，两处全中才写）；不足视为上游形状变化，跳过不写。 */
+  expectedSites?: number
 }
 
 export interface PayloadForkStatus {
@@ -137,19 +139,35 @@ export function locateLayoutBundle(io: PayloadForkIo = defaultIo, extraBases: re
 /**
  * 纯函数：把 bundle 文本里的 520 钳制改成 max。返回 null 表示没有可命中点位
  * （源码 fork 已存在 / 上游结构变化），调用方据此跳过而不是盲写。
+ * 全有或全无：点位数必须恰好等于 expectedSites（默认 2），且每个命中点位的
+ * 尾参重写都必须真正改掉文本——否则一律返回 null，不写盘也不落标记，
+ * 杜绝「标记已落但补丁只生效一半」的静默无效态。
  * 默认 1200 ↔ src/client/detailsWidth.ts 的 DETAILS_MAX。
  */
-export function rewriteClampSites(source: string, max = 1200, fromMax = 520): { text: string; sites: number } | null {
+export function rewriteClampSites(
+  source: string,
+  max = 1200,
+  fromMax = 520,
+  expectedSites = 2,
+): { text: string; sites: number } | null {
   // 入口防守：非有限数字会拼出畸形正则与输出文本，直接按无点位处理。
   if (!Number.isFinite(max) || !Number.isFinite(fromMax)) return null
+  if (!Number.isSafeInteger(expectedSites) || expectedSites < 1) return null
   // 每次调用用全新正则，避免 /g 的 lastIndex 跨调用串状态。
   const pattern = new RegExp(`\\bclampWidth\\((px|details),\\s*300,\\s*${fromMax}\\)`, 'g')
   let sites = 0
+  let phantom = false
   const text = source.replace(pattern, match => {
+    const next = match.replace(new RegExp(`${fromMax}\\s*\\)$`), `${max})`)
+    if (next === match) {
+      // 半命中：外形匹配但尾参重写没改动文本（如上游改成多参 clamp），该点位未生效。
+      phantom = true
+      return match
+    }
     sites++
-    return match.replace(new RegExp(`${fromMax}\\s*\\)$`), `${max})`)
+    return next
   })
-  if (sites === 0) return null
+  if (sites !== expectedSites || phantom) return null
   const oldMarkerRegex = /\/\* dsh-explorer payload fork: details clamp 300\.\.\d+ \(self-healing at plugin startup\) \*\/\n?/g
   const cleaned = text.replace(oldMarkerRegex, '').trimEnd()
   return { text: `${cleaned}\n${forkMarkerFor(max)}\n`, sites }
@@ -163,6 +181,7 @@ export function applyPayloadFork(options: PayloadForkOptions = {}): PayloadForkS
   const io = options.io ?? defaultIo
   // 缺省 1200 ↔ src/client/detailsWidth.ts 的 DETAILS_MAX。
   const max = options.max ?? 1200
+  const expectedSites = options.expectedSites ?? 2
   let path: string | undefined
   try {
     path = locateLayoutBundle(io, options.bases)
@@ -182,17 +201,23 @@ export function applyPayloadFork(options: PayloadForkOptions = {}): PayloadForkS
       fromMax = existingMax
     }
 
-    const rewritten = rewriteClampSites(source, max, fromMax)
+    const rewritten = rewriteClampSites(source, max, fromMax, expectedSites)
     if (rewritten === null) {
       if (existingMarkerMatch !== null) {
-        return { status: 'skipped', path, reason: `已存在补丁标记（max=${existingMarkerMatch[1]}）但未找到 300–${fromMax} 钳制点位` }
+        return { status: 'skipped', path, reason: `已存在补丁标记（max=${existingMarkerMatch[1]}）但未找齐 300–${fromMax} 钳制点位（期望 ${expectedSites} 处）` }
       }
-      return { status: 'skipped', path, reason: 'bundle 中没有 300–520 钳制点位（可能已是源码 fork 或上游结构变化）' }
+      return { status: 'skipped', path, reason: `bundle 中未找齐 300–${fromMax} 钳制点位（期望 ${expectedSites} 处；可能已是源码 fork 或上游结构变化）` }
     }
 
-    // 原始备份只写一次：卸载 / 排查时可手工还原。
+    // 备份必须镜像「打补丁前的原始文本」：缺失、被污染（含 fork 标记）或陈旧
+    // （桌面壳更新覆盖 client.js 后残留旧版备份）都与当前 source 不一致，
+    // 一律刷新成当前这份上游原文，保证按备份回退得到的永远是干净原版。
     const backup = `${path}.dshx-orig`
-    if (!io.exists(backup)) io.write(backup, source)
+    let backupFresh = false
+    if (io.exists(backup)) {
+      try { backupFresh = io.read(backup) === source } catch { backupFresh = false }
+    }
+    if (!backupFresh) io.write(backup, source)
 
     // 同盘临时文件 + 原子换名，避免半截文件被服务器读出去。
     const tmp = `${path}.dshx-tmp`

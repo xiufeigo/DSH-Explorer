@@ -451,34 +451,7 @@ function tokenizeMarkup(source: string): TokenSpan[][] {
         // 识别 script / style 开标签 → 后续内容按对应语言分词
         const openMatch = /^<([a-zA-Z][a-zA-Z0-9]*)[\s>]/.exec(tag)
         const name = openMatch !== null ? openMatch[1].toLowerCase() : ''
-        if ((name === 'script' || name === 'style') && !/\/>$/.test(tag) && !tag.startsWith('</')) {
-          let k = 0
-          while (k < tag.length) {
-            const ch = tag[k]
-            if (ch === '<' || ch === '/' || ch === '>' || ch === '=') {
-              push(spans, ch, 'punct')
-              k++
-            } else if (isIdentStart(ch)) {
-              let j = k + 1
-              while (j < tag.length && /[\w:-]/.test(tag[j])) j++
-              const ident = tag.slice(k, j)
-              const prev = tag[k - 1]
-              push(spans, ident, prev === '<' || prev === '/' ? 'kw' : 'param')
-              k = j
-            } else if (ch === '"' || ch === "'") {
-              const found = readString(tag, k, ch)
-              push(spans, tag.slice(k, found.end), 'str')
-              k = found.end
-            } else {
-              push(spans, ch, 'plain')
-              k++
-            }
-          }
-          embed = name === 'script' ? 'js' : 'css'
-          closeTag = `</${name}`
-          i = end
-          continue
-        }
+        const opensEmbed = (name === 'script' || name === 'style') && !/\/>$/.test(tag) && !tag.startsWith('</')
         let k = 0
         while (k < tag.length) {
           const ch = tag[k]
@@ -499,6 +472,19 @@ function tokenizeMarkup(source: string): TokenSpan[][] {
           } else {
             push(spans, ch, 'plain')
             k++
+          }
+        }
+        if (opensEmbed) {
+          embed = name === 'script' ? 'js' : 'css'
+          closeTag = `</${name}`
+          // 同行闭合（<script>const a=1</script>）：内嵌体就地分词后回到标签态，
+          // 否则 embed 会一路带到后续行（曾把后续 HTML 行按 JS 分词）
+          const closeAt = line.toLowerCase().indexOf(closeTag, end)
+          if (closeAt >= 0) {
+            embedInto(spans, line.slice(end, closeAt), embed)
+            embed = null
+            i = closeAt
+            continue
           }
         }
         i = end
@@ -641,12 +627,28 @@ function tokenizeCss(source: string): TokenSpan[][] {
   return result
 }
 
+/** 找行内 YAML 注释 '#'：跳过引号串（"a # b" 里的 # 不是注释）；未闭合引号按无注释处理。 */
+function findYamlComment(line: string): number {
+  let i = 0
+  while (i < line.length) {
+    const ch = line[i]
+    if (ch === '"' || ch === "'") {
+      const found = readString(line, i, ch)
+      if (!found.closed) return -1
+      i = found.end
+      continue
+    }
+    if (ch === '#' && (i === 0 || line[i - 1] === ' ' || line[i - 1] === '\t')) return i
+    i++
+  }
+  return -1
+}
+
 function tokenizeYaml(source: string): TokenSpan[][] {
   return splitLines(source).map(line => {
-    const hash = line.indexOf('#')
-    const prev = hash > 0 ? line[hash - 1] : ''
-    const body = hash >= 0 && (hash === 0 || prev === ' ' || prev === '\t') ? line.slice(0, hash) : line
-    const comment = hash >= 0 && body !== line ? line.slice(hash) : ''
+    const hash = findYamlComment(line)
+    const body = hash >= 0 ? line.slice(0, hash) : line
+    const comment = hash >= 0 ? line.slice(hash) : ''
     const spans: TokenSpan[] = []
     let i = 0
     while (i < body.length) {

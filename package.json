@@ -1,8 +1,8 @@
 {
   "name": "dsh-explorer",
-  "version": "0.1.0",
+  "version": "0.1.2-rc.1.1",
   "private": true,
-  "description": "DSH Explorer — OpenCode 风格文件树 / 编辑 / 预览 / 审查 / 上下文 / ToDo 面板插件",
+  "description": "DSH Explorer — OpenCode 风格文件树 / 编辑 / 预览 / 审查 / 上下文 / 来源 / 终端面板插件（对齐 DSH 0.1.2-rc.1 接入规范）",
   "type": "module",
   "engines": {
     "node": ">=22.12"
@@ -26,8 +26,10 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
-        "@deepseek-ai/dsh-client-ui-layout"
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-api-workspace-controller"
       ]
     }
   },
@@ -37,6 +39,7 @@
     "watch": "tsdown --watch",
     "typecheck": "tsc --noEmit",
     "verify": "node scripts/smoke.mjs",
+    "selfcheck": "node scripts/md-selfcheck.mjs",
     "plugin:install": "node scripts/install.mjs",
     "plugin:uninstall": "node scripts/uninstall.mjs"
   },
@@ -44,14 +47,12 @@
     "@types/node": "^22.10.0",
     "@types/react": "~18.3.1",
     "@types/react-dom": "~18.3.1",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "tsdown": "^0.22.0",
     "typescript": "^5.6.0"
   },
-  "license": "MIT",
-  "dependencies": {
-    "@xterm/addon-fit": "^0.11.0",
-    "@xterm/xterm": "^6.0.0"
-  }
+  "license": "MIT"
 }

@@ -6,3 +6,4 @@ lib/
 .env.*
 .tmp-mdcheck/
 .tmp-xsscheck/
+.agent-teams/

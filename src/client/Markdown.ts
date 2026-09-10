@@ -185,6 +185,13 @@ interface LinkParse {
 
 type InlineFn = (text: string) => string
 
+/** 方括号配对扫描预算：超出按普通文本处理（未闭合 '[' 逐个全文扫描曾是 O(n²)）。 */
+const BRACKET_SCAN_MAX = 1000
+/** 块嵌套深度上限（引用/列表互递归）：超出按段落文本处理，防栈溢出与超二次扫描。 */
+const MAX_NEST_DEPTH = 100
+/** 脚注引用 [^label]：sticky 正则避免每个 '[' 都 slice 出剩余全文。 */
+const RE_FOOTNOTE_REF = /\[\^([^\]\s]+)\]/y
+
 /**
  * 解析以 src[at]==='[' 开头的脚注引用 / 引用式或行内式链接与图片。
  * 失败返回 null（调用方按普通文本处理）。
@@ -196,10 +203,12 @@ function parseBracket(
   inline: InlineFn,
   isImage: boolean,
 ): LinkParse | null {
-  // 脚注 [^label]
+  // 脚注 [^label]（仅有定义的标签升级为脚注引用；未定义的按原文显示，
+  // 避免悬空锚点与空脚注项。定义由入口预扫描先行登记，支持前向引用）
   if (!isImage) {
-    const fnm = /^\[\^([^\]\s]+)\]/.exec(src.slice(at))
-    if (fnm !== null) {
+    RE_FOOTNOTE_REF.lastIndex = at
+    const fnm = RE_FOOTNOTE_REF.exec(src)
+    if (fnm !== null && ctx.footNotes.has(fnm[1])) {
       const label = fnm[1]
       let idx = ctx.footOrder.indexOf(label)
       if (idx < 0) { idx = ctx.footOrder.length; ctx.footOrder.push(label) }
@@ -211,10 +220,11 @@ function parseBracket(
     }
   }
 
-  // 匹配方括号体（允许嵌套一层计数）
+  // 匹配方括号体（允许嵌套一层计数；扫描限预算防未闭合 '[' 的 O(n²)）
   let depth = 0
   let close = -1
-  for (let k = at; k < src.length; k++) {
+  const limit = Math.min(src.length, at + BRACKET_SCAN_MAX)
+  for (let k = at; k < limit; k++) {
     const ch = src[k]
     if (ch === '\\') { k++; continue }
     if (ch === '[') depth++
@@ -264,12 +274,18 @@ function parseBracket(
 
 // ─── 强调 / 链接化装饰（在已转义纯文本上执行） ──────────────────────────────
 
-function decorate(input: string, stash: string[], ctx: RenderCtx): string {
+function decorate(input: string, stash: string[]): string {
   let s = input
 
+  // 裸 URL 从已转义文本中捕获，& 已是 &amp;；还原后再 attr/escapeHtml，
+  // 否则 href 与可见文本都会双重转义（?a=1&b=2 曾显示并跳转到 &amp;）
+  const unescapeAmp = (u: string): string => u.replace(/&amp;/g, '&')
+
   // 1. http(s) 自动链接
-  s = s.replace(/(^|[\s(])(https?:\/\/[^\s<>")\]}]+[^\s<>")\]},.;:!?])/g, (_m, pre: string, url: string) =>
-    `${pre}<a href="${attr(url)}" target="_blank" rel="noreferrer">${escapeHtml(url)}</a>`)
+  s = s.replace(/(^|[\s(])(https?:\/\/[^\s<>")\]}]+[^\s<>")\]},.;:!?])/g, (_m, pre: string, url: string) => {
+    const link = unescapeAmp(url)
+    return `${pre}<a href="${attr(link)}" target="_blank" rel="noreferrer">${escapeHtml(link)}</a>`
+  })
 
   // 掩藏已生成的标签；后续步骤只作用于纯文本
   const mask = (v: string): string =>
@@ -282,12 +298,20 @@ function decorate(input: string, stash: string[], ctx: RenderCtx): string {
     s.replace(new RegExp(`${ST_TAG}(\\d+)${EN_TAG}`, 'g'), (_m, idx: string) => stash[Number(idx)] ?? '')
 
   // 2. www 自动链接
-  s = s.replace(/(^|[\s(])(www\.[^\s<>")\]}]+[^\s<>")\]},.;:!?])/g, (_m, pre: string, url: string) =>
-    `${pre}<a href="${attr(`https://${url}`)}" target="_blank" rel="noreferrer">${escapeHtml(url)}</a>`)
+  s = s.replace(/(^|[\s(])(www\.[^\s<>")\]}]+[^\s<>")\]},.;:!?])/g, (_m, pre: string, url: string) => {
+    const link = unescapeAmp(url)
+    return `${pre}<a href="${attr(`https://${link}`)}" target="_blank" rel="noreferrer">${escapeHtml(link)}</a>`
+  })
+  // www 产出的标签先掩藏，防止邮箱 pass 把 mailto 锚点嵌进其 href
+  // （www.mail@example.com 曾产出 <a> 嵌套进 href 属性的损坏 HTML）
+  s = mask(s)
 
-  // 3. 邮箱自动链接
-  s = s.replace(/[A-Za-z0-9._+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g, mail =>
+  // 3. 邮箱自动链接（各段限长：无上限时超长 token 的回溯是 O(n²)，
+  // 200k 字符单行实测 35s；限长后匹配失败即终止，整体线性）
+  s = s.replace(/[A-Za-z0-9._+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})+/g, mail =>
     `<a href="mailto:${attr(mail)}">${escapeHtml(mail)}</a>`)
+  // 邮箱标签同样掩藏，防止强调 pass 把 <em> 插进 mailto href
+  s = mask(s)
 
   // 4. 强调链：粗斜体 → 粗体 → 斜体 → 删除线 → 高亮
   const passes: Array<[RegExp, string]> = [
@@ -302,21 +326,16 @@ function decorate(input: string, stash: string[], ctx: RenderCtx): string {
   ]
   for (const [re, wrap] of passes) s = s.replace(re, wrap)
 
-  // 5. Wiki 链接 [[目标|文本]]
-  s = s.replace(/\[\[([^\]|\n]+)(?:\|([^\]\n]+))?\]\]/g, (_m, target: string, label?: string) => {
-    const text = (label ?? target).trim()
-    return `<a href="#${attr(encodeURIComponent(target.trim()))}" class="dshx-wikilink">${escapeHtml(text)}</a>`
-  })
+  // Wiki 链接 [[目标|文本]]：由 createInline 扫描器统一处理（先于本函数，
+  // 同一正则），此处不会再见到成对的 [[…]]——曾存在的兜底分支为死代码已删。
 
-  // 6. 无属性白名单 HTML（原文已被转义成 &lt;…&gt;）
+  // 5. 无属性白名单 HTML（原文已被转义成 &lt;…&gt;）
   s = s.replace(/&lt;(\/?)(br|hr)\s*\/?&gt;/g, '<$1$2/>')
   s = s.replace(
     /&lt;(\/?)(sub|sup|kbd|mark|u|s|b|i|em|strong|small|ins|del)&gt;/g,
     '<$1$2>',
   )
 
-  // 脚注顺序登记仅供块级尾部使用；此处无操作
-  void ctx
   return unmaskAll()
 }
 
@@ -329,7 +348,7 @@ function createInline(ctx: RenderCtx): InlineFn {
     const flushPlain = (): void => {
       if (plain.length === 0) return
       const text = escapeHtml(plain.join(''))
-      out.push(decorate(text, stash, ctx).replace(new RegExp(`${ST_ESC}(\\d+)${EN_ESC}`, 'g'), (_m, idx: string) => escapes[Number(idx)] ?? ''))
+      out.push(decorate(text, stash).replace(new RegExp(`${ST_ESC}(\\d+)${EN_ESC}`, 'g'), (_m, idx: string) => escapes[Number(idx)] ?? ''))
       plain.length = 0
     }
 
@@ -437,7 +456,9 @@ function createInline(ctx: RenderCtx): InlineFn {
 // ─── 代码块高亮 ─────────────────────────────────────────────────────────────
 
 function highlightBlock(code: string, lang: string): string {
-  if (lang.length === 0 || code.length > 60000 || code.split('\n').length > 8000) {
+  // 行数上限（8000）由 tokenizeSource 的 HIGHLIGHT_MAX 统一强制：超限返回空
+  // 数组 → 下面 rows.length === 0 分支即 escapeHtml，结果等价，无需重复检查。
+  if (lang.length === 0 || code.length > 60000) {
     return escapeHtml(code)
   }
   try {
@@ -472,9 +493,12 @@ const RE_REF_DEF = /^ {0,3}\[(?!\^)([^\]]+)\]:[ \t]?(.*)$/
 
 /** 解析引用定义的目的地部分：「dest 可选标题」。 */
 function tryRefDef(rest: string): RefDef | null {
+  // 无空白时补一个空格：尾部反斜杠（x\）在裸目的地扫描里会吞掉闭括号，
+  // 补空格让 '\\' 转义落在空格上（两条路径对其余输入等价）
   const wrapped = rest.includes(' ') || rest.includes('\t') ? `(${rest})` : `(${rest} )`
   const parsed = parseDestTitle(wrapped, 0)
-  if (parsed !== null) return { href: parsed.dest, title: parsed.title }
+  // 必须整串消费完：'[r]: x)' 的 ')' 曾被当包装括号吞掉（end< len → 非法）
+  if (parsed !== null && parsed.end === wrapped.length) return { href: parsed.dest, title: parsed.title }
   const angle = /^<([^<>]*)>[ \t]*$/.exec(rest)
   if (angle !== null) return { href: angle[1], title: null }
   return null
@@ -502,8 +526,10 @@ function isDelimRow(line: string): boolean {
 }
 
 function isBlockOpener(line: string): boolean {
+  // RE_SETEXT：setext 下划线（=== / ---）不能作为引用/列表的懒续行
+  // （CommonMark 规定；曾把 '> q\ntext\n===' 误吞成引用内 h1）
   return RE_FENCE_OPEN.test(line) || RE_HR.test(line) || RE_ATX.test(line) ||
-    RE_UL.test(line) || RE_OL.test(line) || RE_QUOTE.test(line)
+    RE_UL.test(line) || RE_OL.test(line) || RE_QUOTE.test(line) || RE_SETEXT.test(line)
 }
 
 interface ListItem {
@@ -528,6 +554,7 @@ function parseList(
   html: string[],
   ctx: RenderCtx,
   inline: InlineFn,
+  depth: number,
 ): number {
   const firstLine = lines[start]
   const ol = /^[ \t]*(\d{1,9})([.)])([ \t]+)/.exec(firstLine)
@@ -636,7 +663,10 @@ function parseList(
     : ''
   html.push(`<${tag}${startAttr}>`)
   for (const item of items) {
-    const inner = parseBlocks(item.lines, ctx, inline, !loose)
+    // 深度超限时不再递归块解析，条目内容按段落文本收敛（防栈溢出/超二次）
+    const inner = depth >= MAX_NEST_DEPTH
+      ? inline(item.lines.join('\n'))
+      : parseBlocks(item.lines, ctx, inline, !loose, depth + 1)
     if (item.checked === null) {
       html.push(`<li>${inner}</li>`)
     } else {
@@ -679,6 +709,7 @@ function parseBlocks(
   ctx: RenderCtx,
   inline: InlineFn,
   tight: boolean,
+  depth = 0,
 ): string {
   const html: string[] = []
   let para: string[] | null = null
@@ -719,12 +750,17 @@ function parseBlocks(
       while (i < lines.length) {
         const q = RE_QUOTE.exec(lines[i])
         if (q !== null) { buf.push(q[1]); i++; continue }
-        if (lines[i].trim() !== '' && buf.length > 0 && !isBlockOpener(lines[i])) {
+        // 含 '|' 的行可能是表格，别吞（与列表懒续行规则一致）
+        if (lines[i].trim() !== '' && buf.length > 0 && !isBlockOpener(lines[i]) && !lines[i].includes('|')) {
           buf.push(lines[i]); i++; continue
         }
         break
       }
-      html.push(`<blockquote>${parseBlocks(buf, ctx, inline, true)}</blockquote>`)
+      // 深度超限时内容按段落文本收敛，不再递归（防 '>'×N 栈溢出）
+      const inner = depth >= MAX_NEST_DEPTH
+        ? `<p>${inline(buf.join('\n'))}</p>`
+        : parseBlocks(buf, ctx, inline, true, depth + 1)
+      html.push(`<blockquote>${inner}</blockquote>`)
       continue
     }
 
@@ -821,10 +857,10 @@ function parseBlocks(
       }
     }
 
-    // 列表
-    if (width <= 3 && (RE_UL.test(line) || RE_OL.test(line))) {
+    // 列表（深度超限时按段落处理，防嵌套列表递归失控）
+    if (depth < MAX_NEST_DEPTH && width <= 3 && (RE_UL.test(line) || RE_OL.test(line))) {
       flushPara()
-      i = parseList(lines, i, html, ctx, inline)
+      i = parseList(lines, i, html, ctx, inline, depth)
       continue
     }
 
@@ -851,6 +887,16 @@ export function renderMarkdown(markdown: string): string {
   // 无 XSS）。只在最上游总入口清一次，覆盖 front matter / 代码块 / 行内全部
   // 文本路径，不漏不重。
   const normalized = markdown.replace(/[\uE000-\uF8FF]/g, '').replace(/\r\n?/g, '\n')
+  try {
+    return renderNormalized(normalized)
+  } catch {
+    // 兜底：任何未预见的解析异常都降级为纯文本（调用方在 useMemo 内裸调，
+    // 抛错会击穿无 ErrorBoundary 的整棵插件视图）
+    return `<p>${escapeHtml(normalized).replace(/\n/g, '<br/>')}</p>`
+  }
+}
+
+function renderNormalized(normalized: string): string {
   let lines = normalized.split('\n')
 
   const head: string[] = []
@@ -875,7 +921,9 @@ export function renderMarkdown(markdown: string): string {
     footOrder: [],
   }
 
-  // 预扫描：先收走全部引用链接定义，支持前向引用（跳过围栏代码内部）
+  // 预扫描：先收走全部引用链接定义，支持前向引用（跳过围栏代码内部）。
+  // 同时登记顶层脚注定义（仅登记不删行——块级解析随后会以完整多行体重写；
+  // 行内脚注引用据此判定"是否有定义"，未定义的按原文显示）
   {
     let fence: string | null = null
     const drop = new Set<number>()
@@ -888,6 +936,8 @@ export function renderMarkdown(markdown: string): string {
       const f = RE_FENCE_OPEN.exec(line)
       if (f !== null) { fence = f[1]; continue }
       if (indentWidth(line) > 3) continue
+      const fd = RE_FN_DEF.exec(line)
+      if (fd !== null) { ctx.footNotes.set(fd[1], fd[2]); continue }
       const rd = RE_REF_DEF.exec(line)
       if (rd === null) continue
       const def = tryRefDef(rd[2])

@@ -213,6 +213,31 @@ try {
   if (card === undefined) throw new Error('missing settings.plugin.item key=dsh-explorer')
   if (card.options.id !== 'dsh-explorer') throw new Error('settings.plugin.item should also carry id=dsh-explorer')
   ok('settings slots: plugin.item card registers with key+id=dsh-explorer')
+
+  // ── 0.1.2 兼容回归：client-runtime 重组后 workspaces.openPath 被删除 ──
+  // apply 不得因缺失本地 opener 抛错；openWithSystem 应回落远端通道。
+  pluginModule.resetHostOpenPath()
+  const remoteOpens = []
+  const slots2 = makeSlots()
+  pluginModule.apply({
+    get: (name) => name === 'remote'
+      ? { session: { openWorkspacePath: async (req) => { remoteOpens.push(req?.path) } } }
+      : undefined,
+    effect: (cb) => {
+      const d = cb()
+      return typeof d === 'function' ? d : () => {}
+    },
+    slots: slots2,
+    sessions: {},
+    workspaces: {}, // 0.1.2：没有 openPath 成员
+    layout: {},
+  })
+  slots2.declare('settings.plugin.item', { kind: 'keyed', scope: 'root' })
+  await pluginModule.openWithSystem('C:\\tmp\\demo.txt')
+  if (remoteOpens.length !== 1 || remoteOpens[0] !== 'C:\\tmp\\demo.txt') {
+    throw new Error(`remote openWorkspacePath fallback expected one call, got ${JSON.stringify(remoteOpens)}`)
+  }
+  ok('0.1.2 compat: apply survives missing workspaces.openPath; openWithSystem falls back to remote.session')
 } catch (error) {
   fail('browser half evaluation', error)
 }
@@ -324,9 +349,40 @@ try {
     if (!res.body.includes('会话不存在')) throw new Error(`pty stream body unexpected: ${res.body}`)
     ok('pty stream: header + loopback origin reaches dispatch (session guard answers)')
   }
+  {
+    // t14：pty.resize 分发 + 参数形状 + 非法尺寸拒绝（真实 PTY 不起，桩验证转发）。
+    const session = { header: { id: 's-rz', cwd: process.cwd() } }
+    const calls = []
+    const sv = {
+      sessions: { get: id => (id === 's-rz' ? session : undefined) },
+      policyFor: () => undefined,
+      pty: {
+        async resize(sessionId, id, cols, rows) { calls.push([sessionId, id, cols, rows]); return { ok: true } },
+      },
+    }
+    const res = makeRes()
+    await handleRpc(
+      makeReq('POST', { 'content-type': 'application/json', 'x-dsh-explorer': '1', ...LOOP },
+        '{"sessionId":"s-rz","method":"pty.resize","args":{"id":"pty-1","cols":100,"rows":30}}'),
+      res, sv, new Map(),
+    )
+    if (res.statusCode !== 200) throw new Error(`pty.resize expected 200, got ${res.statusCode}`)
+    if (calls.length !== 1 || calls[0][0] !== 's-rz' || calls[0][1] !== 'pty-1' || calls[0][2] !== 100 || calls[0][3] !== 30) {
+      throw new Error(`pty.resize forwarding wrong: ${JSON.stringify(calls)}`)
+    }
+    const resBad = makeRes()
+    await handleRpc(
+      makeReq('POST', { 'content-type': 'application/json', 'x-dsh-explorer': '1', ...LOOP },
+        '{"sessionId":"s-rz","method":"pty.resize","args":{"id":"pty-1","cols":"wide"}}'),
+      resBad, sv, new Map(),
+    )
+    if (!resBad.body.includes('非法尺寸')) throw new Error(`pty.resize malformed dims unexpected: ${resBad.body}`)
+    ok('rpc dispatch: pty.resize forwards {id,cols,rows} and rejects malformed dims')
+  }
 } catch (error) {
+  // 不在此处 process.exit：后续分节相互独立，汇总到文末统一退出，
+  // 一次运行能看到全部失败（§1/§2 的 lib 破坏总闸仍会先行短路）。
   fail('rpc gate checks', error)
-  process.exit(1)
 }
 
 // ── 4. 载荷自愈钩子（src/payloadFork.ts） ─────────────────────────────────
@@ -442,9 +498,29 @@ try {
     }
     ok('payload fork: rename failure abandons the write, keeps original, cleans temp via io.remove')
   }
+  {
+    // P2-③：半命中（只找到 1 处点位）不得写盘、不得落标记、不得备份。
+    const half = UPSTREAM.split('\n').slice(0, 1).join('\n')
+    if (rewriteClampSites(half, 1200) !== null) {
+      throw new Error('single-site source must not rewrite (expectedSites=2)')
+    }
+    const files = { [BUNDLE]: half }
+    const status = applyPayloadFork({ bases: BASES, io: makeIo(files) })
+    if (status.status !== 'skipped') throw new Error(`expected skipped on half-match, got ${JSON.stringify(status)}`)
+    if (files[BUNDLE] !== half) throw new Error('half-match must not write the bundle')
+    if (files[`${BUNDLE}.dshx-orig`] !== undefined) throw new Error('half-match must not touch the backup')
+    ok('payload fork: half-matched clamp sites are skipped without writing or stamping')
+  }
+  {
+    // P2-④：备份被污染（含 fork 标记）时，重打前先用当前原始文本刷新备份。
+    const files = { [BUNDLE]: UPSTREAM, [`${BUNDLE}.dshx-orig`]: `${UPSTREAM}\n${FORK_MARKER}\n` }
+    const status = applyPayloadFork({ bases: BASES, io: makeIo(files) })
+    if (status.status !== 'patched' || status.sites !== 2) throw new Error(`expected patched(2), got ${JSON.stringify(status)}`)
+    if (files[`${BUNDLE}.dshx-orig`] !== UPSTREAM) throw new Error('polluted backup was not refreshed to the pristine source')
+    ok('payload fork: polluted backup is refreshed before re-patching')
+  }
 } catch (error) {
   fail('payload fork checks', error)
-  process.exit(1)
 }
 
 // ── 5. 工作区按会话时间排序（workspaceRecencyOrder） ──────────────────────
@@ -543,8 +619,7 @@ try {
     },
   })
   moves.length = 0
-  current = [...items].sort(() => -1) // 故意打乱初始顺序
-  current = items // 修正为原始（创建序）排列，等待重排
+  current = items // 原始（创建序）排列，等待重排
   const workspaces2 = makeStore({ phase: 'ready', items })
   const sessions2 = makeStore({ phase: 'ready', byId: sessions.getSnapshot().byId })
   const insertBefore2 = async (id, before) => {
@@ -776,7 +851,6 @@ try {
   delete globalThis.document
 } catch (error) {
   fail('workspace recency order', error)
-  process.exit(1)
 }
 
 // ── 6. git 路径解码（中文文件名 / C 风格八进制转义） ──────────────────────
@@ -799,7 +873,6 @@ try {
   ok('git pathspec: C-style octal escapes decode to UTF-8 (Chinese filenames)')
 } catch (error) {
   fail('unquotePath checks', error)
-  process.exit(1)
 }
 
 // ── 7. shellSafePath（P0-1 回归修复：按平台放行路径分隔符） ───────────────
@@ -825,7 +898,6 @@ try {
   ok(`shellSafePath: platform-aware separators + metachar blacklist (P0-1 regression guard, win32=${win})`)
 } catch (error) {
   fail('shellSafePath checks', error)
-  process.exit(1)
 }
 
 if (failures > 0) {

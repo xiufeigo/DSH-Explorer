@@ -57,16 +57,19 @@ async function readNdjson(
   }
 }
 
-function TermPane({ sessionId, tab, active, visible, height, onMeta }: {
+function TermPane({ sessionId, tab, active, visible, height, onMeta, onDropped }: {
   sessionId: string
   tab: TermTab
   active: boolean
   visible: boolean
   height: number
   onMeta: () => void
+  /** 宿主 overflow 事件：累计丢弃帧数（累计进 store，仅增长）。 */
+  onDropped: (dropped: number) => void
 }): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
   const rec = useRef<{ term: Terminal; fit: FitAddon } | null>(null)
+  const refitRef = useRef<(() => void) | null>(null)
 
   useLayoutEffect(() => {
     const el = hostRef.current
@@ -102,13 +105,96 @@ function TermPane({ sessionId, tab, active, visible, height, onMeta }: {
       if (tab.ptyId !== null) void rpc(sessionId, 'pty.write', { id: tab.ptyId, data })
     })
 
+    // ── 尺寸同步（B1）：容器几何变化 → 本地 fit + 上报宿主 pty.resize。
+    // 宿主没有该方法（旧版）或连续失败时静默降级为纯本地 xterm resize。
+    let resizeFailStreak = 0
+    let lastPtyId: string | null = null
+    let lastCols = term.cols
+    let lastRows = term.rows
+    const reportSize = (): void => {
+      if (abort.signal.aborted) return
+      const ptyId = tab.ptyId
+      if (ptyId === null) return
+      if (ptyId !== lastPtyId) {
+        lastPtyId = ptyId
+        resizeFailStreak = 0
+      }
+      if (term.cols === lastCols && term.rows === lastRows) return
+      const cols = term.cols
+      const rows = term.rows
+      lastCols = cols
+      lastRows = rows
+      if (resizeFailStreak >= 3) return
+      void rpc(sessionId, 'pty.resize', { id: ptyId, cols, rows }).then(res => {
+        if (res.error === undefined) {
+          resizeFailStreak = 0
+          return
+        }
+        resizeFailStreak += 1
+        // 发送失败的尺寸不算已同步：回滚基线（基线仍指向本次失败值时），
+        // 尺寸未再变时下一次 reportSize 仍会重试；连续 3 次失败后停发降级。
+        if (lastCols === cols && lastRows === rows && resizeFailStreak < 3) {
+          lastCols = -1
+          lastRows = -1
+        }
+      })
+    }
+    const refit = (): void => {
+      if (abort.signal.aborted) return
+      try { fit.fit() } catch { /* 容器不可见时量不出尺寸 */ }
+      reportSize()
+    }
+    refitRef.current = refit
+    let resizeRaf = 0
+    const ro = typeof ResizeObserver !== 'undefined'
+      ? new ResizeObserver(() => {
+          // 隐藏（display:none）的窗格宽为 0：跳过，重新可见时 ResizeObserver 会再触发。
+          if (resizeRaf !== 0 || el.offsetWidth === 0) return
+          resizeRaf = requestAnimationFrame(() => {
+            resizeRaf = 0
+            refit()
+          })
+        })
+      : null
+    ro?.observe(el)
+
+    // ── 流静默中断重连（B3）：readNdjson 正常结束却没见到 exit 行 =
+    // 连接被代理/宿主重启掐断。提示后指数退避重挂，不静默吞掉。
+    let reconnectAttempts = 0
+    let reconnectTimer: number | null = null
+    const scheduleReconnect = (): void => {
+      if (abort.signal.aborted || reconnectTimer !== null) return
+      if (reconnectAttempts >= 5) {
+        term.writeln('\r\n\x1b[31m[连接已断开] 自动重连未成功，可关闭该标签后重新打开\x1b[0m')
+        return
+      }
+      const delay = Math.min(15000, 1000 * 2 ** reconnectAttempts)
+      reconnectAttempts += 1
+      term.writeln(`\r\n\x1b[33m[连接中断] ${String(Math.round(delay / 1000))} 秒后重连…\x1b[0m`)
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null
+        if (abort.signal.aborted) return
+        const id = tab.ptyId
+        if (id === null) return
+        // 重挂成功后 fit 重同步一次（断流期间窗口可能已变，PTY 内核尺寸需追平）。
+        void attach(id).then(ok => { if (ok) refit() })
+      }, delay)
+    }
+
     /** 挂流到既有进程：只接 NDJSON 输出，不重新 pty.open。返回是否挂成功。 */
     const attach = async (ptyId: string): Promise<boolean> => {
+      let sawExit = false
       try {
         await readNdjson(sessionId, ptyId, row => {
+          if (reconnectAttempts !== 0) reconnectAttempts = 0 // 收到任何行都证明连接活着
           if (row.t === 'out' && typeof row.d === 'string') term.write(row.d)
           if (row.t === 'err' && typeof row.m === 'string') term.writeln(`\r\n\x1b[31m${row.m}\x1b[0m`)
+          if (row.t === 'overflow' && typeof row.dropped === 'number' && row.dropped > 0) {
+            onDropped(row.dropped)
+            term.writeln(`\r\n\x1b[33m[输出过快，已丢弃 ${String(row.dropped)} 帧]\x1b[0m`)
+          }
           if (row.t === 'exit') {
+            sawExit = true
             term.writeln('\r\n\x1b[90m[进程已结束]\x1b[0m')
             // 进程已退出：清掉 ptyId 并 touch，避免重挂载时去挂一条死流
             if (tab.ptyId !== null) {
@@ -117,6 +203,8 @@ function TermPane({ sessionId, tab, active, visible, height, onMeta }: {
             }
           }
         }, abort.signal)
+        // 流结束但进程没退出 = 静默断连，安排重连（abort 时无需）。
+        if (!sawExit && !abort.signal.aborted) scheduleReconnect()
         return true
       } catch (error) {
         if (abort.signal.aborted) return false
@@ -137,7 +225,10 @@ function TermPane({ sessionId, tab, active, visible, height, onMeta }: {
       // 把流挂回既有进程，不重新 pty.open。
       const existing = tab.ptyId
       if (existing !== null) {
-        if (await attach(existing)) return
+        if (await attach(existing)) {
+          reportSize() // 重挂后把当前尺寸同步给 PTY（卸载期间窗口可能已变）
+          return
+        }
         if (abort.signal.aborted) return
         // 挂流失败（宿主重启后进程被回收等）：清掉死 id，落到下面新开
         tab.ptyId = null
@@ -168,6 +259,10 @@ function TermPane({ sessionId, tab, active, visible, height, onMeta }: {
     return () => {
       abort.abort()
       stopPrefs()
+      ro?.disconnect()
+      if (resizeRaf !== 0) cancelAnimationFrame(resizeRaf)
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
+      refitRef.current = null
       // 卸载/切会话不发 pty.close：仅断流、销毁 xterm。ptyId 保留在 store，
       // 重挂载时重新挂流；仅用户点 ✕ 关 tab（closeTab 路径）才杀进程。
       // 孤儿进程由宿主 10 分钟闲置回收兜底。
@@ -178,10 +273,9 @@ function TermPane({ sessionId, tab, active, visible, height, onMeta }: {
 
   useLayoutEffect(() => {
     if (!active || !visible) return
-    const current = rec.current
-    if (current === null) return
-    current.fit.fit()
-    current.term.focus()
+    // 切换标签 / 展开面板 / 拖高度后重 fit，并把新尺寸上报宿主（B1）。
+    refitRef.current?.()
+    rec.current?.term.focus()
   }, [active, visible, height])
 
   return (
@@ -233,6 +327,7 @@ export function TerminalPanel({ sessionId, store }: { sessionId: string; store: 
   if (!visible && bag.tabs.length === 0) return null
 
   const addTab = (): void => { store.addTermTab(sessionId) }
+  const activeTab = bag.tabs.find(tab => tab.localId === bag.active)
 
   const closeTab = (localId: string, event: { preventDefault(): void; stopPropagation(): void }): void => {
     event.preventDefault()
@@ -294,6 +389,13 @@ export function TerminalPanel({ sessionId, store }: { sessionId: string; store: 
         <button type="button" className="dshx-term-plus" title="新建终端" onClick={addTab}>+</button>
       </div>
       <div className="dshx-term-body">
+        {activeTab !== undefined && activeTab.dropped > 0
+          ? (
+            <div className="dshx-term-overflow" role="status">
+              输出过快，已丢弃 {String(activeTab.dropped)} 帧（慢客户端积压超限时宿主丢最旧输出）
+            </div>
+          )
+          : null}
         {bag.tabs.map(tab => (
           <TermPane
             key={tab.localId}
@@ -303,6 +405,7 @@ export function TerminalPanel({ sessionId, store }: { sessionId: string; store: 
             visible={visible}
             height={store.terminalHeight}
             onMeta={() => { store.touch() }}
+            onDropped={dropped => { store.setTermDropped(sessionId, tab.localId, dropped) }}
           />
         ))}
       </div>

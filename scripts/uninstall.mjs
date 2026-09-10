@@ -12,75 +12,36 @@
  *   node scripts/uninstall.mjs --dry-run   # 只打印计划，不执行
  */
 
-import { spawnSync } from 'node:child_process'
 import {
   existsSync, lstatSync, readFileSync, readlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  atomicWrite, backupOnce, linkPointsTo, locateHarness,
-  sameResolved, shellLine, stripNtPrefix,
+  atomicWrite, backupOnce, linkPointsTo, locateHarness, log, makeExec, parseArgs,
+  profilePaths, resolveDshHome, run, sameResolved, step, stripNtPrefix,
 } from './harness.mjs'
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const ROW_ID = 'dsh-explorer'
 
-const argv = process.argv.slice(2)
-const KNOWN_OPTS = new Set(['--keep-fork', '--dry-run', '--profile', '--harness'])
-for (const token of argv) {
-  const head = token.split('=')[0]
-  if (token.startsWith('--') && !KNOWN_OPTS.has(head)) {
-    console.error(`✘ 未知参数：${token}`)
-    console.error('  可用：--keep-fork --dry-run --profile <name> --harness <path>')
-    process.exit(1)
-  }
-}
-const flag = (name) => argv.includes(name)
-const opt = (name) => {
-  const eqForm = argv.find(token => token.startsWith(`${name}=`))
-  if (eqForm !== undefined) {
-    const value = eqForm.slice(name.length + 1)
-    return value.length > 0 ? value : undefined
-  }
-  const i = argv.indexOf(name)
-  return i >= 0 && argv[i + 1] !== undefined && !argv[i + 1].startsWith('--') ? argv[i + 1] : undefined
-}
-function requireValue(name, value) {
-  const present = argv.some(token => token === name || token.startsWith(`${name}=`))
-  if (present && value === undefined) {
-    console.error(`✘ ${name} 缺少取值（用法：${name} <value>）`)
-    process.exit(1)
-  }
-}
+// ── 参数解析（共享实现见 harness.mjs） ─────────────────────────────────────
+const { flag, opt, requireValue } = parseArgs({
+  argv: process.argv.slice(2),
+  known: new Set(['--keep-fork', '--dry-run', '--profile', '--harness']),
+  usage: '--keep-fork --dry-run --profile <name> --harness <path>',
+})
 const DRY = flag('--dry-run')
 const harnessFlag = opt('--harness')
 requireValue('--harness', harnessFlag)
 const PROFILE = opt('--profile') ?? 'web'
 requireValue('--profile', opt('--profile'))
-// 与安装器同一规则：默认位置没有 profiles/ 结构时报错，不静默写错地方。
-let DSH_HOME
-if (process.env.DSH_HOME !== undefined && process.env.DSH_HOME.length > 0) {
-  DSH_HOME = process.env.DSH_HOME
-} else {
-  const fallback = join(process.env.USERPROFILE || process.env.HOME || '', '.dsh')
-  if (!existsSync(join(fallback, 'profiles'))) {
-    console.error(`✘ 未设置 DSH_HOME，且默认位置 ${fallback} 不含 profiles/ 目录`)
-    console.error('  请设置环境变量 DSH_HOME 指向 DSH 主目录（含 profiles/<profile>）后再试')
-    process.exit(1)
-  }
-  DSH_HOME = fallback
-}
-const PROFILE_DIR = join(DSH_HOME, 'profiles', PROFILE)
-const PATCH_PATH = join(PROFILE_DIR, 'cordis.patch.yml')
+// DSH_HOME 缺失时的防呆在共享 resolveDshHome 里（与安装器同一规则）。
+const DSH_HOME = resolveDshHome()
 // 与安装器一致的解析基准：junction 农场（profiles/node_modules）优先，兼容 per-profile 目录。
-const JUNCTION_BASES = [
-  join(DSH_HOME, 'profiles', 'node_modules'),
-  join(PROFILE_DIR, 'node_modules'),
-]
+const { profileDir: PROFILE_DIR, patchPath: PATCH_PATH, junctionBases: JUNCTION_BASES } = profilePaths(DSH_HOME, PROFILE)
 
-const log = (...parts) => console.log(...parts)
-const step = (title) => console.log(`\n▶ ${title}`)
+const exec = makeExec(DRY)
 // 卸载结束时汇总的残留提示（fork 回退未命中等）。
 const residueWarnings = []
 
@@ -249,10 +210,16 @@ if (!flag('--keep-fork')) {
         )
         if (next === source) {
           log('  ✘ columns.ts 回退未命中（源码可能已变），未改文件')
+          residueWarnings.push(`${columnsPath} 仍含宽度 FORK 标记（DETAILS_MAX = 1200）`)
         } else {
-          writeFileSync(columnsPath, next)
-          log('  ✓ 已回退 DETAILS_MAX = 520')
-          needRebuild = true
+          try {
+            atomicWrite(columnsPath, next)
+            log('  ✓ 已回退 DETAILS_MAX = 520')
+            needRebuild = true
+          } catch (error) {
+            log(`  ✘ columns.ts 回退写入失败（原文件未动或可自 .dshx-orig 恢复）：${error.message}`)
+            residueWarnings.push(`${columnsPath} 回退写入失败，宽度 FORK 可能残留`)
+          }
         }
       }
     }
@@ -278,14 +245,21 @@ if (!flag('--keep-fork')) {
         )
         if (source.includes('persistDetails(d.details)')) {
           log('  ✘ setDetails 回退未命中，保留 helper，避免留下空调用')
+          residueWarnings.push(`${storesPath} 仍含宽度记忆 FORK（persistDetails 调用未还原）`)
         } else {
           source = source.replace(/\n\n\/\/ ── FORK（DSH-Explorer）：右侧栏宽度记忆[\s\S]*$/, '\n')
           if (source === before) {
             log('  ✘ stores.ts 回退未命中（源码可能已变），未改文件')
+            residueWarnings.push(`${storesPath} 仍含宽度记忆 FORK 标记（DETAILS_WIDTH_KEY）`)
           } else {
-            writeFileSync(storesPath, source)
-            log('  ✓ 已回退 stores.ts 宽度记忆')
-            needRebuild = true
+            try {
+              atomicWrite(storesPath, source)
+              log('  ✓ 已回退 stores.ts 宽度记忆')
+              needRebuild = true
+            } catch (error) {
+              log(`  ✘ stores.ts 回退写入失败（原文件未动或可自 .dshx-orig 恢复）：${error.message}`)
+              residueWarnings.push(`${storesPath} 回退写入失败，宽度记忆 FORK 可能残留`)
+            }
           }
         }
       }
@@ -333,7 +307,13 @@ if (!flag('--keep-fork')) {
         return
       }
       try { backupOnce(filePath) } catch { /* 备份失败不阻断回退 */ }
-      atomicWrite(filePath, next)
+      try {
+        atomicWrite(filePath, next)
+      } catch (error) {
+        log(`  ✘ ${label} 写入失败（原文件未动或可自 .dshx-orig 恢复）：${error.message}`)
+        residueWarnings.push(`${filePath} 回退写入失败`)
+        return
+      }
       log(`  ✓ 已回退 ${label}`)
       needSidebarRebuild = true
     }
@@ -343,10 +323,14 @@ if (!flag('--keep-fork')) {
         /\n[ \t]*\/\*\* FORK（本机部署改动，DSH-Explorer 依赖）：工作区上方动作条座位，见 README。 \*\/\n[ \t]*'sidebar\.workspaces\.actions': \{ kind: 'list'; scope: 'root'; owner: SidebarFooterActionOwnerProps \}/,
         '',
       )
+      // 单行 union 形态（旧上游）。
       out = out.replace(
         "'sidebar.workspaces' | 'sidebar.workspaces.actions' | 'sidebar.settings'",
         "'sidebar.workspaces' | 'sidebar.settings'",
       )
+      // 多行 union 形态（上游加入 brand 席位后；与安装器双形态针配套）：
+      // 删掉整个成员行。
+      out = out.replace(/^[ \t]*\| 'sidebar\.workspaces\.actions'[ \t]*\r?\n/m, '')
       return out
     })
     revertFile('index.ts', join(SIDEBAR_DIR, 'index.ts'), SEAT_KEY, (source) => source.replace(
@@ -373,10 +357,17 @@ if (!flag('--keep-fork')) {
 }
 
 // ── 残留终检：fork 标记仍在即显式告警，不再假装「卸载完成」 ───────────────
+// 覆盖全部六类 fork 标记（宽度 ×2 + 座位 ×2 终检、座位另两文件由
+// revertFile 自身记录），无论上面走了哪条分支（dry-run / --keep-fork /
+// 回退未命中），结尾汇总都给出完整残留清单。
 if (harnessRoot !== undefined) {
   const probes = [
+    [join(harnessRoot, 'packages', 'client', 'ui-layout', 'src', 'client', 'columns.ts'), 'DETAILS_MAX = 1200'],
+    [join(harnessRoot, 'packages', 'client', 'ui-layout', 'src', 'client', 'stores.ts'), 'DETAILS_WIDTH_KEY'],
     [join(harnessRoot, 'packages', 'client', 'ui-sidebar', 'src', 'client', 'contract', 'slots.ts'), 'sidebar.workspaces.actions'],
+    [join(harnessRoot, 'packages', 'client', 'ui-sidebar', 'src', 'client', 'index.ts'), 'sidebar.workspaces.actions'],
     [join(harnessRoot, 'packages', 'client', 'ui-sidebar', 'src', 'client', 'SidebarRoot.tsx'), 'workspaceActions'],
+    [join(harnessRoot, 'packages', 'client', 'ui-sidebar', 'src', 'client', 'SidebarRoot.module.css'), '.workspaceActions'],
   ]
   for (const [file, marker] of probes) {
     try {
@@ -395,20 +386,3 @@ if (residueWarnings.length > 0) {
 }
 console.log('  建议重启 dsh web 一次，彻底清掉 Host 模块缓存')
 console.log('════════════════════════════════════════')
-
-function exec(description, fn) {
-  if (DRY) {
-    log(`  [dry-run] ${description}`)
-    return
-  }
-  try {
-    fn()
-  } catch (error) {
-    console.error(`  ✘ ${description} 失败：${error.message}`)
-    process.exit(1)
-  }
-}
-
-function run(cmd, args, cwd) {
-  return spawnSync(shellLine(cmd, args), { cwd, stdio: 'inherit', shell: true }).status
-}

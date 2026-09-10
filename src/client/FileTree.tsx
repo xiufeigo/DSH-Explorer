@@ -15,6 +15,7 @@ import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react
 import {
   IconFolderClose16, IconFolderOpen16, IconTriangleRightFill14,
 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { canPreview } from './EditorTab'
 import { FileGlyph } from './fileGlyph'
 import { isTransientSessionError, openFileTab, rpc, rpcWithSessionRetry } from './rpc'
 import { useExplorer, type ExplorerStore } from './store'
@@ -43,11 +44,19 @@ function fingerprint(entries: TreeEntry[]): string {
   return entries.map(entry => `${entry.type}|${entry.name}|${entry.size ?? ''}`).join('\u0000')
 }
 
+/** cwd 的路径前缀（含分隔符）：判定 children 键是否属于当前工作区。 */
+function cwdPrefix(cwd: string): string {
+  return /[\\/]$/.test(cwd) ? cwd : `${cwd}${cwd.includes('\\') ? '\\' : '/'}`
+}
+
 // ── 展开状态记忆（按 cwd 存 localStorage） ─────────────────────────────────
 
 const TREE_OPEN_KEY = 'dsh-explorer:tree-open'
 /** 最多记住多少个 cwd 的展开状态：超出删最早写入的（键序即写入序）。 */
 const TREE_OPEN_KEY_CAP = 40
+/** 每 cwd 展开记忆条数上限：恢复与保存共用一个值（原先存 150 恢复 24，
+ *  重挂一次就被回写成 24，逐次收缩）。 */
+const TREE_OPEN_CAP = 24
 
 function readSavedOpen(cwd: string): string[] {
   try {
@@ -72,7 +81,7 @@ function saveOpen(cwd: string, paths: string[]): void {
       if (key === cwd || !Array.isArray(parsed[key])) continue
       map[key] = parsed[key]
     }
-    map[cwd] = paths.slice(0, 150)
+    map[cwd] = paths.slice(0, TREE_OPEN_CAP)
     const keys = Object.keys(map)
     if (keys.length > TREE_OPEN_KEY_CAP) {
       for (const key of keys.slice(0, keys.length - TREE_OPEN_KEY_CAP)) delete map[key]
@@ -96,17 +105,19 @@ interface MenuState {
   parent: string
 }
 
-const NAME_BAD = /[\\/:*?"<>|]/
+// 名称校验与宿主 fsCreate（src/index.ts）对齐：非法字符 / Windows 保留名 /
+// 结尾点或空格 / 超长，提前给行内反馈，不在 RPC 失败后才暴露。
+const NAME_BAD = /[\\/:*?"<>|&%\u0000-\u001f]/
+const NAME_RESERVED = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$/i
 
 // ── 性能护栏 ────────────────────────────────────────────────────────────────
 // 记忆恢复曾把 node_modules 这类几千项目录在切会话的关键帧里整树同步挂载，
 // 配合宿主网格过渡的逐帧重排造成秒级卡死。三个约束：
 //   1) 每层目录默认只渲染前 TREE_CHILD_CAP 行，超出折叠为「显示全部」；
-//   2) 恢复最多展开 RESTORE_DIR_CAP 个目录、并发 ≤LIST_CONCURRENCY；
+//   2) 恢复最多展开 TREE_OPEN_CAP 个目录、并发 ≤LIST_CONCURRENCY；
 //   3) 恢复等 SWITCH_SETTLE_MS 错峰，不和切换过渡抢主线程。
 const TREE_CHILD_CAP = 120
 const TREE_MAX_RENDER_CAP = 2000
-const RESTORE_DIR_CAP = 24
 const LIST_CONCURRENCY = 8
 /** 轮询比对子目录的并发上限：比恢复路径更保守（分批串行，防请求风暴）。 */
 const POLL_LIST_CONCURRENCY = 4
@@ -143,13 +154,23 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
   const [rootError, setRootError] = useState<string | null>(null)
   const [menu, setMenu] = useState<MenuState | null>(null)
   const [creating, setCreating] = useState<Creating>(null)
+  /** 新建文件/文件夹失败提示（原先静默吞掉，输入行已收、用户无从得知）。 */
+  const [createError, setCreateError] = useState<string | null>(null)
   /** 用户点「显示全部」后放开渲染上限的目录（key 为目录路径，根目录用 ''）。 */
   const [showAllDirs, setShowAllDirs] = useState<Set<string>>(() => new Set())
 
   const childrenRef = useRef(children)
   childrenRef.current = children
+  const cwdRef = useRef(cwd)
+  cwdRef.current = cwd
+  const sessionIdRef = useRef(sessionId)
+  sessionIdRef.current = sessionId
   const lastRootFp = useRef('')
   const dirFps = useRef<Map<string, string>>(new Map())
+  /** 展开记忆恢复进行中：拦截持久化，防切 cwd 后「错写旧目录 → 抹写空表」两连击。 */
+  const restoringRef = useRef(false)
+  /** 恢复代数：旧一代被 abort 时不得误放行新一轮的持久化拦截。 */
+  const restoreGenRef = useRef(0)
 
   const loadRoot = useCallback(async (signal?: AbortSignal) => {
     if (cwd === undefined || cwd.length === 0) return
@@ -180,40 +201,50 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
       setLoading(new Map())
       setCreating(null)
       setMenu(null)
+      setCreateError(null)
       setShowAllDirs(new Set())
       lastRootFp.current = ''
       dirFps.current = new Map()
       // 必须同步捕获：持久化 effect 会随后把当前空展开写入存储，晚读会拿到空
       const saved = cwd !== undefined && cwd.length > 0
-        ? readSavedOpen(cwd).filter(path => path !== cwd).slice(0, RESTORE_DIR_CAP)
+        ? readSavedOpen(cwd).filter(path => path !== cwd).slice(0, TREE_OPEN_CAP)
         : []
+      // 有记忆要恢复才拦截持久化（恢复结束/中止由 finally 解除）：
+      // 否则重置的空 children 会被立刻写盘，抹掉该 cwd 已存的展开记忆
+      restoringRef.current = saved.length > 0
+      const myGen = ++restoreGenRef.current
       void (async () => {
-        await loadRoot(ac.signal)
-        if (ac.signal.aborted || saved.length === 0) return
-        if (sessionId === undefined || sessionId.length === 0) return
-        // 错峰：等宿主切会话的网格过渡帧走完再恢复，恢复动作不挤占切换的关键帧；
-        // 分批拉取避免几十个目录并发打满。
-        await delay(ac.signal, SWITCH_SETTLE_MS)
-        for (let start = 0; start < saved.length; start += LIST_CONCURRENCY) {
-          if (ac.signal.aborted) return
-          const batch = saved.slice(start, start + LIST_CONCURRENCY)
-          const results = await Promise.all(batch.map(async path => ({
-            path,
-            res: await rpc<ListResult>(sessionId, 'fs.list', { path }),
-          })))
-          if (ac.signal.aborted) return
-          setChildren(current => {
-            const next = new Map(current)
-            let changed = false
-            for (const { path, res } of results) {
-              if (res.error !== undefined) continue
-              const entries = res.entries ?? []
-              dirFps.current.set(path, fingerprint(entries))
-              next.set(path, entries)
-              changed = true
-            }
-            return changed ? next : current
-          })
+        try {
+          await loadRoot(ac.signal)
+          if (ac.signal.aborted || saved.length === 0) return
+          if (sessionId === undefined || sessionId.length === 0) return
+          // 错峰：等宿主切会话的网格过渡帧走完再恢复，恢复动作不挤占切换的关键帧；
+          // 分批拉取避免几十个目录并发打满。
+          await delay(ac.signal, SWITCH_SETTLE_MS)
+          for (let start = 0; start < saved.length; start += LIST_CONCURRENCY) {
+            if (ac.signal.aborted) return
+            const batch = saved.slice(start, start + LIST_CONCURRENCY)
+            const results = await Promise.all(batch.map(async path => ({
+              path,
+              res: await rpc<ListResult>(sessionId, 'fs.list', { path }),
+            })))
+            if (ac.signal.aborted) return
+            setChildren(current => {
+              const next = new Map(current)
+              let changed = false
+              for (const { path, res } of results) {
+                if (res.error !== undefined) continue
+                const entries = res.entries ?? []
+                dirFps.current.set(path, fingerprint(entries))
+                next.set(path, entries)
+                changed = true
+              }
+              return changed ? next : current
+            })
+          }
+        } finally {
+          // 只有最新一代恢复能解除拦截：旧一代被 abort 时不能误放行新一轮
+          if (restoreGenRef.current === myGen) restoringRef.current = false
         }
       })()
     } else {
@@ -223,10 +254,17 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
     return () => ac.abort()
   }, [loadRoot])
 
-  /** 展开状态持久化：children 变化即落盘。 */
+  /** 展开状态持久化：children 变化即落盘（恢复进行中与跨 cwd 残留时拦截）。 */
   useEffect(() => {
     if (cwd === undefined || cwd.length === 0) return
-    saveOpen(cwd, Array.from(children.keys()))
+    // 切 cwd 后的恢复窗口内不写盘（见 restoringRef），避免错写旧目录/抹写空表
+    if (restoringRef.current) return
+    const keys = Array.from(children.keys())
+    // children 混入不属于当前 cwd 的路径（切换竞态残留）→ 拒绝写，防串目录；
+    // 大小写不敏感：Windows 盘符/目录大小写与 displayPath 可能不一致。
+    const prefix = cwdPrefix(cwd).toLowerCase()
+    if (keys.some(path => !path.toLowerCase().startsWith(prefix))) return
+    saveOpen(cwd, keys)
   }, [children, cwd])
 
   /**
@@ -268,10 +306,25 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
         updates.push(...results)
       }
       setChildren(current => {
+        // 用 ref 里的最新 cwd 判前缀：本函数闭包捕获的 cwd 在「切换会话竞态」
+        // 里恰恰是旧值，防不住要防的那批路径；会话已无 cwd 则全部视为过期
+        const curCwd = cwdRef.current ?? cwd
+        if (curCwd === undefined || curCwd.length === 0) return current
         const next = new Map(current)
         let changed = false
+        const prefix = cwdPrefix(curCwd).toLowerCase()
         for (const { path, res } of updates) {
-          if (res.error !== undefined) continue
+          if (res.error !== undefined) {
+            // 目录已从磁盘消失（ENOENT）或已跑到会话工作目录之外 → 摘掉孤儿展开项
+            if (next.has(path) && (/enoent|no such file/i.test(res.error) || res.error.includes('路径超出会话工作目录'))) {
+              next.delete(path)
+              dirFps.current.delete(path)
+              changed = true
+            }
+            continue
+          }
+          // 切换会话/cwd 竞态期间残留的旧路径不落地，防跨工作区串树
+          if (!path.toLowerCase().startsWith(prefix)) continue
           const entries = res.entries ?? []
           const fp = fingerprint(entries)
           if (fp === dirFps.current.get(path)) continue
@@ -321,9 +374,13 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
 
   const reloadDir = useCallback(async (parent: string): Promise<TreeEntry[] | null> => {
     if (sessionId === undefined || sessionId.length === 0) return null
+    const startCwd = cwd
+    const startSession = sessionId
     const res = parent === cwd
       ? await rpcWithSessionRetry<ListResult>(sessionId, 'fs.list', { path: parent })
       : await rpc<ListResult>(sessionId, 'fs.list', { path: parent })
+    // await 期间已切换会话/cwd：结果作废，不落进新树（防跨工作区串树）
+    if (cwdRef.current !== startCwd || sessionIdRef.current !== startSession) return null
     if (res.error !== undefined) return null
     const entries = res.entries ?? []
     if (parent === cwd) {
@@ -354,6 +411,8 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
       return
     }
     if (loading.get(path) === true) return
+    const startCwd = cwd
+    const startSession = sessionId
     setLoading(current => new Map(current).set(path, true))
     const res = await rpc<ListResult>(sessionId, 'fs.list', { path })
     setLoading(current => {
@@ -361,6 +420,8 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
       next.delete(path)
       return next
     })
+    // await 期间已切换会话/cwd：结果作废，不落进新树（防跨工作区串树）
+    if (cwdRef.current !== startCwd || sessionIdRef.current !== startSession) return
     if (res.error !== undefined) {
       setErrors(current => new Map(current).set(path, res.error ?? '未知错误'))
       return
@@ -373,7 +434,7 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
     const entries = res.entries ?? []
     dirFps.current.set(path, fingerprint(entries))
     setChildren(current => new Map(current).set(path, entries))
-  }, [children, loading, sessionId])
+  }, [children, loading, sessionId, cwd])
 
   const openEntry = useCallback((entry: TreeEntry, kind: 'edit' | 'preview') => {
     void openFileTab(store, sessionId, entry.path, entry.name, kind).then(() => {
@@ -415,6 +476,7 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
 
   const beginCreate = useCallback((kind: 'file' | 'dir', parent: string) => {
     setMenu(null)
+    setCreateError(null)
     setCreating({ parent, kind })
     void ensureOpen(parent)
   }, [ensureOpen])
@@ -425,7 +487,12 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
     const kind = creating.kind
     setCreating(null)
     const res = await rpc<{ ok?: boolean }>(sessionId, 'fs.create', { path: parent, name, kind })
-    if (res.error !== undefined || res.ok !== true) return
+    if (res.error !== undefined || res.ok !== true) {
+      // 创建失败不再静默：此时输入行已收起，用户需要明确的失败反馈
+      setCreateError(typeof res.error === 'string' && res.error.length > 0 ? res.error : '创建失败')
+      return
+    }
+    setCreateError(null)
     const entries = await reloadDir(parent)
     if (kind === 'file' && entries !== null) {
       // 用列表里的规范路径打开（避免猜分隔符）
@@ -491,16 +558,16 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
               <span className="dshx-tree-size">{formatSize(entry.size)}</span>
             )}
           </div>
-          {isDir && isOpen && (
-            errors.has(entry.path)
-              ? <div className="dshx-error" style={{ padding: '2px 8px 2px 26px', fontSize: 13 }}>{errors.get(entry.path)}</div>
-              : (
-                  <>
-                    {renderEntries(children.get(entry.path) ?? [], depth + 1, entry.path)}
-                    {renderNewRow(entry.path, depth + 1, `${entry.path}::new`)}
-                  </>
-                )
-          )}
+          {isDir && errors.has(entry.path) ? (
+            // 加载失败的错误必须可见：原先藏在 isOpen 分支里（失败必然未展开 → 永不可达）。
+            // 错误行常驻展示，再点目录行即可重试（toggle 成功会清掉 errors）。
+            <div className="dshx-error" style={{ padding: '2px 8px 2px 26px', fontSize: 13 }}>{errors.get(entry.path)}</div>
+          ) : isDir && isOpen ? (
+            <>
+              {renderEntries(children.get(entry.path) ?? [], depth + 1, entry.path)}
+              {renderNewRow(entry.path, depth + 1, `${entry.path}::new`)}
+            </>
+          ) : null}
         </div>
       )
     })
@@ -531,10 +598,11 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
     return rows
   }
 
-  const previewable = (entry: TreeEntry): boolean => /\.(md|markdown|html?|htm)$/i.test(entry.name)
-
   return (
     <div className="dshx-tree" onContextMenu={onBackgroundContextMenu}>
+      {createError !== null && (
+        <div className="dshx-error" style={{ padding: '2px 8px', fontSize: 13 }}>{createError}</div>
+      )}
       {cwd === undefined || cwd.length === 0 ? (
         <div className="dshx-empty">当前会话没有工作目录</div>
       ) : rootError !== null ? (
@@ -571,9 +639,9 @@ export function FileTree({ cwd, sessionId, store, onOpenPanel }: FileTreeProps):
             <>
               <div className="dshx-menu-item" onClick={() => { openEntry(menu.entry!, 'edit'); setMenu(null) }}>打开编辑</div>
               <div
-                className={`dshx-menu-item ${previewable(menu.entry) ? '' : 'disabled'}`}
+                className={`dshx-menu-item ${canPreview(menu.entry.name) ? '' : 'disabled'}`}
                 onClick={() => {
-                  if (!previewable(menu.entry!)) return
+                  if (!canPreview(menu.entry!.name)) return
                   openEntry(menu.entry!, 'preview')
                   setMenu(null)
                 }}
@@ -603,7 +671,13 @@ function NewNameRow({ kind, depth, onConfirm, onCancel }: {
   const confirm = (): void => {
     const name = value.trim()
     if (name.length === 0) { onCancel(); return }
-    if (name === '.' || name === '..' || NAME_BAD.test(name)) { setBad(true); return }
+    // 口径与宿主 fsCreate 对齐（见 NAME_BAD / NAME_RESERVED），提前给行内反馈
+    if (name === '.' || name === '..' || name.length > 200
+      || name.endsWith('.') || name.endsWith(' ')
+      || NAME_RESERVED.test(name) || NAME_BAD.test(name)) {
+      setBad(true)
+      return
+    }
     onConfirm(name)
   }
   return (
@@ -621,7 +695,7 @@ function NewNameRow({ kind, depth, onConfirm, onCancel }: {
         }}
         onBlur={onCancel}
       />
-      {bad && <span className="dshx-tree-newhint">名称含非法字符</span>}
+      {bad && <span className="dshx-tree-newhint">名称不可用（非法字符 / 保留名 / 过长）</span>}
     </div>
   )
 }

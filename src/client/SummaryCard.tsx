@@ -1,11 +1,9 @@
 /**
- * Codex-style environment summary: changes / branch / commit-push / child
- * agents / sources. No "local" row. Change counts open Review; child agents
- * and sources open the matching details page.
+ * Codex-style environment summary: changes / branch / commit-push / sources.
+ * No "local" row. Change counts open Review; sources open the details page.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { agentHue } from './conversationHost'
 import { rpc, rpcWithSessionRetry, safeExternalUrl } from './rpc'
 import type { ExplorerStore, ReviewMode } from './store'
 
@@ -36,27 +34,10 @@ export interface SourceGroup {
   pages: SourcePage[]
 }
 
-export interface SubagentRow {
-  id: string
-  label: string
-  activity: 'running' | 'inactive' | string
-  mode?: string
-}
-
-interface CatalogEntry {
-  kind?: string
-  id?: string
-  label?: string
-  activity?: string
-  mode?: string
-}
-
 interface SummaryCardProps {
   sessionId: string
   store: ExplorerStore
   openDetails(): void
-  refreshSubagents(id: string): void
-  setSubagentCatalogOpen(id: string, open: boolean): void
   useSessions?: (selector: (state: any) => unknown) => any
   onNavigate?: () => void
 }
@@ -64,19 +45,18 @@ interface SummaryCardProps {
 function openPage(
   store: ExplorerStore,
   openDetails: () => void,
-  page: 'review' | 'subagents' | 'sources',
-  opts?: { reviewMode?: ReviewMode; subagentId?: string | null },
+  page: 'review' | 'sources',
+  opts?: { reviewMode?: ReviewMode },
 ): void {
   store.openPage(page, opts)
   openDetails()
 }
 
 export function SummaryCard({
-  sessionId, store, openDetails, refreshSubagents, setSubagentCatalogOpen, useSessions, onNavigate,
+  sessionId, store, openDetails, useSessions, onNavigate,
 }: SummaryCardProps): JSX.Element {
   const [git, setGit] = useState<GitSummary>({})
   const [sources, setSources] = useState<SourceGroup[]>([])
-  const [hostAgents, setHostAgents] = useState<SubagentRow[]>([])
   const [branchOpen, setBranchOpen] = useState(false)
   const [commitOpen, setCommitOpen] = useState(false)
   const [commitMsg, setCommitMsg] = useState('')
@@ -86,9 +66,6 @@ export function SummaryCard({
   // 最新 sessionId 的镜像：异步动作 resolve 后用它判断会话是否已切走
   const sessionIdRef = useRef(sessionId)
   sessionIdRef.current = sessionId
-
-  const useSessionsSafe = useSessions ?? (() => undefined)
-  const catalog = useSessionsSafe((state: { subagentsByParent?: Record<string, { entries?: CatalogEntry[] }> }) => state?.subagentsByParent?.[sessionId]) as { entries?: CatalogEntry[] } | undefined
 
   const load = useCallback(() => {
     if (typeof document !== 'undefined' && document.hidden) return
@@ -100,12 +77,7 @@ export function SummaryCard({
     void rpcWithSessionRetry<{ groups?: SourceGroup[] }>(sessionId, 'session.sources').then(res => {
       if (my === reqSeq.current) setSources(res.groups ?? [])
     })
-    void rpcWithSessionRetry<{ agents?: SubagentRow[] }>(sessionId, 'session.subagents').then(res => {
-      if (my === reqSeq.current) setHostAgents(res.agents ?? [])
-    })
-    void refreshSubagents(sessionId)
-    setSubagentCatalogOpen(sessionId, true)
-  }, [sessionId, refreshSubagents, setSubagentCatalogOpen])
+  }, [sessionId])
 
   useEffect(() => {
     load()
@@ -122,51 +94,14 @@ export function SummaryCard({
       clearInterval(timer)
       if (visTimer !== 0) window.clearTimeout(visTimer)
       document.removeEventListener('visibilitychange', onVis)
-      setSubagentCatalogOpen(sessionId, false)
     }
-  }, [load, sessionId, setSubagentCatalogOpen])
+  }, [load, sessionId])
 
-  const catalogAgents: SubagentRow[] = (catalog?.entries ?? [])
-    .filter(entry => entry.kind === 'child' && typeof entry.id === 'string')
-    .map(entry => ({
-      id: entry.id as string,
-      label: (entry.label ?? entry.id) as string,
-      activity: entry.activity ?? 'inactive',
-      mode: entry.mode,
-    }))
-  // ── 子智能体主备数据源与迟滞 ─────────────────────────────────────────────
-  // 主源：catalog（宿主 live 投影）；备源：hostAgents（session.subagents 快照）。
-  // catalog 从有到无常是投影异步清空的一瞬：延迟一拍再回落备源，并用最近一次
-  // 非空快照填补空窗，避免两源交替生效造成列表闪烁。
-  const hasCatalog = catalogAgents.length > 0
-  const lastCatalogRef = useRef<SubagentRow[]>([])
-  if (hasCatalog) lastCatalogRef.current = catalogAgents
-  const [useCatalog, setUseCatalog] = useState(hasCatalog)
-  useEffect(() => {
-    // 会话切换：为新会话重启主备判定，旧会话快照立即作废
-    lastCatalogRef.current = []
-    setUseCatalog(false)
-  }, [sessionId])
-  useEffect(() => {
-    if (hasCatalog) {
-      setUseCatalog(true)
-      return
-    }
-    const timer = window.setTimeout(() => setUseCatalog(false), 1200)
-    return () => window.clearTimeout(timer)
-    // sessionId 也在依赖里：切会话后即使两侧都有 catalog（hasCatalog 不变），
-    // 也要跟随上面的复位重新判定
-  }, [hasCatalog, sessionId])
-  const agents = useCatalog && lastCatalogRef.current.length > 0
-    ? lastCatalogRef.current
-    : hostAgents
-  const running = agents.filter(agent => agent.activity === 'running')
-  const done = agents.filter(agent => agent.activity !== 'running')
   const previewSources = sources.slice(0, 3)
   const added = git.added ?? 0
   const deleted = git.deleted ?? 0
 
-  const go = (page: 'review' | 'subagents' | 'sources', opts?: { reviewMode?: ReviewMode }): void => {
+  const go = (page: 'review' | 'sources', opts?: { reviewMode?: ReviewMode }): void => {
     openPage(store, openDetails, page, opts)
     onNavigate?.()
   }
@@ -263,7 +198,7 @@ export function SummaryCard({
                       key={name}
                       type="button"
                       className={`dshx-summary-menu-item${name === git.branch ? ' on' : ''}`}
-                      disabled={busy === 'checkout'}
+                      disabled={busy !== null}
                       onClick={() => { void checkout(name) }}
                     >
                       {name}
@@ -334,26 +269,6 @@ export function SummaryCard({
       )}
 
       {note !== null && note !== '' && <div className="dshx-summary-note">{note}</div>}
-
-      <div className="dshx-summary-section">
-        <div className="dshx-summary-section-title">子智能体</div>
-        <button
-          type="button"
-          className="dshx-summary-agents"
-          onClick={() => go('subagents')}
-        >
-          <span className="dshx-summary-dots">
-            {agents.slice(0, 5).map(agent => (
-              <span key={agent.id} className="dshx-summary-dot" style={{ background: agentHue(agent.id) }} />
-            ))}
-            {agents.length === 0 && <span className="dshx-muted">暂无</span>}
-          </span>
-          <span className="dshx-summary-agent-stat">
-            {running.length > 0 && <span>{running.length} 个运行中</span>}
-            {done.length > 0 && <span>{done.length} 完成</span>}
-          </span>
-        </button>
-      </div>
 
       <div className="dshx-summary-section">
         <div className="dshx-summary-section-title">来源</div>

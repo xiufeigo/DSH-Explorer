@@ -8,4 +8,4 @@ alwaysApply: true
 官方 `@deepseek-ai/dsh-client-ui-layout` 把 details 列钳在 **300–520px**（`clampWidth(..., 300, 520)`）。插件嵌在该列里，绕不过私有 store。合同上限是 **1200**，宽度记在 `localStorage['dsh-explorer:details-width']`。中栏让步链仍要求中心列 ≥640px。
 
 - 本机 `dsh web`：`pnpm plugin:install --fork-width`（或 `--fork-ui`）改 harness 的 `DETAILS_MAX` 并重建 ui-layout。升级 DSH 会覆盖，必须重打。
-- **DSH Desktop**：吃 npm 载荷，不是本机 harness。`--fork-width` 对 Desktop **无效**。Desktop 同步官方后右侧会锁回 520。运行时放宽在 Desktop 壳 `titlebar.js` 的 `installLayoutWidthFork`，不要把说明、规则或 `@deepseek-ai/*` 补丁写进 Desktop 仓库。上游若改掉 `clampWidth(..., 300, 520)` 字面量，Desktop 的 rewrite 会静默失效，要改那边的匹配串。
+- **DSH Desktop**：吃 npm 载荷，不是本机 harness。`--fork-width` 对 Desktop **无效**。权威兜底是插件的**载荷自愈钩子**（`src/payloadFork.ts`：Host 半边 apply 时把载荷里 `@deepseek-ai/dsh-client-ui-layout/lib/client.js` 的 `clampWidth(…, 300, 520)` 两处点位改成 `300, 1200`，幂等 + `.dshx-orig` 备份，Desktop 同步官方后自动重打）。Desktop 壳 `titlebar.js` 的 `installLayoutWidthFork` 是历史遗留方案、**不可靠**（client-modules 启动时以 `target.load` 原地接管队列 loader，动态加载的 ui-layout 走不到改写），不要依赖；也不要把说明、规则或 `@deepseek-ai/*` 补丁写进 Desktop 仓库。上游若改掉 `clampWidth(..., 300, 520)` 字面量，payload fork 会按「无点位」静默跳过，需要同步更新 `src/payloadFork.ts` 的匹配串。

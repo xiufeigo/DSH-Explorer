@@ -8,10 +8,16 @@ import { defineConfig } from 'tsdown'
  * react / react-dom / the native icon library stay external so the plugin
  * reuses the app's shared instances; everything else this package imports
  * gets inlined.
+ *
+ * `@deepseek-ai/dsh-client-store` 同属 baseline（宿主
+ * `packages/client/web/src/platform.ts` 的 PLATFORM_MODULES 把 client/store、
+ * ui-slots、ui-primitives 一起播种进模块表），因此同样外部化——内联它会在
+ * 运行时把同一份 store 引擎装成第二份实例。
  */
 const CLIENT_EXTERNALS = [
   'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client',
   '@deepseek-ai/dsh-client-ui-primitives',
+  '@deepseek-ai/dsh-client-store',
 ]
 
 /**
@@ -82,12 +88,16 @@ export default defineConfig([
     dts: false,
     clean: false,
     sourcemap: true,
-    external: CLIENT_EXTERNALS,
+    // tsdown 0.22+：external/noExternal 已弃用，改由 deps.* 表达
+    //（数组语义不变——CLIENT_EXTERNALS 仍是唯一的「除外」清单）。
     // Everything that is NOT a platform module must be inlined: a require()
     // the module table cannot answer is a guaranteed runtime throw.
-    // 显式 false（而非依赖 undefined 的隐式语义），上游行为变化也不会把
-    // react 误内联。
-    noExternal: (id: string) => (CLIENT_EXTERNALS.includes(id) ? false : true),
+    // alwaysBundle 显式排除（而非依赖 undefined 的隐式语义），上游默认
+    // 行为变化也不会把 react 误内联。
+    deps: {
+      neverBundle: CLIENT_EXTERNALS,
+      alwaysBundle: (id: string) => (CLIENT_EXTERNALS.includes(id) ? false : true),
+    },
     define: {
       'process.env.NODE_ENV': JSON.stringify('production'),
       'import.meta.env.MODE': JSON.stringify('production'),
@@ -102,6 +112,8 @@ export default defineConfig([
     // placed there never reaches the artifact and the factory body throws
     // `exports is not defined` when the shell module loader evaluates it
     // (took down the whole plugin graph once — see README).
+    // 升级 tsdown 前必读本注：任何版本升级后跑 `pnpm run verify`——
+    // 冒烟会真实执行 client.js 工厂，banner/footer 若被新版丢弃会当场红。
     banner: 'window.__ModuleLoader__.load({ id: "dsh-explorer", factory: (require) => { var module = { exports: {} }; var exports = module.exports;',
     footer: 'return module.exports; } });',
   },

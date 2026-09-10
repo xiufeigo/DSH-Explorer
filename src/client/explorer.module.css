@@ -83,10 +83,6 @@ div[style*="grid-template-columns"]:has(.dshx-root) > [data-side] {
 .dshx-tab-preview { opacity: 0.75; font-size: 10px; border: 1px solid var(--dshx-border); border-radius: 4px; padding: 0 4px; }
 
 /* ── Panel body / tool row ───────────────────────────────────────────────── */
-.dshx-panel-header {
-  display: flex; align-items: center; gap: 8px; padding: 8px 10px;
-  border-bottom: 1px solid var(--dshx-border); flex: none;
-}
 .dshx-panel-title { font-weight: 600; font-size: 13px; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dshx-btn {
   appearance: none; border: 1px solid var(--dshx-border); border-radius: 6px;
@@ -97,7 +93,6 @@ div[style*="grid-template-columns"]:has(.dshx-root) > [data-side] {
 .dshx-btn:hover { border-color: var(--dshx-border2); background: var(--dshx-layer2); }
 .dshx-btn:disabled { opacity: 0.5; cursor: default; }
 .dshx-btn.primary { background: var(--dshx-accent); border-color: var(--dshx-accent); color: #fff; }
-.dshx-btn.danger { color: var(--dshx-error); }
 .dshx-btn.small { padding: 2px 8px; font-size: 11px; }
 .dshx-seg {
   display: inline-flex; border: 1px solid var(--dshx-border); border-radius: 6px; overflow: hidden;
@@ -110,6 +105,7 @@ div[style*="grid-template-columns"]:has(.dshx-root) > [data-side] {
 .dshx-seg button.active { background: var(--dshx-layer2); color: var(--dshx-text); font-weight: 600; }
 .dshx-empty { color: var(--dshx-text2); padding: 24px 16px; text-align: center; }
 .dshx-error { color: var(--dshx-error); padding: 16px; white-space: pre-wrap; word-break: break-all; }
+.dshx-error .dshx-error-detail { display: block; margin-top: 6px; font-size: 12px; color: var(--dshx-text2); }
 .dshx-muted { color: var(--dshx-text2); font-size: 12px; }
 .dshx-spin { animation: dshx-rotate 0.9s linear infinite; display: inline-block; }
 @keyframes dshx-rotate { to { transform: rotate(360deg); } }
@@ -444,8 +440,7 @@ div:has(> [data-slot="sidebar.footer.action"]):not(:has(button)):not(:has(a)):no
 }
 .dshx-tree-row.dir { height: 34px; }
 .dshx-tree-row.file { height: 32px; }
-.dshx-tree-row:hover,
-.dshx-tree-row.selected {
+.dshx-tree-row:hover {
   background: var(--dsw-alias-interactive-bg-hover, var(--dshx-layer2));
 }
 /* 16px glyph slot + 4px title gap (22px indent per level via paddingLeft). */
@@ -822,6 +817,14 @@ body[data-ds-dark-theme] .dshx-menu-item:hover { background: rgba(255, 255, 255,
   color: var(--dsw-alias-label-secondary, #62626b); font-size: 16px; line-height: 1;
 }
 .dshx-term-plus:hover { background: var(--dsw-alias-interactive-bg-hover, #ececee); }
+/* 输出过快丢帧的轻提示条（宿主 overflow 事件），浮在终端区顶部。 */
+.dshx-term-overflow {
+  position: absolute; z-index: 6; top: 6px; left: 50%; transform: translateX(-50%);
+  padding: 2px 10px; border-radius: 6px; pointer-events: none;
+  background: var(--dsw-alias-bg-layer-2, #ececee);
+  color: var(--dsw-alias-label-secondary, #62626b);
+  font-size: 11px; white-space: nowrap; opacity: 0.92;
+}
 .dshx-term-body { flex: 1 1 auto; min-height: 0; position: relative; }
 .dshx-term-view { position: absolute; inset: 0 8px 8px; }
 .dshx-term-view[hidden] { display: none !important; }

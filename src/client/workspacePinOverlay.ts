@@ -85,6 +85,7 @@ function rowTitle(row: Element): string | undefined {
 }
 
 interface DragRowInfo {
+  el: HTMLElement
   id: string
   top: number
   bottom: number
@@ -183,6 +184,14 @@ export function installWorkspacePinOverlay(faces: WorkspacePinOverlayFaces): () 
   }
 
   function placeIndicator(current: DragSession, pointerY: number): void {
+    // 拖拽期间侧栏可能滚动，行几何逐次重测，不用拖拽开始时的快照。
+    for (const row of current.rows) {
+      const rect = row.el.getBoundingClientRect()
+      row.top = rect.top
+      row.bottom = rect.bottom
+      row.left = rect.left
+      row.width = rect.width
+    }
     let hit: { row: DragRowInfo; before: boolean } | null = null
     for (const row of current.rows) {
       if (pointerY >= row.top && pointerY <= row.bottom) {
@@ -261,7 +270,7 @@ export function installWorkspacePinOverlay(faces: WorkspacePinOverlayFaces): () 
       if (id === null || id === start.id) continue
       const rect = row.getBoundingClientRect()
       if (rect.height <= 0) continue
-      rows.push({ id, top: rect.top, bottom: rect.bottom, left: rect.left, width: rect.width })
+      rows.push({ el: row, id, top: rect.top, bottom: rect.bottom, left: rect.left, width: rect.width })
     }
     if (rows.length === 0) {
       candidate = null

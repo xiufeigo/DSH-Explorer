@@ -123,8 +123,15 @@ export async function openFileTab(
   name: string,
   kind: ExplorerTabKind,
 ): Promise<void> {
-  const tab = store.openTab({ sessionId: sessionId ?? '', path, name, kind })
-  if (!tab.loading) return // Already open with content.
+  const sid = sessionId ?? ''
+  // 先查已有 tab：加载在途去重；错误/空内容允许重试读取
+  // （旧实现一次失败后同路径点击永远只聚焦旧错误，须手动关 tab）。
+  const existing = store.sessionTabs(sid).find(tab => tab.path === path && tab.kind === kind)
+  if (existing !== undefined && existing.loading) return
+  const retry = existing !== undefined && (existing.error !== null || existing.content === '')
+  const tab = store.openTab({ sessionId: sid, path, name, kind })
+  if (!retry && existing !== undefined) return // 已有内容：仅激活聚焦
+  if (retry) store.patchTab(tab.id, { loading: true, error: null })
   // 大文件读取显式放宽超时（默认 15s 会误杀）
   const res = await rpc<FsReadResult>(sessionId, 'fs.read', { path }, { timeoutMs: 30_000 })
   if (res.error !== undefined) {
@@ -138,6 +145,8 @@ export async function openFileTab(
     truncated: res.truncated === true,
     // 记录磁盘基准版本，供编辑器保存时做 CAS（旧宿主缺失时为 null → 不做 CAS）
     baseVersion: res.version ?? null,
+    // 记录磁盘基准大小：文件跟随首探测的已知指纹（见 fileFollow 的 known）
+    baseSize: typeof res.size === 'number' ? res.size : null,
   })
 }
 

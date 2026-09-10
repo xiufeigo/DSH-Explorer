@@ -6,7 +6,7 @@
 import { useEffect, useSyncExternalStore } from 'react'
 
 export type ExplorerTabKind = 'edit' | 'preview'
-export type ExplorerPage = 'review' | 'context' | 'subagents' | 'sources'
+export type ExplorerPage = 'review' | 'context' | 'sources'
 export type ReviewMode = 'git' | 'last' | 'branch'
 
 export interface FileTab {
@@ -25,6 +25,9 @@ export interface FileTab {
   /** 打开/载入时记录的磁盘基准版本（Host fs.read 的 version，可能缺失）。
    *  保存时作为 `expected` 传给 fs.write 做 CAS，防止盲覆盖外部改动。 */
   baseVersion?: string | null
+  /** 打开/载入时记录的磁盘大小（fs.read 的 size）：与 baseVersion 一起构成
+   *  文件跟随首探测的已知指纹（version 缺失的旧宿主靠 size 比对，见 fileFollow）。 */
+  baseSize?: number | null
 }
 
 export interface TermTab {
@@ -32,6 +35,8 @@ export interface TermTab {
   ptyId: string | null
   title: string
   error: string | null
+  /** 宿主 overflow 事件累计丢弃的输出帧数（>0 时终端面板顶部显示轻提示）。 */
+  dropped: number
 }
 
 export interface TermBag {
@@ -56,7 +61,6 @@ export interface ExplorerStore {
   /** Floating summary window while the column is narrow. */
   summaryFloat: boolean
   reviewMode: ReviewMode
-  subagentId: string | null
   extraPages: ExplorerPage[]
   /** ExplorerPage | a file tab id（全局最近一次激活；渲染请用 activeFor） */
   active: string
@@ -74,7 +78,7 @@ export interface ExplorerStore {
   /** 该会话自己的文件 tab（按打开会话过滤，互不可见）。 */
   sessionTabs(sessionId: string): FileTab[]
   openTab(input: { sessionId: string; path: string; name: string; kind: ExplorerTabKind }): FileTab
-  openPage(page: ExplorerPage, opts?: { reviewMode?: ReviewMode; subagentId?: string | null }): void
+  openPage(page: ExplorerPage, opts?: { reviewMode?: ReviewMode }): void
   closePage(page: ExplorerPage): void
   activate(id: string): void
   closeTab(id: string): void
@@ -82,7 +86,6 @@ export interface ExplorerStore {
   setPanelOpen(open: boolean): void
   /** 右栏开合按会话记忆：显式动作才写，探针同步不写。 */
   setPanelIntent(open: boolean, sessionId?: string): void
-  markPanelIntent(open: boolean, sessionId?: string): void
   setOverlayOpen(open: boolean): void
   setFilesMode(active: boolean): void
   setReviewMode(mode: ReviewMode): void
@@ -95,6 +98,8 @@ export interface ExplorerStore {
   addTermTab(sessionId: string): TermTab
   closeTermTab(sessionId: string, localId: string): void
   setTermActive(sessionId: string, localId: string): void
+  /** 宿主 overflow 事件上报：累计丢弃帧数（仅增长，回 0 清除提示）。 */
+  setTermDropped(sessionId: string, localId: string, dropped: number): void
   /** Re-render after in-place TermTab patches (pty id / title / error). */
   touch(): void
   patchTab(id: string, patch: Partial<FileTab>): void
@@ -162,6 +167,26 @@ export function createExplorerStore(): ExplorerStore {
     for (const listener of listeners) listener()
   }
 
+  /** 右栏开合意图落库（内部）：重复打开时删除重加刷新位置（LRU），
+   *  保证保存时 slice(-50) 截掉的真是最久未活跃的会话。 */
+  function markPanelIntent(open: boolean, sessionId?: string): void {
+    const target = sessionId ?? store.currentSessionId
+    if (target === undefined || target === null || target.length === 0) return
+    let changed = false
+    if (open) {
+      // 重建 Set 以便保持插入顺序（保存时取最近 50 个）
+      const next = readPanelSessions()
+      if (!next.has(target)) changed = true
+      else next.delete(target)
+      next.add(target)
+      savePanelSessions(next)
+    } else {
+      const next = readPanelSessions()
+      if (next.delete(target)) { savePanelSessions(next); changed = true }
+    }
+    if (changed) notify()
+  }
+
   const store: ExplorerStore = {
     version: 0,
     panelOpen: false,
@@ -172,7 +197,6 @@ export function createExplorerStore(): ExplorerStore {
     terminalOn: false,
     terminalHeight: readTermHeight(),
     reviewMode: 'git',
-    subagentId: null,
     extraPages: [],
     active: 'review',
     defaultActive: 'review',
@@ -196,22 +220,6 @@ export function createExplorerStore(): ExplorerStore {
       return this.tabs.filter(tab => tab.sessionId === sessionId)
     },
 
-    markPanelIntent(open, sessionId) {
-      const target = sessionId ?? this.currentSessionId
-      if (target === undefined || target === null || target.length === 0) return
-      let changed = false
-      if (open) {
-        // 重建 Set 以便保持插入顺序（保存时取最近 50 个）
-        const next = readPanelSessions()
-        if (!next.has(target)) { next.add(target); changed = true }
-        savePanelSessions(next)
-      } else {
-        const next = readPanelSessions()
-        if (next.delete(target)) { savePanelSessions(next); changed = true }
-      }
-      if (changed) notify()
-    },
-
     openTab(input) {
       const existing = this.tabs.find(tab =>
         tab.sessionId === input.sessionId && tab.path === input.path && tab.kind === input.kind)
@@ -219,7 +227,7 @@ export function createExplorerStore(): ExplorerStore {
         this.active = existing.id
         sessionActive.set(input.sessionId, existing.id)
         this.panelOpen = true
-        this.markPanelIntent(true, input.sessionId)
+        markPanelIntent(true, input.sessionId)
         notify()
         return existing
       }
@@ -235,28 +243,26 @@ export function createExplorerStore(): ExplorerStore {
         loading: true,
         error: null,
         baseVersion: null,
+        baseSize: null,
       }
       this.tabs = [...this.tabs, tab]
       this.active = tab.id
       sessionActive.set(input.sessionId, tab.id)
       this.panelOpen = true
-      this.markPanelIntent(true, input.sessionId)
+      markPanelIntent(true, input.sessionId)
       notify()
       return tab
     },
 
     openPage(page, opts) {
-      if (page === 'subagents' || page === 'sources') {
+      if (page === 'sources') {
         if (!this.extraPages.includes(page)) this.extraPages = [...this.extraPages, page]
       }
       if (opts?.reviewMode !== undefined) this.reviewMode = opts.reviewMode
-      if (opts !== undefined && Object.prototype.hasOwnProperty.call(opts, 'subagentId')) {
-        this.subagentId = opts.subagentId ?? null
-      }
       this.active = page
       this.panelOpen = true
       if (this.currentSessionId !== null) sessionActive.set(this.currentSessionId, page)
-      this.markPanelIntent(true)
+      markPanelIntent(true)
       notify()
     },
 
@@ -266,7 +272,6 @@ export function createExplorerStore(): ExplorerStore {
       for (const [session, value] of sessionActive) {
         if (value === page) sessionActive.delete(session)
       }
-      if (page === 'subagents') this.subagentId = null
       notify()
     },
 
@@ -299,7 +304,7 @@ export function createExplorerStore(): ExplorerStore {
     },
 
     setPanelIntent(open, sessionId) {
-      this.markPanelIntent(open, sessionId)
+      markPanelIntent(open, sessionId)
     },
 
     setOverlayOpen(open) {
@@ -359,6 +364,7 @@ export function createExplorerStore(): ExplorerStore {
         ptyId: null,
         title: '终端',
         error: null,
+        dropped: 0,
       }
       bag.tabs = [...bag.tabs, tab]
       bag.active = tab.localId
@@ -376,6 +382,13 @@ export function createExplorerStore(): ExplorerStore {
 
     setTermActive(sessionId, localId) {
       this.termBag(sessionId).active = localId
+      notify()
+    },
+
+    setTermDropped(sessionId, localId, dropped) {
+      const tab = this.termBag(sessionId).tabs.find(t => t.localId === localId)
+      if (tab === undefined || tab.dropped === dropped) return
+      tab.dropped = Math.max(0, dropped)
       notify()
     },
 

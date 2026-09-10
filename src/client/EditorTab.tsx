@@ -8,6 +8,7 @@ import { CodeView, gitStats } from './CodeView'
 import { openWithSystem } from './chatFileOpen'
 import { useExternalFollow } from './fileFollow'
 import { renderMarkdown } from './Markdown'
+import { MdErrorBoundary } from './MdErrorBoundary'
 import { openFileTab, rpc } from './rpc'
 import type { ExplorerStore, FileTab } from './store'
 
@@ -19,10 +20,11 @@ function isMarkdown(name: string): boolean {
 }
 
 function isHtml(name: string): boolean {
-  return /\.(html?|htm)$/i.test(name)
+  return /\.(html?)$/i.test(name)
 }
 
-function canPreview(name: string): boolean {
+/** 是否支持右侧预览（md / html）：编辑器与文件树右键共用同一口径。 */
+export function canPreview(name: string): boolean {
   return isMarkdown(name) || isHtml(name)
 }
 
@@ -134,14 +136,11 @@ function EditPane({
 }): JSX.Element {
   const gutterRef = useRef<HTMLPreElement>(null)
   const areaRef = useRef<HTMLTextAreaElement>(null)
-  const lineCount = useMemo(() => {
-    if (value.length === 0) return 1
-    let count = 1
-    for (let i = 0; i < value.length; i++) {
-      if (value[i] === '\n') count++
-    }
-    return count
-  }, [value])
+  // split 由引擎优化，替代逐字符循环（接近 2MB 上限的文件每击键省一次 O(n) 扫描）
+  const lineCount = useMemo(
+    () => (value.length === 0 ? 1 : value.split('\n').length),
+    [value],
+  )
   const numbers = useMemo(
     () => Array.from({ length: lineCount }, (_, index) => String(index + 1)).join('\n'),
     [lineCount],
@@ -171,7 +170,6 @@ function EditPane({
         value={value}
         spellCheck={false}
         wrap="off"
-        readOnly={loading}
         onChange={event => onChange(event.target.value)}
         onKeyDown={onKeyDown}
         onScroll={syncGutter}
@@ -182,6 +180,8 @@ function EditPane({
 }
 
 export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: string; store: ExplorerStore }): JSX.Element {
+  // ExplorerPanel 以 key={tab.id} 挂载本组件：切 tab 整体重挂载，per-tab 状态
+  // 天然隔离（原先手写的 [tab.id] 重置状态机已删，脏草稿经卸载兜底 flush 落库）。
   const [value, setValue] = useState(tab.content)
   const [mode, setMode] = useState<'view' | 'edit'>('view')
   const [saving, setSaving] = useState(false)
@@ -190,13 +190,13 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
   const [patch, setPatch] = useState<string | null>(null)
   const [untracked, setUntracked] = useState(false)
   const [staleDisk, setStaleDisk] = useState<string | null>(null)
-  const loadedOnce = useRef(false)
-  /** 外部修改提示条对应内容的磁盘版本号（载入最新版本时写回基准）。 */
+  /** 外部修改提示条对应内容的磁盘版本/大小（载入最新版本时写回基准）。 */
   const staleVersionRef = useRef<string | null>(null)
+  const staleSizeRef = useRef<number | null>(null)
   /** 击键防抖：脏标立即入库，正文延迟写入（见 onChange / flushContent）。 */
   const flushTimer = useRef<{ id: string; content: string; timer: number } | null>(null)
 
-  /** 立即把防抖中的正文写入 store（保存 / 切走 / 卸载前调用，草稿不丢）。 */
+  /** 立即把防抖中的正文写入 store（保存 / 卸载前调用，草稿不丢）。 */
   const flushContent = useCallback(() => {
     const pending = flushTimer.current
     if (pending === null) return
@@ -205,59 +205,50 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
     store.patchTab(pending.id, { content: pending.content })
   }, [store])
 
-  // 卸载兜底：组件移除前把未落库的正文写回
+  // 卸载兜底：组件移除（切 tab / 切页面）前把未落库的正文写回
   useEffect(() => () => { flushContent() }, [flushContent])
 
+  // store 侧内容更新（初次加载完成 / 外部跟随 / 载入最新）同步进输入框；
+  // dirty 期间以输入框为准，绝不回写。
   useEffect(() => {
-    if (!tab.loading && !loadedOnce.current && tab.content !== value) {
-      setValue(tab.content)
-      loadedOnce.current = true
-    } else if (!tab.loading && !tab.dirty && tab.content !== value) {
-      setValue(tab.content)
-    }
+    if (!tab.loading && !tab.dirty && tab.content !== value) setValue(tab.content)
   }, [tab.loading, tab.dirty, tab.content, value])
-
-  useEffect(() => {
-    // 切 tab：旧 tab 防抖中的正文先落库，草稿不丢
-    flushContent()
-    loadedOnce.current = false
-    setMode('view')
-    setPatch(null)
-    setUntracked(false)
-    setValue(tab.content)
-    setSaveError(null)
-    setDesktopError(null)
-    setStaleDisk(null)
-    staleVersionRef.current = null
-  }, [tab.id, flushContent])
 
   // 外部修改跟随：查看态/干净编辑态自动套用；有未保存修改只提示不强改。
   const dirtyRef = useRef(tab.dirty)
   dirtyRef.current = tab.dirty
   const followExternalChange = useCallback(() => {
     // 大文件读取显式放宽超时（默认 15s 会误杀）
-    void rpc<{ content?: string; version?: string }>(sessionId, 'fs.read', { path: tab.path }, { timeoutMs: 30_000 }).then(res => {
+    void rpc<{ content?: string; version?: string; size?: number }>(sessionId, 'fs.read', { path: tab.path }, { timeoutMs: 30_000 }).then(res => {
       if (res.error !== undefined || typeof res.content !== 'string') return
       const version = typeof res.version === 'string' ? res.version : null
+      const size = typeof res.size === 'number' ? res.size : null
       if (dirtyRef.current) {
         staleVersionRef.current = version // 「载入最新版本」时用它重建基准
+        staleSizeRef.current = size
         setStaleDisk(res.content) // 提示条按钮主动载入，绝不覆盖用户正在写的内容
         return
       }
       setValue(res.content)
-      store.patchTab(tab.id, { content: res.content, error: null, baseVersion: version })
+      store.patchTab(tab.id, { content: res.content, error: null, baseVersion: version, baseSize: size })
     })
   }, [sessionId, tab.path, tab.id, store])
   const rebase = useExternalFollow({
     sessionId,
     path: tab.path,
-    paused: tab.loading || tab.dirty || saving,
+    // 脏编辑不暂停轮询：指纹探测（fs.stat）继续，外部改动才能弹「文件已在磁盘上被修改」提示条
+    paused: tab.loading || saving,
     visible: store.panelOpen || store.overlayOpen, // 列收起时宿主仍挂载本组件，必须停轮询
+    // 已知指纹（打开/上次同步时记录）：重挂载后首探测与其比对，切走期间的外部变化不吞
+    known: { version: tab.baseVersion, size: tab.baseSize },
     onChanged: followExternalChange,
   })
 
   useEffect(() => {
     if (tab.loading) return
+    // 脏编辑期间不拉 diff：视图此时不展示（viewPatch 为 null），
+    // 保存 / 载入最新后 content 变化会自然重拉。
+    if (tab.dirty) return
     let cancelled = false
     // 大文件/大仓库 diff 放宽超时
     void rpc<{ patch?: string | null; untracked?: boolean }>(sessionId, 'git.fileDiff', {
@@ -269,10 +260,11 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
       setPatch(typeof res.patch === 'string' && res.patch.length > 0 ? res.patch : null)
     })
     return () => { cancelled = true }
-  }, [sessionId, tab.path, tab.loading, tab.content])
+  }, [sessionId, tab.path, tab.loading, tab.dirty, tab.content])
 
   const save = useCallback(async () => {
     // 外部已修改提示条仍在：先确认，避免盲覆盖冲掉 agent 刚写的内容
+    let overwrite = false
     if (staleDisk !== null) {
       let confirmed = true
       try {
@@ -281,31 +273,43 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
         /* 受限环境 confirm 不可用：视为确认，不把保存通道堵死 */
       }
       if (!confirmed) return
+      overwrite = true
     }
     flushContent() // 防抖中的正文先落库，保存失败切走时草稿也不丢
     setSaving(true)
     setSaveError(null)
     const args: Record<string, unknown> = { path: tab.path, content: value }
-    // CAS：带上打开/载入时的基准版本，版本不匹配由 Host 拒绝并提示刷新
-    if (tab.baseVersion !== null && tab.baseVersion !== undefined) args.expected = tab.baseVersion
+    // CAS：无已知外部改动时带基准版本，版本不符由新 Host 拒绝（旧 Host 忽略
+    // expected 照常写）。用户已在提示条上确认覆盖 → 不带 expected 直接写，
+    // 兑现对话框「保存将覆盖外部改动」的承诺。
+    if (!overwrite && tab.baseVersion !== null && tab.baseVersion !== undefined) args.expected = tab.baseVersion
     const res = await rpc<{ ok?: boolean; version?: string }>(sessionId, 'fs.write', args)
     setSaving(false)
-    if (res.error !== undefined) {
-      setSaveError(res.error)
+    if (res.ok !== true || res.error !== undefined) {
+      const raw = typeof res.error === 'string' && res.error.length > 0 ? res.error : '保存失败'
+      // 版本冲突（新 Host 的 CAS 拒绝，error 带 seam 文案）：映射成中文，并
+      // 立即重读磁盘内容让「载入最新版本 / 忽略」提示条当场出现（不等下个轮询 tick）
+      if (/file changed since it was read/i.test(raw)) {
+        setSaveError('文件已在磁盘上被修改，本次保存未执行')
+        followExternalChange()
+        return
+      }
+      setSaveError(raw)
       return
     }
     staleVersionRef.current = null
     store.patchTab(tab.id, {
       dirty: false,
       content: value,
-      // 保存成功：响应带回新版本则作为新基准；没带回则置空（旧宿主不做 CAS）
+      // 保存成功：响应带回新版本则作为新基准；没带回则置空（旧宿主不做 CAS）。
+      // baseSize 保留旧值作比对锚点：与磁盘不符时下次重挂载会补一次重读自愈。
       baseVersion: typeof res.version === 'string' ? res.version : null,
     })
     // 写盘成功：基准重建，避免把「自己的保存」误判成外部修改；
     // 挂起的磁盘提示也一并撤销。
     rebase()
     setStaleDisk(null)
-  }, [sessionId, tab.id, tab.path, tab.baseVersion, value, store, rebase, staleDisk, flushContent])
+  }, [sessionId, tab.id, tab.path, tab.baseVersion, value, store, rebase, staleDisk, flushContent, followExternalChange])
 
   const onKeyDown = useCallback((event: KeyboardEvent<HTMLTextAreaElement>) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
@@ -369,7 +373,11 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
           <button
             type="button"
             className="dshx-btn small"
-            onClick={() => { setStaleDisk(null); staleVersionRef.current = null }}
+            onClick={() => {
+              setStaleDisk(null)
+              staleVersionRef.current = null
+              staleSizeRef.current = null
+            }}
           >
             忽略
           </button>
@@ -377,11 +385,26 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
             type="button"
             className="dshx-btn small primary"
             onClick={() => {
+              // 载入最新 = 丢弃未保存修改，先确认（受限环境 confirm 不可用时按项目惯例视为确认）
+              let confirmed = true
+              try {
+                confirmed = window.confirm('载入最新版本将丢弃当前未保存的修改。确定继续？')
+              } catch {
+                /* 受限环境 confirm 不可用：视为确认，不把通道堵死 */
+              }
+              if (!confirmed) return
               setValue(staleDisk)
-              // 内容换成磁盘最新的同时重建版本基准
-              store.patchTab(tab.id, { content: staleDisk, error: null, baseVersion: staleVersionRef.current })
+              // 内容换成磁盘最新的同时重建版本基准；内容已与磁盘一致，脏标一并复位
+              store.patchTab(tab.id, {
+                content: staleDisk,
+                error: null,
+                baseVersion: staleVersionRef.current,
+                baseSize: staleSizeRef.current,
+                dirty: false,
+              })
               setStaleDisk(null)
               staleVersionRef.current = null
+              staleSizeRef.current = null
               rebase()
             }}
           >
@@ -422,6 +445,18 @@ export function EditorTab({ tab, sessionId, store }: { tab: FileTab; sessionId: 
   )
 }
 
+/**
+ * Markdown 预览子树：解析挪进子组件，MdErrorBoundary 才兜得住渲染期抛错——
+ * 边界只能捕获子组件的错误，若 useMemo 留在 PreviewTab 本体里执行，
+ * 包在内部的边界对它无效。
+ */
+function MarkdownPreview({ content }: { content: string }): JSX.Element {
+  // 解析按内容 memo：store 每次通知都会重渲染本组件，
+  // 裸调 renderMarkdown 会把整篇文档同步重解析（大文档数百毫秒级 × 连续多次通知）。
+  const html = useMemo(() => renderMarkdown(content), [content])
+  return <div className="dshx-preview dshx-scroll" dangerouslySetInnerHTML={{ __html: html }} />
+}
+
 export function PreviewTab({ tab, sessionId, store }: { tab: FileTab; sessionId: string; store: ExplorerStore }): JSX.Element {
   const [content, setContent] = useState(tab.content)
   const [desktopError, setDesktopError] = useState<string | null>(null)
@@ -430,36 +465,42 @@ export function PreviewTab({ tab, sessionId, store }: { tab: FileTab; sessionId:
     if (!tab.loading) setContent(tab.content)
   }, [tab.loading, tab.content])
 
-  // markdown 解析按内容 memo：store 每次通知都会重渲染本组件，
-  // 裸调 renderMarkdown 会把整篇文档同步重解析（大文档数百毫秒级 × 连续多次通知）。
-  const markdownHtml = useMemo(
-    () => (isMarkdown(tab.name) ? renderMarkdown(content) : ''),
-    [tab.name, content],
-  )
-
   // 外部更新跟随：fileFollow 每 2s 探指纹（fs.stat，失败回退 fs.list 父目录，
   // 与宿主是否重启无关），变化就静默重读。预览只读，不会和编辑冲突。
   const pullLatest = useCallback(async () => {
     // 大文件读取显式放宽超时（默认 15s 会误杀）
-    const read = await rpc<{ content?: string }>(sessionId, 'fs.read', { path: tab.path }, { timeoutMs: 30_000 })
+    const read = await rpc<{ content?: string; version?: string; size?: number }>(sessionId, 'fs.read', { path: tab.path }, { timeoutMs: 30_000 })
     if (read.error !== undefined || typeof read.content !== 'string') return
-    store.patchTab(tab.id, { content: read.content, error: null })
+    store.patchTab(tab.id, {
+      content: read.content,
+      error: null,
+      // 基准同步前移：重挂载后首探测的 known 比对以此为准
+      baseVersion: typeof read.version === 'string' ? read.version : null,
+      baseSize: typeof read.size === 'number' ? read.size : null,
+    })
     setContent(read.content)
   }, [sessionId, tab.id, tab.path, store])
   useExternalFollow({
     sessionId, path: tab.path, paused: tab.loading,
     visible: store.panelOpen || store.overlayOpen, // 列收起时停轮询
+    known: { version: tab.baseVersion, size: tab.baseSize }, // 重挂载首探测比对，切走期间的变化不吞
     onChanged: () => { void pullLatest() },
   })
 
   const reload = useCallback(() => {
-    void rpc<{ content?: string }>(sessionId, 'fs.read', { path: tab.path }, { timeoutMs: 30_000 }).then(res => {
-      if (res.error === undefined && res.content !== undefined) {
-        store.patchTab(tab.id, { content: res.content, error: null })
-        setContent(res.content)
-      } else if (res.error !== undefined) {
+    void rpc<{ content?: string; version?: string; size?: number }>(sessionId, 'fs.read', { path: tab.path }, { timeoutMs: 30_000 }).then(res => {
+      if (res.error !== undefined) {
         store.patchTab(tab.id, { error: res.error })
+        return
       }
+      if (typeof res.content !== 'string') return
+      store.patchTab(tab.id, {
+        content: res.content,
+        error: null,
+        baseVersion: typeof res.version === 'string' ? res.version : null,
+        baseSize: typeof res.size === 'number' ? res.size : null,
+      })
+      setContent(res.content)
     })
   }, [sessionId, tab.id, tab.path, store])
 
@@ -485,10 +526,11 @@ export function PreviewTab({ tab, sessionId, store }: { tab: FileTab; sessionId:
       {desktopError !== null && <div className="dshx-error" style={{ padding: 6, flex: 'none' }}>{desktopError}</div>}
       {isMarkdown(tab.name)
         ? (
-            <div
-              className="dshx-preview dshx-scroll"
-              dangerouslySetInnerHTML={{ __html: markdownHtml }}
-            />
+            // 错误边界按内容 key：崩过一次的预览在文件更新（跟随重读 / 手动重载）
+            // 时重新挂载、用新内容重试，而不是一直卡在错误态。
+            <MdErrorBoundary key={content} title="Markdown 预览渲染失败">
+              <MarkdownPreview content={content} />
+            </MdErrorBoundary>
           )
         : isHtml(tab.name)
           ? <iframe className="dshx-preview-frame" title={tab.name} sandbox="" srcDoc={content} />

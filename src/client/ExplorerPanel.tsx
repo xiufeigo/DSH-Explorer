@@ -10,11 +10,9 @@ import { ContextView } from './ContextView'
 import { EditorTab, PreviewTab } from './EditorTab'
 import { ReviewView } from './ReviewView'
 import { SourcesView } from './SourcesView'
-import { SubagentsView } from './SubagentsView'
 import { readPanelIntent, useExplorer, type ExplorerPage, type ExplorerStore } from './store'
 import { closeNarrowOverlay, narrowNow } from './narrowPanel'
 import { getAttachedPanelActions, maybePersistObservedWidth, readDetailsWidth } from './detailsWidth'
-import type { CatalogActions } from './faces'
 
 export interface LayoutFace {
   openDetails(): void
@@ -22,18 +20,11 @@ export interface LayoutFace {
   toggleSidebar(): void
 }
 
-export interface SessionsFace {
-  refreshSubagents?(id: string): Promise<void>
-  setSubagentCatalogOpen?(id: string, open: boolean): void
-}
-
 export interface ExplorerPanelProps {
   sessionId: string
   useProjection?: (key: string) => any
   useSessions?: (selector: (state: any) => unknown) => any
   store: ExplorerStore
-  refreshSubagents: CatalogActions['refreshSubagents']
-  setSubagentCatalogOpen: CatalogActions['setSubagentCatalogOpen']
   /** 宿主的开列动作：会话切换后按用户意图自动恢复右栏。 */
   openDetails?: () => void
 }
@@ -41,7 +32,6 @@ export interface ExplorerPanelProps {
 const PAGE_LABEL: Record<ExplorerPage, string> = {
   review: '审查',
   context: '上下文',
-  subagents: '子智能体',
   sources: '来源',
 }
 
@@ -58,7 +48,7 @@ function confirmCloseDirtyTab(name: string): boolean {
 const PAGE_IDS: ReadonlySet<string> = new Set(Object.keys(PAGE_LABEL))
 
 export function ExplorerPanel({
-  sessionId, useProjection, useSessions, store: storeHandle, refreshSubagents, setSubagentCatalogOpen, openDetails,
+  sessionId, useProjection, useSessions, store: storeHandle, openDetails,
 }: ExplorerPanelProps): JSX.Element {
   const store = useExplorer(storeHandle)
 
@@ -154,6 +144,9 @@ export function ExplorerPanel({
         if (persistTimer !== 0) window.clearTimeout(persistTimer)
         persistTimer = window.setTimeout(() => {
           persistTimer = 0
+          // overlay 替换模式下 details 列被 CSS 拉满全宽，实测值不是列宽——
+          // 不落盘（否则窄视口的整屏宽度会被当成记忆宽度存下来）。
+          if (store.overlayOpen || narrowNow()) return
           maybePersistObservedWidth(probe.offsetWidth)
         }, 350)
       }
@@ -268,21 +261,15 @@ export function ExplorerPanel({
         <ReviewView sessionId={sessionId} store={storeHandle} visible={active === 'review'} />
       </div>
       {active === 'context' && <ContextView sessionId={sessionId} useProjection={useProjection} />}
-      {active === 'subagents' && (
-        <SubagentsView
-          sessionId={sessionId}
-          store={store}
-          useSessions={useSessions}
-          refreshSubagents={refreshSubagents}
-          setSubagentCatalogOpen={setSubagentCatalogOpen}
-        />
-      )}
       {active === 'sources' && <SourcesView sessionId={sessionId} />}
+      {/* key 按 tab 隔离实例：切 tab 整体重挂载，替代 EditorTab 内手写的
+          [tab.id] 重置状态机（脏草稿经卸载兜底 flush 落库，切走期间的磁盘
+          变化经 fileFollow 的 known 指纹比对在重挂载首探测补触发）。 */}
       {activeTab !== undefined && activeTab.kind === 'edit' && (
-        <EditorTab tab={activeTab} sessionId={sessionId} store={store} />
+        <EditorTab key={activeTab.id} tab={activeTab} sessionId={sessionId} store={store} />
       )}
       {activeTab !== undefined && activeTab.kind === 'preview' && (
-        <PreviewTab tab={activeTab} sessionId={sessionId} store={store} />
+        <PreviewTab key={activeTab.id} tab={activeTab} sessionId={sessionId} store={store} />
       )}
     </div>
   )

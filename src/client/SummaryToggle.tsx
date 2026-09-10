@@ -18,8 +18,6 @@ export interface SummaryToggleProps {
   useSessions?: (selector: (state: any) => unknown) => any
   store: ExplorerStore
   openDetails(): void
-  refreshSubagents(id: string): void
-  setSubagentCatalogOpen(id: string, open: boolean): void
 }
 
 function eventInsideSummary(event: Event, btn: HTMLElement | null): boolean {
@@ -31,7 +29,7 @@ function eventInsideSummary(event: Event, btn: HTMLElement | null): boolean {
 }
 
 export function SummaryToggle({
-  sessionId, useSessions, store: storeHandle, openDetails, refreshSubagents, setSubagentCatalogOpen,
+  sessionId, useSessions, store: storeHandle, openDetails,
 }: SummaryToggleProps): JSX.Element {
   const store = useExplorer(storeHandle)
   // 右栏关闭时 ExplorerPanel 不挂载；这里持续回报当前会话，
@@ -128,8 +126,6 @@ export function SummaryToggle({
       sessionId={sessionId}
       store={store}
       openDetails={openDetails}
-      refreshSubagents={refreshSubagents}
-      setSubagentCatalogOpen={setSubagentCatalogOpen}
       useSessions={useSessions}
       onNavigate={() => { if (!wide) store.setSummaryFloat(false) }}
     />

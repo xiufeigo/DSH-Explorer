@@ -1,5 +1,10 @@
 # OpenCode Desktop Notification Sound — Implementation Research
 
+> 姊妹篇（互补，非重复）：`.research/opencode-notification-research.md` 是同一主题的
+> 源码锚定精简版（本地证据克隆指针 + 仓库身份结论 + 第三方插件生态 +
+> 复刻要点清单）；本文是实现深读版（完整 sound.ts 源码、settings-v2 三个
+> 控制器、运行时触发链、CSP issue/PR 分析）。读其一即可，按需互查。
+
 Researched 2026-08-22 from `anomalyco/opencode` branch **`dev`** (commit `e00890c`).
 Corroborated by two independent fetch agents reading raw.githubusercontent.com, github.com file pages,
 the GitHub audio directory listing, issue #11081, PR #11082, and DeepWiki.

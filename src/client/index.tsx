@@ -10,7 +10,7 @@
  *    `sidebar.workspaces` occupant; Workspace disposes it and the native list
  *    returns unchanged.
  *  - `conversation.session.header.utilities`: pinned summary, terminal, details
- *    toggle, conversation outline.
+ *    toggle.
  *  - `settings.plugin.item`: DSH-Explorer card on Settings → Plugins.
  *
  * Host data rides the package-private HTTP RPC route (/dsh-explorer/rpc).
@@ -18,9 +18,8 @@
 
 import { ExplorerPanel } from './ExplorerPanel'
 import { ExplorerSettingsCard } from './ExplorerSettingsCard'
-import { catalogActions, layoutActions } from './faces'
+import { layoutActions } from './faces'
 import { FilesToggle } from './FilesToggle'
-import { MessageRail } from './MessageRail'
 import { PanelToggle } from './PanelToggle'
 import { SidebarFiles } from './SidebarFiles'
 import { SummaryToggle } from './SummaryToggle'
@@ -30,7 +29,7 @@ import { disposeConversationHost } from './conversationHost'
 import { disposeSoundPlayer } from './soundPlayer'
 import { createExplorerStore, type ExplorerStore } from './store'
 import { injectStyles } from './styles'
-import { installChatFileOpen, rememberHostOpenPath, resetHostOpenPath } from './chatFileOpen'
+import { rememberHostOpenPath, rememberRemoteOpenPath, resetHostOpenPath } from './chatFileOpen'
 import { installNarrowOverlay, overlayAwareOpenDetails } from './narrowPanel'
 import {
   installWorkspaceRecencyOrder,
@@ -41,24 +40,6 @@ import { installWorkspacePinOverlay } from './workspacePinOverlay'
 interface SlotsLike {
   inject(name: string, callback: () => unknown): void
   register(options: Record<string, unknown>, component: (props: any) => unknown): unknown
-}
-
-/** 性能诊断：把 >250ms 的长任务打到 console。只读观测，随时可删。 */
-function installLongTaskProbe(): void {
-  if (typeof window === 'undefined' || typeof PerformanceObserver === 'undefined') return
-  const w = window as unknown as { __dshxLongTask?: boolean }
-  if (w.__dshxLongTask === true) return
-  w.__dshxLongTask = true
-  try {
-    const observer = new PerformanceObserver(list => {
-      for (const item of list.getEntries()) {
-        if (item.duration > 250) {
-          console.warn(`[dsh-explorer] 长任务 ${Math.round(item.duration)}ms —— 若切会话仍卡，这就是元凶`, item)
-        }
-      }
-    })
-    observer.observe({ entryTypes: ['longtask'] })
-  } catch { /* 内核不支持就静默 */ }
 }
 
 interface ExplorerClientContext {
@@ -85,7 +66,7 @@ export {
   beginWorkspaceDragHold,
   endWorkspaceDragHold,
 } from './workspaceRecencyOrder'
-export { resetHostOpenPath } from './chatFileOpen'
+export { resetHostOpenPath, openWithSystem } from './chatFileOpen'
 export { installWorkspacePinOverlay } from './workspacePinOverlay'
 
 export function apply(ctx: ExplorerClientContext): void {
@@ -98,7 +79,6 @@ export function apply(ctx: ExplorerClientContext): void {
     resetHostOpenPath()
     resetWorkspaceRecencyOrderForReload()
   }, 'dsh-explorer: host and sound cleanup')
-  installLongTaskProbe()
   if (typeof document !== 'undefined') {
     ctx.effect(() => injectStyles(), 'dsh-explorer: styles')
   }
@@ -107,15 +87,12 @@ export function apply(ctx: ExplorerClientContext): void {
   const layout = layoutActions(ctx.layout)
   // 窄屏下所有「打开右侧栏」入口统一替换主会话区域。
   layout.openDetails = overlayAwareOpenDetails(layout.openDetails, store)
-  const catalog = catalogActions(ctx.sessions)
   rememberHostOpenPath(ctx.workspaces as never)
+  // 0.1.2 起本地 openPath 面删除，改捕远端 `remote.session.openWorkspacePath`。
+  rememberRemoteOpenPath(ctx.get('remote'))
   ctx.effect(
     () => installNarrowOverlay(store, () => ctx.layout.openDetails()),
     'dsh-explorer: narrow overlay',
-  )
-  ctx.effect(
-    () => installChatFileOpen(ctx.workspaces as never, ctx.sessions as never, { ...ctx.layout, openDetails: layout.openDetails }, store),
-    'dsh-explorer: chat file open',
   )
   ctx.effect(
     () => installWorkspaceRecencyOrder({
@@ -160,7 +137,7 @@ export function apply(ctx: ExplorerClientContext): void {
     {
       name: 'details',
       priority: -10,
-      inject: () => ({ store, ...catalog, openDetails: layout.openDetails }),
+      inject: () => ({ store, openDetails: layout.openDetails }),
     },
     ExplorerPanel as never,
   ))
@@ -196,7 +173,7 @@ export function apply(ctx: ExplorerClientContext): void {
       name: 'conversation.session.header.utilities',
       id: 'dsh-explorer-summary',
       order: 10,
-      inject: () => ({ store, ...layout, ...catalog }),
+      inject: () => ({ store, ...layout }),
     },
     SummaryToggle as never,
   ))
@@ -217,10 +194,6 @@ export function apply(ctx: ExplorerClientContext): void {
       inject: () => ({ store, ...layout }),
     },
     PanelToggle as never,
-  ))
-  ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register(
-    { name: 'conversation.session.header.utilities', id: 'dsh-explorer-msg-rail', order: 30 },
-    MessageRail as never,
   ))
 
   try {

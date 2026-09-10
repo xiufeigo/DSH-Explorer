@@ -1,14 +1,9 @@
 /**
- * 上下文视图：顶部 ToDo List，下方为会话概览 + 模型上下文清单。
+ * 上下文视图：上下文使用率 + 会话概览 + 模型上下文清单。
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { isTransientSessionError, rpc } from './rpc'
-
-interface TodoItem {
-  content: string
-  status: string
-}
+import { isTransientSessionError, rpcWithSessionRetry } from './rpc'
 
 interface ManifestSection {
   name: string
@@ -16,7 +11,6 @@ interface ManifestSection {
 }
 
 interface ContextData {
-  todos?: TodoItem[]
   cwd?: string
   preset?: string
   id?: string
@@ -75,9 +69,8 @@ function contextOccupancy(pressure: {
 export function ContextView({ sessionId, useProjection }: { sessionId: string; useProjection?: (key: string) => any }): JSX.Element {
   const [data, setData] = useState<ContextData>({})
   const [error, setError] = useState<string | null>(null)
-  // todo 与 meta 各有独立取号：共用一个序号时，挂载阶段 load() 后紧跟
-  // loadMeta() 会把 todo 的请求序号顶掉，首屏 todo 响应被判过期而丢弃。
-  const todoSeq = useRef(0)
+  // meta 请求取号：session.meta / context.meta 共用一序号，resolve 后序号
+  // 不一致即丢弃（切会话/新一轮刷新时旧响应不得回写）。
   const metaSeq = useRef(0)
   const goalProjection = useProjection !== undefined ? useProjection('goal') : undefined
   const planProjection = useProjection !== undefined ? useProjection('plan') : undefined
@@ -94,23 +87,9 @@ export function ContextView({ sessionId, useProjection }: { sessionId: string; u
     setError(message)
   }
 
-  const load = useCallback(() => {
-    if (typeof document !== 'undefined' && document.hidden) return
-    const my = ++todoSeq.current
-    void rpc<{ todos: TodoItem[] }>(sessionId, 'todo.list').then(todo => {
-      if (my !== todoSeq.current) return
-      if (todo.error !== undefined) {
-        surfaceError(todo.error)
-        return
-      }
-      setError(null)
-      setData(current => ({ ...current, todos: todo.todos ?? [] }))
-    })
-  }, [sessionId])
-
   const loadMeta = useCallback(() => {
     const my = ++metaSeq.current
-    void rpc<{ cwd: string; preset?: string; id: string }>(sessionId, 'session.meta').then(meta => {
+    void rpcWithSessionRetry<{ cwd: string; preset?: string; id: string }>(sessionId, 'session.meta').then(meta => {
       if (my !== metaSeq.current) return
       if (meta.error !== undefined) {
         surfaceError(meta.error)
@@ -119,9 +98,9 @@ export function ContextView({ sessionId, useProjection }: { sessionId: string; u
       setError(null)
       setData(current => ({ ...current, cwd: meta.cwd, preset: meta.preset, id: meta.id }))
     })
-    // assemble() 会拼装全量提示词文本，比较贵：只在挂载和手动刷新时调用，
-    // 不放进轮询里。与 session.meta 共用同一取号即可。
-    void rpc<{ sections: ManifestSection[]; contexts: ManifestSection[]; tools: string[]; variables: string[] }>(sessionId, 'context.meta').then(manifest => {
+    // assemble() 会拼装全量提示词文本，比较贵：与 session.meta 共用同一取号，
+    // 只在挂载 / 回前台 / 轮询 / 手动重试时调用。
+    void rpcWithSessionRetry<{ sections: ManifestSection[]; contexts: ManifestSection[]; tools: string[]; variables: string[] }>(sessionId, 'context.meta').then(manifest => {
       if (my !== metaSeq.current) return
       if (manifest.error !== undefined) {
         surfaceError(manifest.error)
@@ -138,15 +117,17 @@ export function ContextView({ sessionId, useProjection }: { sessionId: string; u
   }, [sessionId])
 
   useEffect(() => {
-    load()
+    // 会话切换：先清空旧会话数据，避免新会话首响应到达前串台显示。
+    setData({})
     loadMeta()
-    const timer = setInterval(load, 6000)
+    // 轮询保持原 6s 节奏，只刷新剩下的会话元数据与上下文清单。
+    const timer = setInterval(loadMeta, 6000)
     // 回前台刷新加 0-300ms 随机 jitter，避免多个组件同刻齐射 RPC
     let visTimer = 0
     const onVis = (): void => {
       if (document.hidden) return
       if (visTimer !== 0) window.clearTimeout(visTimer)
-      visTimer = window.setTimeout(() => { visTimer = 0; load() }, Math.round(Math.random() * 300))
+      visTimer = window.setTimeout(() => { visTimer = 0; loadMeta() }, Math.round(Math.random() * 300))
     }
     document.addEventListener('visibilitychange', onVis)
     return () => {
@@ -154,10 +135,8 @@ export function ContextView({ sessionId, useProjection }: { sessionId: string; u
       if (visTimer !== 0) window.clearTimeout(visTimer)
       document.removeEventListener('visibilitychange', onVis)
     }
-  }, [load, loadMeta])
+  }, [loadMeta])
 
-  const todos = data.todos ?? []
-  const doneCount = todos.filter(todo => todo.status === 'completed').length
   const sections = data.sections ?? []
   const contexts = data.contexts ?? []
   const tools = data.tools ?? []
@@ -171,32 +150,12 @@ export function ContextView({ sessionId, useProjection }: { sessionId: string; u
             <button
               type="button"
               className="dshx-btn small"
-              onClick={() => { setError(null); load(); loadMeta() }}
+              onClick={() => { setError(null); loadMeta() }}
             >
               重试
             </button>
           </div>
         )}
-        {/* ── ToDo ─────────────────────────────────────────────────────────── */}
-        <div className="dshx-section">
-          <div className="dshx-section-title">
-            <span>ToDo</span>
-            <span className="dshx-muted">{doneCount}/{todos.length}</span>
-            <span style={{ flex: 1 }} />
-            <button className="dshx-btn small" onClick={() => { load(); loadMeta() }}>刷新</button>
-          </div>
-          <div className="dshx-section-body">
-            {todos.length === 0
-              ? <div className="dshx-muted">暂无 ToDo（Agent 使用 todo 工具后这里会自动出现）</div>
-              : todos.map((todo, index) => (
-                  <label key={index} className={`dshx-todo-item ${todo.status === 'completed' ? 'done' : ''}`}>
-                    <input type="checkbox" readOnly checked={todo.status === 'completed'} disabled />
-                    <span>{todo.content}</span>
-                  </label>
-                ))}
-          </div>
-        </div>
-
         {/* ── 上下文使用率 ─────────────────────────────────────────────────── */}
         <div className="dshx-section">
           <div className="dshx-section-title">

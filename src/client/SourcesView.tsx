@@ -3,7 +3,7 @@
  */
 
 import { useEffect, useRef, useState } from 'react'
-import { rpc, safeExternalUrl } from './rpc'
+import { rpcWithSessionRetry, safeExternalUrl } from './rpc'
 import type { SourceGroup } from './SummaryCard'
 
 export function SourcesView({ sessionId }: { sessionId: string }): JSX.Element {
@@ -13,17 +13,38 @@ export function SourcesView({ sessionId }: { sessionId: string }): JSX.Element {
   const reqSeq = useRef(0)
 
   useEffect(() => {
+    // 会话切换：清空旧数据，避免新会话首响应到达前显示上一会话的来源。
+    setGroups([])
+    setError(null)
     const load = (): void => {
+      if (typeof document !== 'undefined' && document.hidden) return
       const my = ++reqSeq.current
-      void rpc<{ groups?: SourceGroup[]; error?: string }>(sessionId, 'session.sources').then(res => {
+      // 瞬时错误（会话尚未挂载）由 rpcWithSessionRetry 内部重试，不闪红字。
+      void rpcWithSessionRetry<{ groups?: SourceGroup[]; error?: string }>(sessionId, 'session.sources').then(res => {
         if (my !== reqSeq.current) return
-        if (res.error !== undefined && res.error !== '') setError(res.error)
+        if (res.error !== undefined && res.error !== '') {
+          setError(res.error)
+          return
+        }
+        setError(null)
         setGroups(res.groups ?? [])
       })
     }
     load()
     const timer = setInterval(load, 8000)
-    return () => clearInterval(timer)
+    // 回前台刷新加 0-300ms 随机 jitter，避免多个组件同刻齐射 RPC
+    let visTimer = 0
+    const onVis = (): void => {
+      if (document.hidden) return
+      if (visTimer !== 0) window.clearTimeout(visTimer)
+      visTimer = window.setTimeout(() => { visTimer = 0; load() }, Math.round(Math.random() * 300))
+    }
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      clearInterval(timer)
+      if (visTimer !== 0) window.clearTimeout(visTimer)
+      document.removeEventListener('visibilitychange', onVis)
+    }
   }, [sessionId])
 
   if (error !== null && error !== '') return <div className="dshx-error">{error}</div>
@@ -53,7 +74,7 @@ export function SourcesView({ sessionId }: { sessionId: string }): JSX.Element {
                 <span className={`dshx-file-pane-chevron${expanded ? ' open' : ''}`} />
               )}
             </button>
-            {(expanded || group.pages.length <= 2) && group.pages.map(page => (
+            {(expanded || group.pages.length <= 2) && group.pages.map((page, index) => (
               page.url.length > 0
                 ? (
                   <a
@@ -69,7 +90,7 @@ export function SourcesView({ sessionId }: { sessionId: string }): JSX.Element {
                   </a>
                 )
                 : (
-                  <div key={page.title} className="dshx-source-page">
+                  <div key={`${page.title}#${index}`} className="dshx-source-page">
                     <span className="dshx-source-page-title">{page.title}</span>
                     {page.snippet.length > 0 && <span className="dshx-source-page-snip">{page.snippet}</span>}
                   </div>

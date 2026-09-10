@@ -276,6 +276,134 @@ check(
   t => t.includes('dshx-frontmatter') && t.includes('dshx-tok-fn') && t.includes('<h1>T</h1>'),
 )
 
+// ── P1/P2 性能与健壮性护栏（回归：超长行 35s / 8000 层引用栈溢出 / 深列表挂死）──
+{
+  const t0 = Date.now()
+  const out = renderMarkdown('a'.repeat(100000))
+  check('P1 护栏：100k 字符长行 ~100ms 内', { ms: Date.now() - t0, len: out.length },
+    r => r.ms < 300 && r.len > 0)
+}
+{
+  const t0 = Date.now()
+  let out = ''
+  let threw = false
+  try { out = renderMarkdown('>'.repeat(8000) + ' x') } catch { threw = true }
+  check('P1 护栏：8000 层引用不抛错且有限返回', { threw, ms: Date.now() - t0, len: out.length },
+    r => !r.threw && r.ms < 300 && r.len > 0 && r.len < 100000)
+}
+{
+  const lines = []
+  for (let d = 0; d < 300; d++) lines.push('    '.repeat(d) + '- a')
+  const t0 = Date.now()
+  const out = renderMarkdown(lines.join('\n'))
+  const ulCount = (out.match(/<ul>/g) ?? []).length
+  check('P1 护栏：300 层嵌套列表有限返回（深度封顶）', { ms: Date.now() - t0, ulCount },
+    r => r.ms < 300 && r.ulCount > 0 && r.ulCount <= 100)
+}
+{
+  const t0 = Date.now()
+  const out = renderMarkdown('['.repeat(8000))
+  check('P2 护栏：8000 个未闭合方括号预算内返回', { ms: Date.now() - t0, len: out.length },
+    r => r.ms < 300 && r.len > 0)
+}
+
+// ── B5/B6 回归：自动链接 pass 交叉污染 ──
+check(
+  'B5：www+邮箱交叉不把 <a> 嵌进 href',
+  renderMarkdown('go www.mail@example.com now'),
+  t => !/href="[^"]*<a /.test(t) && t.includes('href="https://www.mail@example.com"'),
+)
+check(
+  'B5：强调标记不进 www href',
+  renderMarkdown('go www._ab_.b now'),
+  t => t.includes('href="https://www._ab_.b"') && !t.includes('<em>'),
+)
+check(
+  'B5：强调标记不进 mailto href',
+  renderMarkdown('see a._bc_@d.ef now'),
+  t => t.includes('href="mailto:a._bc_@d.ef"') && !t.includes('<em>'),
+)
+check(
+  'B6：裸 URL 原始 & 单次转义',
+  renderMarkdown('go https://x.y/?a=1&b=2 now'),
+  t => t.includes('href="https://x.y/?a=1&amp;b=2"') && !t.includes('&amp;amp;'),
+)
+
+// ── 解析边界盲区 ──
+check('CRLF 归一', renderMarkdown('# T\r\n\r\ntext\r\nmore'), t => t.includes('<h1>T</h1>') && t.includes('<p>text\nmore</p>'))
+check(
+  'Tab 缩进嵌套列表',
+  renderMarkdown('- a\n\t- b\n\t\t- c'),
+  t => (t.match(/<ul>/g) ?? []).length === 3,
+)
+check('大写 [X] 任务项', renderMarkdown('- [X] done'), t => t.includes(' checked'))
+check(
+  '未闭合围栏至 EOF',
+  renderMarkdown('```js\nconst a = 1'),
+  t => t.includes('data-lang="js"') && t.includes('const'),
+)
+check(
+  '4 反引号围栏嵌 3 反引号内容',
+  renderMarkdown('````\n```js\nx\n```\n````'),
+  t => t.includes('```js') && !t.includes('data-lang'),
+)
+{
+  const fm = ['---', ...Array.from({ length: 250 }, (_, i) => `k${i}: v`), '---', '', '# T'].join('\n')
+  check('front matter 超 202 行不再识别', renderMarkdown(fm), t => !t.includes('dshx-frontmatter') && t.includes('<h1>T</h1>'))
+}
+check(
+  '超长邮件 token 限长后不误报邮箱',
+  renderMarkdown('x'.repeat(200) + '@' + 'y'.repeat(200) + '.com'),
+  t => !t.includes('mailto:'),
+)
+check(
+  '50 层引用内正常嵌套',
+  renderMarkdown('>'.repeat(50) + ' q'),
+  t => (t.match(/<blockquote>/g) ?? []).length === 50 && t.includes('q'),
+)
+
+// ── P3 回归（t18：B7-B12）──
+check(
+  'B9：未定义脚注引用按原文显示',
+  renderMarkdown('ref[^missing]'),
+  t => !t.includes('dshx-fnref') && !t.includes('dshx-footnotes') && t.includes('[^missing]'),
+)
+check(
+  'B9：前向脚注引用仍生效',
+  renderMarkdown('a[^x]\n\n[^x]: def'),
+  t => t.includes('href="#dshx-fn-1"') && t.includes('dshx-footnotes') && t.includes('def'),
+)
+check(
+  'B10：引用懒续行不吞表格',
+  renderMarkdown('> q\n| a |\n| --- |\n| b |'),
+  t => t.includes('<blockquote>') && t.includes('<table>') && !t.includes('<blockquote><table>'),
+)
+check(
+  'B11：setext 不打断引用懒续行',
+  renderMarkdown('> q\ntext\n==='),
+  t => !t.includes('<h1>') && t.includes('==='),
+)
+check(
+  'B11：列表懒续行同样不被 setext 打断',
+  renderMarkdown('- item\ntext\n==='),
+  t => !t.includes('<h2>') && t.includes('==='),
+)
+check(
+  'B12：不平衡右括号的引用定义非法',
+  renderMarkdown('[r]: x)\n\nuse [r]'),
+  t => !t.includes('<a ') && t.includes('use [r]'),
+)
+check(
+  'B12：合法引用定义不受影响',
+  renderMarkdown('[text][ref]\n\n[ref]: https://example.com "T"'),
+  t => t.includes('href="https://example.com"') && t.includes('title="T"'),
+)
+check(
+  'S1：wiki 链接仍由扫描器处理（decorate 死分支已删）',
+  renderMarkdown('[[Page|显示名]]'),
+  t => t.includes('href="#Page"') && t.includes('显示名'),
+)
+
 console.log('\n── 高亮器 ──')
 {
   const rows = highlight.tokenizeSource('FROM node AS base\nRUN copy', 'docker')
@@ -311,6 +439,58 @@ console.log('\n── 高亮器 ──')
   const rows = highlight.tokenizeSource('@x = 1\ndef m; end', 'rb')
   const flat = rows.flat()
   check('Ruby def 关键字 + ivar', flat.some(s => s.tok === 'kw' && s.text === 'def') && flat.some(s => s.tok === 'param' && s.text === '@x'), true)
+}
+{
+  // B7：同行闭合的 <script> 不把 embed 状态带到后续行
+  const rows = highlight.tokenizeSource('<script src="x.js"></script>\n<h1>Title</h1>', 'html')
+  const flat = rows.flat()
+  check('B7：同行闭合 script 后续行按 HTML 分词', flat.some(s => s.tok === 'kw' && s.text === 'h1') && !flat.some(s => s.tok === 'type' && s.text === 'Title'), true)
+}
+{
+  // B7：单行 <script>…</script> 的内嵌体按 JS 高亮
+  const rows = highlight.tokenizeSource('<div>a</div>\n<script>const a = 1</script>', 'html')
+  const flat = rows.flat()
+  check('B7：单行 script 内嵌体按 JS 高亮', flat.some(s => s.tok === 'kw' && s.text === 'const'), true)
+}
+{
+  // B7：跨行 script 仍按行首 embed 块处理
+  const rows = highlight.tokenizeSource('<script>\nconst b = 2;\n</script>\n<p>x</p>', 'html')
+  const flat = rows.flat()
+  check('B7：跨行 script 内嵌体按 JS 高亮', flat.some(s => s.tok === 'kw' && s.text === 'const'), true)
+}
+{
+  // B8：YAML 引号内的 # 不是注释
+  const rows = highlight.tokenizeSource('title: "a # b"', 'yaml')
+  const flat = rows.flat()
+  check('B8：YAML 引号内 # 不是注释', flat.some(s => s.tok === 'str' && s.text.includes('#')) && !flat.some(s => s.tok === 'cmt'), true)
+}
+{
+  // B8：行尾真注释仍是注释
+  const rows = highlight.tokenizeSource('k: v # real comment', 'yaml')
+  check('B8：YAML 行尾真注释仍识别', rows[0].some(s => s.tok === 'cmt' && s.text.startsWith('#')), true)
+}
+{
+  const map = {
+    'src/a.d.ts': 'ts', 'Makefile': 'sh', 'CMakeLists.txt': 'c', 'Dockerfile': 'docker',
+    'package.json': 'json', 'noext': 'noext', 'a.b.mts': 'mts',
+  }
+  const bad = Object.entries(map).filter(([p, want]) => highlight.langFromPath(p) !== want)
+  check('langFromPath 映射', bad, r => r.length === 0)
+}
+{
+  const at = highlight.tokenizeSource('x\n'.repeat(8000), 'js')
+  const over = highlight.tokenizeSource('x\n'.repeat(8001), 'js')
+  check('HIGHLIGHT_MAX 边界（8000 行内分词、超出返回空）', { at: at.length, over: over.length },
+    r => r.at === 8000 && r.over === 0)
+}
+{
+  const spans = highlight.tokenizeLine('const a = 1', 'ts')
+  check('tokenizeLine 单行分词', spans.some(s => s.tok === 'kw' && s.text === 'const'), true)
+}
+{
+  // 大小写语言别名归一
+  const upper = highlight.tokenizeSource('const a = 1', 'TypeScript').flat()
+  check('语言名大小写不敏感', upper.some(s => s.tok === 'kw' && s.text === 'const'), true)
 }
 
 console.log(`\n通过 ${pass} 项${failures.length > 0 ? `，失败 ${failures.length} 项：\n  - ${failures.join('\n  - ')}` : '，全部 OK'}`)

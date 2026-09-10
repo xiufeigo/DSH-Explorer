@@ -13,7 +13,7 @@ import { randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import Module, { createRequire } from 'node:module'
-import { basename, dirname, join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { PassThrough, type Readable } from 'node:stream'
 import { StringDecoder } from 'node:string_decoder'
 import { fileURLToPath } from 'node:url'
@@ -36,12 +36,15 @@ interface TerminalHandle {
   done: Promise<{ exitCode: number | null }>
   write(data: string): Promise<void>
   terminate(): Promise<void>
+  /** 可选：重设 PTY 内核尺寸（node-pty 路径支持；管道回退路径无此能力）。 */
+  resize?(cols: number, rows: number): void
 }
 
 interface NodePtyProcess {
   readonly pid: number
   write(data: string): void
   kill(signal?: string): void
+  resize(cols: number, rows: number): void
   onData(cb: (data: string) => void): { dispose(): void }
   onExit(cb: (e: { exitCode: number; signal?: number }) => void): { dispose(): void }
 }
@@ -152,7 +155,68 @@ function mergeEnv(extra: Record<string, string>): Record<string, string> {
   return { ...env, ...extra }
 }
 
-function wrapNodePty(term: NodePtyProcess): TerminalHandle {
+/** 暂存队列上限（字节）：超出丢最旧（终端语义等同滚出屏幕），host 内存始终有界。 */
+const PUMP_PENDING_CAP_BYTES = 1024 * 1024
+
+/**
+ * 上游→PassThrough 的有界转发。PassThrough.write() 返回 false 只表示超过
+ * 高水位，数据仍会被无限缓冲，生产端不能无视返回值；这里改为统一入队再
+ * 按序补排：output 可写时直通，背压时暂存，超上限丢最旧，队列清空时通过
+ * onOverflow 一次性上报本轮丢弃量（快输出 + 慢客户端不再撑爆 host 内存）。
+ */
+interface BoundedPump {
+  write(chunk: Buffer): void
+}
+
+function createBoundedPump(
+  output: PassThrough,
+  capBytes: number,
+  onOverflow?: (dropped: number) => void,
+): BoundedPump {
+  const pending: Buffer[] = []
+  let pendingBytes = 0
+  let droppedBytes = 0
+  let notified = false
+  let flushing = false
+  const flush = (): void => {
+    if (flushing || output.writableEnded) return
+    flushing = true
+    try {
+      while (pending.length > 0) {
+        const chunk = pending[0]
+        if (!output.write(chunk)) return // 背压：等 drain 事件再继续补排
+        pending.shift()
+        pendingBytes -= chunk.length
+      }
+      // 队列清空：把本轮积压期间丢弃的字节数一次性上报并复位。
+      if (notified) {
+        notified = false
+        const dropped = droppedBytes
+        droppedBytes = 0
+        if (dropped > 0) onOverflow?.(dropped)
+      }
+    } finally {
+      flushing = false
+    }
+  }
+  output.on('drain', flush)
+  return {
+    write(chunk) {
+      pending.push(chunk)
+      pendingBytes += chunk.length
+      while (pendingBytes > capBytes && pending.length > 1) {
+        const oldest = pending.shift()
+        if (oldest === undefined) break
+        pendingBytes -= oldest.length
+        droppedBytes += oldest.length
+        notified = true
+      }
+      flush()
+    },
+  }
+}
+
+function wrapNodePty(term: NodePtyProcess, onOverflow?: (dropped: number) => void): TerminalHandle {
   const output = new PassThrough()
   const done = new Promise<{ exitCode: number | null }>(resolve => {
     term.onExit(({ exitCode, signal }) => {
@@ -160,8 +224,9 @@ function wrapNodePty(term: NodePtyProcess): TerminalHandle {
       resolve({ exitCode: signal === undefined || signal === 0 ? exitCode : null })
     })
   })
+  const pump = createBoundedPump(output, PUMP_PENDING_CAP_BYTES, onOverflow)
   term.onData(data => {
-    output.write(Buffer.from(data, 'utf8'))
+    pump.write(Buffer.from(data, 'utf8'))
   })
   return {
     pid: term.pid,
@@ -170,13 +235,16 @@ function wrapNodePty(term: NodePtyProcess): TerminalHandle {
     async write(data) {
       term.write(data)
     },
+    resize(cols, rows) {
+      term.resize(cols, rows)
+    },
     async terminate() {
       try { term.kill() } catch { /* already gone */ }
     },
   }
 }
 
-function spawnPiped(file: string, args: string[], cwd: string, env: Record<string, string>): TerminalHandle {
+function spawnPiped(file: string, args: string[], cwd: string, env: Record<string, string>, onOverflow?: (dropped: number) => void): TerminalHandle {
   const child = spawnChild(file, args, {
     cwd,
     env,
@@ -184,23 +252,10 @@ function spawnPiped(file: string, args: string[], cwd: string, env: Record<strin
     detached: process.platform !== 'win32',
     stdio: ['pipe', 'pipe', 'pipe'],
   })
-  if (process.platform === 'win32') {
-    child.once('spawn', () => {
-      try {
-        const base = basename(file).toLowerCase()
-        if (base.includes('pwsh') || base.includes('powershell')) {
-          child.stdin?.write('[Console]::InputEncoding=[Text.Encoding]::UTF8;[Console]::OutputEncoding=[Text.Encoding]::UTF8\r')
-        } else if (base === 'cmd' || base === 'cmd.exe') {
-          child.stdin?.write('chcp 65001 >nul\r')
-        }
-      } catch {
-        /* ignore */
-      }
-    })
-  }
   const output = new PassThrough()
-  child.stdout?.on('data', chunk => { output.write(chunk) })
-  child.stderr?.on('data', chunk => { output.write(chunk) })
+  const pump = createBoundedPump(output, PUMP_PENDING_CAP_BYTES, onOverflow)
+  child.stdout?.on('data', chunk => { pump.write(chunk) })
+  child.stderr?.on('data', chunk => { pump.write(chunk) })
   child.on('close', () => { output.end() })
   const done = new Promise<{ exitCode: number | null }>(resolve => {
     child.on('exit', (code, signal) => {
@@ -243,6 +298,7 @@ function spawnDirect(
   extraEnv: Record<string, string>,
   cols: number,
   rows: number,
+  onOverflow?: (dropped: number) => void,
 ): TerminalHandle {
   const file = argv[0]
   if (file === undefined || file.length === 0) throw new Error('终端 argv 为空')
@@ -256,9 +312,9 @@ function spawnDirect(
       rows,
       cwd,
       env,
-    }))
+    }), onOverflow)
   }
-  return spawnPiped(file, args, cwd, env)
+  return spawnPiped(file, args, cwd, env, onOverflow)
 }
 
 async function spawnUserTerminal(
@@ -267,6 +323,7 @@ async function spawnUserTerminal(
   cwd: string,
   cols: number,
   rows: number,
+  onOverflow?: (dropped: number) => void,
 ): Promise<TerminalHandle> {
   const extraEnv = { TERM: 'xterm-256color', COLORTERM: 'truecolor' }
   const spec = { argv, cwd, env: extraEnv, cols, rows, graceMs: 1500 }
@@ -278,7 +335,7 @@ async function spawnUserTerminal(
       if (!message.includes('unsupported on platform')) throw error
     }
   }
-  return spawnDirect(argv, cwd, extraEnv, cols, rows)
+  return spawnDirect(argv, cwd, extraEnv, cols, rows, onOverflow)
 }
 
 export interface PtyHub {
@@ -286,9 +343,34 @@ export interface PtyHub {
     { id: string; pid: number; cwd: string; title: string } | { error: string }
   >
   write(sessionId: string, id: string, data: string): Promise<{ ok: true } | { error: string }>
+  /** 重设 PTY 尺寸（客户端 fit 后上报）；管道回退路径静默 no-op。 */
+  resize(sessionId: string, id: string, cols: number, rows: number): Promise<{ ok: true } | { error: string }>
   close(sessionId: string, id: string): Promise<{ ok: true } | { error: string }>
   attach(sessionId: string, id: string, res: ServerResponse): Promise<void>
   disposeAll(): Promise<void>
+}
+
+/**
+ * 尽力重设终端尺寸，返回是否找到可用通道：
+ * 1) 句柄自带 resize（本文件 wrapNodePty 产物）；
+ * 2) 宿主 subprocess.spawnTerminal 返回的 LocalTerminalHandle 未提供 resize，
+ *    但公开原始 node-pty 句柄 `.terminal`，按形状探测调用；
+ * 3) 管道回退（spawnPiped）无 PTY 可言——no-op，由调用方决定提示。
+ * 已退出终端的 resize 异常吞掉：尺寸重设失败不影响主流程。
+ */
+function tryResize(handle: TerminalHandle, cols: number, rows: number): boolean {
+  try {
+    if (typeof handle.resize === 'function') {
+      handle.resize(cols, rows)
+      return true
+    }
+    const raw = (handle as { terminal?: unknown }).terminal
+    if (raw !== null && typeof raw === 'object' && typeof (raw as NodePtyProcess).resize === 'function') {
+      ;(raw as NodePtyProcess).resize(cols, rows)
+      return true
+    }
+  } catch { /* 已退出 / 不支持：静默 */ }
+  return false
 }
 
 function clip(n: number, min: number, max: number): number {
@@ -306,15 +388,19 @@ async function shellArgv(subprocess: SubprocessLike): Promise<string[]> {
     for (const name of ['pwsh.exe', 'pwsh', 'powershell.exe', 'powershell']) {
       try {
         const file = await subprocess.resolveExecutable(name)
-        return [file, '-NoLogo']
+        // 编码设置走 -NoExit -Command 命令行参数而非 stdin 预注入：
+        // stdin 方式会把设置命令当交互输入回显到终端，argv 方式无回显。
+        return [file, '-NoLogo', '-NoExit', '-Command', '[Console]::InputEncoding=[Text.Encoding]::UTF8;[Console]::OutputEncoding=[Text.Encoding]::UTF8']
       } catch {
         /* try next */
       }
     }
     try {
-      return [await subprocess.resolveExecutable('cmd.exe')]
+      const file = await subprocess.resolveExecutable('cmd.exe')
+      // /K：设置代码页后保持交互（同理由：argv 注入，无 stdin 回显）。
+      return [file, '/K', 'chcp 65001 >nul']
     } catch {
-      return ['cmd.exe']
+      return ['cmd.exe', '/K', 'chcp 65001 >nul']
     }
   }
   const preferred = process.env.SHELL ?? '/bin/bash'
@@ -335,7 +421,11 @@ function emit(pty: LivePty, line: Record<string, unknown>): void {
   }
 }
 
-export function createPtyHub(getSubprocess: () => SubprocessLike | undefined): PtyHub {
+export function createPtyHub(
+  getSubprocess: () => SubprocessLike | undefined,
+  /** 当前 live 会话 id 集合（差量回收死会话终端用）；返回 undefined 表示探针不可用。 */
+  getLiveSessionIds?: () => Set<string> | undefined,
+): PtyHub {
   const live = new Map<string, LivePty>()
   const idleTimers = new Map<string, NodeJS.Timeout>()
   /** 在飞 open 的同步预占位（sessionId → 个数）：>= 8 判定时一并计入，防并发突破上限。 */
@@ -355,20 +445,40 @@ export function createPtyHub(getSubprocess: () => SubprocessLike | undefined): P
     }
   }
 
+  /** 终止一条终端并广播 exit（idle 回收与死会话回收共用同一收尾路径）。 */
+  function reap(record: LivePty): void {
+    if (record.closed) return
+    live.delete(record.id)
+    clearIdleTimer(record.id)
+    record.closed = true
+    void record.handle.terminate().catch(() => {})
+    emit(record, { t: 'exit', code: null })
+    record.listeners.clear()
+  }
+
   function scheduleIdleTimer(id: string): void {
     clearIdleTimer(id)
     const timer = setTimeout(() => {
       idleTimers.delete(id)
       const record = live.get(id)
       if (record === undefined || record.closed) return
-      live.delete(id)
-      record.closed = true
-      void record.handle.terminate().catch(() => {})
-      emit(record, { t: 'exit', code: null })
-      record.listeners.clear()
+      reap(record)
     }, 10 * 60 * 1000)
     idleTimers.set(id, timer)
   }
+
+  // 死会话回收：宿主没有 session 卸载事件可订阅（S5 结论），低频差量检测
+  // 兜底——会话已从 live map 消失时其终端立即回收；10 分钟 idle 兜底仍保留。
+  const sweepDeadSessions = (): void => {
+    const liveIds = getLiveSessionIds?.()
+    if (liveIds === undefined) return
+    for (const record of [...live.values()]) {
+      if (record.closed || liveIds.has(record.sessionId)) continue
+      reap(record)
+    }
+  }
+  const sweepTimer = setInterval(sweepDeadSessions, 60_000)
+  sweepTimer.unref?.()
 
   const hub: PtyHub = {
     async open({ sessionId, cwd, cols, rows }) {
@@ -390,7 +500,16 @@ export function createPtyHub(getSubprocess: () => SubprocessLike | undefined): P
         const argv = await shellArgv(subprocess)
         const id = `pty-${randomBytes(8).toString('hex')}`
         try {
-          const handle = await spawnUserTerminal(subprocess, argv, cwd, clip(cols, 20, 300), clip(rows, 8, 120))
+          // 背压溢出通知：数据在 spawn 返回前就可能在飞，此时还没有可发的 record。
+          const box: { record?: LivePty } = {}
+          const handle = await spawnUserTerminal(
+            subprocess,
+            argv,
+            cwd,
+            clip(cols, 20, 300),
+            clip(rows, 8, 120),
+            dropped => { if (box.record !== undefined) emit(box.record, { t: 'overflow', dropped }) },
+          )
           const record: LivePty = {
             id,
             sessionId,
@@ -399,6 +518,7 @@ export function createPtyHub(getSubprocess: () => SubprocessLike | undefined): P
             listeners: new Set(),
             closed: false,
           }
+          box.record = record
           const decoder = new StringDecoder('utf8')
           handle.output.on('data', (chunk: Buffer | string) => {
             const text = typeof chunk === 'string' ? chunk : decoder.write(chunk)
@@ -456,6 +576,16 @@ export function createPtyHub(getSubprocess: () => SubprocessLike | undefined): P
         rearm()
         return { error: error instanceof Error ? error.message : String(error) }
       }
+    },
+
+    async resize(sessionId, id, cols, rows) {
+      // 与 write 同一套会话归属校验：跨会话拿不到别人的终端。
+      const record = live.get(id)
+      if (record === undefined || record.sessionId !== sessionId) return { error: '终端不存在' }
+      if (record.closed) return { error: '终端已退出' }
+      // 与 open 相同的 20-300 / 8-120 边界；管道回退路径无 PTY，静默 no-op。
+      tryResize(record.handle, clip(cols, 20, 300), clip(rows, 8, 120))
+      return { ok: true }
     },
 
     async close(sessionId, id) {
@@ -524,6 +654,7 @@ export function createPtyHub(getSubprocess: () => SubprocessLike | undefined): P
     },
 
     async disposeAll() {
+      clearInterval(sweepTimer)
       for (const timer of idleTimers.values()) {
         clearTimeout(timer)
       }

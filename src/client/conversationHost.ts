@@ -1,13 +1,13 @@
 /**
- * Conversation-column helpers: find the native scrollport, overlay hosts,
- * user-message text, and in-flow jump-to-message.
+ * Conversation-column helpers: find the native scrollport and overlay hosts.
  */
 
 export const SUMMARY_CARD_WIDTH = 300
 
 interface HostRegistry {
   createdElements: HTMLElement[]
-  observers: ResizeObserver[]
+  /** observer 与它观测的滚动区配对：滚动区脱离文档时可精确 disconnect。 */
+  observers: Array<{ observer: ResizeObserver; scroller: HTMLElement }>
   modifiedScrollers: HTMLElement[]
 }
 
@@ -18,7 +18,7 @@ const hostRegistry: HostRegistry = {
 }
 
 export function disposeConversationHost(): void {
-  for (const observer of hostRegistry.observers) {
+  for (const { observer } of hostRegistry.observers) {
     try { observer.disconnect() } catch { /* ignore */ }
   }
   hostRegistry.observers = []
@@ -30,7 +30,6 @@ export function disposeConversationHost(): void {
 
   for (const scroller of hostRegistry.modifiedScrollers) {
     try {
-      scroller.classList.remove('dshx-has-chrome')
       scroller.style.removeProperty('--dshx-scrollport-h')
       delete scroller.dataset.dshxRo
     } catch { /* ignore */ }
@@ -53,6 +52,14 @@ export function canPinSummary(scroller: HTMLElement | null = conversationScroll(
 }
 
 export function ensureHost(attr: string, className: string): HTMLElement | null {
+  // 先清扫已脱离文档的滚动区/宿主元素：disconnect 对应 observer、释放引用，
+  // 避免宿主按会话重挂滚动区时注册表无限累积。
+  hostRegistry.observers = hostRegistry.observers.filter(({ observer, scroller }) => {
+    if (document.contains(scroller)) return true
+    try { observer.disconnect() } catch { /* ignore */ }
+    return false
+  })
+  hostRegistry.createdElements = hostRegistry.createdElements.filter(el => document.contains(el))
   const scroller = conversationScroll()
   if (scroller === null) return null
   const existing = scroller.querySelector(`[${attr}]`)
@@ -65,7 +72,6 @@ export function ensureHost(attr: string, className: string): HTMLElement | null 
   if (!hostRegistry.modifiedScrollers.includes(scroller)) {
     hostRegistry.modifiedScrollers.push(scroller)
   }
-  scroller.classList.add('dshx-has-chrome')
   const applyHeight = (): void => {
     scroller.style.setProperty('--dshx-scrollport-h', `${scroller.clientHeight}px`)
   }
@@ -81,7 +87,7 @@ export function ensureHost(attr: string, className: string): HTMLElement | null 
       })
     })
     observer.observe(scroller)
-    hostRegistry.observers.push(observer)
+    hostRegistry.observers.push({ observer, scroller })
   }
   return host
 }
@@ -104,65 +110,6 @@ export function ensureTermHost(): HTMLElement | null {
   root.appendChild(host)
   hostRegistry.createdElements.push(host)
   return host
-}
-
-export function flattenContent(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return ''
-  const parts: string[] = []
-  for (const block of content) {
-    if (block !== null && typeof block === 'object' && (block as { type?: string }).type === 'text') {
-      const text = (block as { text?: unknown }).text
-      if (typeof text === 'string') parts.push(text)
-    }
-  }
-  return parts.join('')
-}
-
-export function scrollToChatKey(key: string): void {
-  const scroller = conversationScroll()
-  if (scroller === null) return
-  for (const row of scroller.querySelectorAll<HTMLElement>('[data-chat-anchor-key]')) {
-    if (row.dataset.chatAnchorKey !== key) continue
-    row.scrollIntoView({ block: 'center', behavior: 'smooth' })
-    row.classList.add('dshx-msg-flash')
-    window.setTimeout(() => row.classList.remove('dshx-msg-flash'), 1200)
-    return
-  }
-}
-
-export function formatProcessed(ms: number): string {
-  const total = Math.max(0, Math.floor(ms / 1000))
-  const minutes = Math.floor(total / 60)
-  const seconds = total % 60
-  if (minutes === 0) return `${seconds}s`
-  return `${minutes}m ${seconds}s`
-}
-
-export function formatClock(ms: number): string {
-  const total = Math.max(0, Math.floor(ms / 1000))
-  const days = Math.floor(total / 86400)
-  const hours = Math.floor(total % 86400 / 3600)
-  const minutes = Math.floor(total % 3600 / 60)
-  const seconds = total % 60
-  if (days > 0) return `${days}d ${hours}h ${minutes}m ${seconds}s`
-  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`
-  if (minutes > 0) return `${minutes}m ${seconds}s`
-  return `${seconds}s`
-}
-
-export function relativeTime(at: number, now = Date.now()): string {
-  const delta = Math.max(0, now - at)
-  const minutes = Math.floor(delta / 60_000)
-  if (minutes < 1) return '刚刚'
-  if (minutes < 60) return `${minutes} 分钟前`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours} 小时前`
-  const days = Math.floor(hours / 24)
-  if (days < 7) return `${days} 天前`
-  const weeks = Math.floor(days / 7)
-  if (weeks < 5) return `${weeks} 周前`
-  return new Date(at).toLocaleDateString()
 }
 
 export function agentHue(id: string): string {

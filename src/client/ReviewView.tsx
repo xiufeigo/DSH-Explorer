@@ -25,6 +25,8 @@ interface ReviewData {
   at?: number | null
   notRepo?: boolean
   error?: string
+  /** true=快照期 diff 输出被截断，清单/patch 可能缺文件（git.lastRound）。 */
+  truncated?: boolean
 }
 
 const STATUS_LABEL: Record<string, string> = {
@@ -117,6 +119,14 @@ function rememberPatch(key: string, patch: string | null): void {
   if (first !== undefined) reviewPatchCache.delete(first)
 }
 
+/** 手动刷新：作废该会话该模式的 patch 缓存，diff 面板与后续切换都强制走 RPC。 */
+function invalidatePatches(sessionId: string, mode: ReviewMode): void {
+  const prefix = `${sessionId}:${mode}:`
+  for (const key of reviewPatchCache.keys()) {
+    if (key.startsWith(prefix)) reviewPatchCache.delete(key)
+  }
+}
+
 function useReviewMode(store: ExplorerStore): ReviewMode {
   const [, tick] = useReducer((value: number) => value + 1, 0)
   useEffect(() => {
@@ -171,16 +181,19 @@ function useReviewPanes(): [ReviewPanes, (key: keyof ReviewPanes) => void] {
   return [panes, toggle]
 }
 
-const DiffView = memo(function DiffView({ path, patch }: { path: string; patch: string }): JSX.Element {
+const DiffView = memo(function DiffView({ path, patch, truncated }: { path: string; patch: string; truncated?: boolean }): JSX.Element {
   const allLines = useMemo(() => patch.split('\n'), [patch])
-  const truncated = allLines.length > DIFF_LINE_CAP
-  const total = truncated ? DIFF_LINE_CAP : allLines.length
+  const truncatedByCap = allLines.length > DIFF_LINE_CAP
+  const total = truncatedByCap ? DIFF_LINE_CAP : allLines.length
   const { wrapRef, from, to, onScroll } = useVirtualSlice(total, DIFF_LINE_H, `${path}:${total}`)
 
   return (
     <>
       <div className="dshx-diff-header">{path}</div>
       {truncated && (
+        <div className="dshx-muted" style={{ padding: '4px 10px' }}>⚠ diff 输出被截断，内容可能不完整</div>
+      )}
+      {truncatedByCap && (
         <div className="dshx-muted" style={{ padding: '4px 10px' }}>
           内容过长，仅显示前 {DIFF_LINE_CAP} 行（共 {allLines.length} 行）
         </div>
@@ -279,6 +292,8 @@ export const ReviewView = memo(function ReviewView({ sessionId, store, visible =
   const [selectedPath, setSelectedPath] = useState<string | null>(() => reviewListCacheGet(cacheKey)?.selectedPath ?? null)
   const [patch, setPatch] = useState<string | null>(null)
   const [patchLoading, setPatchLoading] = useState(false)
+  /** 单文件 diff 输出被 stdout 上限截断（git.fileDiff truncated）：面板内提示。 */
+  const [patchTruncated, setPatchTruncated] = useState(false)
   const [panes, togglePane] = useReviewPanes()
   const listSig = useRef(reviewListCacheGet(cacheKey)?.sig ?? '')
   const reqSeq = useRef(0)
@@ -306,7 +321,8 @@ export const ReviewView = memo(function ReviewView({ sessionId, store, visible =
     void rpcWithSessionRetry<ReviewData>(sessionId, method, {}, undefined, { timeoutMs: 60_000 }).then(result => {
       if (my !== reqSeq.current) return
       const files: ReviewFile[] = result.files ?? []
-      const signature = `${result.error ?? ''}\n${result.branch ?? ''}\n${listSignature(files)}`
+      // at/truncated 入签名：上一回合冻结了相同清单时也要刷新「冻结于」与截断提示。
+      const signature = `${result.error ?? ''}\n${result.branch ?? ''}\n${result.at ?? ''}\n${result.truncated === true}\n${listSignature(files)}`
       const key = reviewListKey(sessionId, mode)
       if (!force && signature === listSig.current) return
       listSig.current = signature
@@ -345,10 +361,46 @@ export const ReviewView = memo(function ReviewView({ sessionId, store, visible =
   const others = useMemo(() => files.filter(file => !isUntracked(file)), [files])
   const selected = selectedPath === null ? null : files.find(file => file.path === selectedPath) ?? null
 
+  /** 当前 patch 面板的键：会话/模式/文件任一切走后，晚归响应据此丢弃。 */
+  const activePatchKeyRef = useRef<string | null>(null)
+  activePatchKeyRef.current = selected === null ? null : `${sessionId}:${mode}:${selected.path}`
+
+  /** 拉单个文件的 diff；缓存优先（bypassCache 时强制 RPC）。按文件取号防晚归覆盖。 */
+  const requestPatch = useCallback((path: string, bypassCache: boolean): void => {
+    const patchKey = `${sessionId}:${mode}:${path}`
+    if (!bypassCache) {
+      const cachedPatch = reviewPatchCache.get(patchKey)
+      if (cachedPatch !== undefined) {
+        setPatch(cachedPatch)
+        setPatchLoading(false)
+        setPatchTruncated(false)
+        return
+      }
+      setPatchLoading(true)
+    }
+    const seqs = diffSeq.current
+    const seq = (seqs.get(path) ?? 0) + 1
+    seqs.set(path, seq)
+    void rpc<{ patch?: string | null; error?: string; truncated?: boolean }>(sessionId, 'git.fileDiff', {
+      path,
+      mode,
+    }, { timeoutMs: 60_000 }).then(result => {
+      if (patchKey !== activePatchKeyRef.current) return // 已切到别的文件/模式
+      if (seqs.get(path) !== seq) return // 已有更新的请求：丢弃过期响应
+      const next = typeof result.patch === 'string' && result.patch.length > 0 ? result.patch : null
+      rememberPatch(patchKey, next)
+      setPatchLoading(false)
+      setPatchTruncated(result.truncated === true)
+      setPatch(next)
+    })
+  }, [sessionId, mode])
+
+  // 选中/切换文件时装载 patch：先吃缓存（快速切换秒出），没有再拉。
   useEffect(() => {
     if (selected === null || !fileHasPatch(selected)) {
       setPatch(null)
       setPatchLoading(false)
+      setPatchTruncated(false)
       return
     }
     const path = selected.path
@@ -356,34 +408,33 @@ export const ReviewView = memo(function ReviewView({ sessionId, store, visible =
     if (typeof inline === 'string' && inline.length > 0) {
       setPatch(inline)
       setPatchLoading(false)
+      setPatchTruncated(false)
       return
     }
-    const patchKey = `${sessionId}:${mode}:${path}`
-    const cachedPatch = reviewPatchCache.get(patchKey)
-    if (cachedPatch !== undefined) {
-      setPatch(cachedPatch)
-      setPatchLoading(false)
-    } else {
-      setPatchLoading(true)
+    requestPatch(path, false)
+  }, [sessionId, mode, selectedPath, selected?.hasPatch, selected?.patch, requestPatch])
+
+  // 选中文件不变时也要跟随工作区：与列表同节奏轮询单文件 diff（绕过缓存）。
+  // 列表签名只含状态与路径，Agent 编辑已选中文件时列表不变，patch 只能自己刷新。
+  // 依赖用原始值：列表刷新会换 selected 对象身份，用对象做依赖会不断重置定时器。
+  const selectedPatchable = selected !== null && fileHasPatch(selected)
+  const selectedInline = selected?.patch
+  useEffect(() => {
+    if (!visible || selectedPath === null || !selectedPatchable) return
+    if (typeof selectedInline === 'string' && selectedInline.length > 0) return
+    const timer = setInterval(() => { requestPatch(selectedPath, true) }, 8000)
+    return () => { clearInterval(timer) }
+  }, [visible, selectedPath, selectedPatchable, selectedInline, requestPatch])
+
+  const refresh = useCallback((): void => {
+    // 手动刷新同时作废 patch 缓存：diff 面板立刻重拉，不再吃旧缓存。
+    invalidatePatches(sessionId, mode)
+    listSig.current = ''
+    load(true)
+    if (selected !== null && fileHasPatch(selected) && !(typeof selected.patch === 'string' && selected.patch.length > 0)) {
+      requestPatch(selected.path, true)
     }
-    let cancelled = false
-    // 按文件取号：快速切换文件/模式时，晚归的慢 patch 不得覆盖新请求
-    const seqs = diffSeq.current
-    const seq = (seqs.get(path) ?? 0) + 1
-    seqs.set(path, seq)
-    void rpc<{ patch?: string | null; error?: string }>(sessionId, 'git.fileDiff', {
-      path,
-      mode,
-    }, { timeoutMs: 60_000 }).then(result => {
-      if (cancelled) return
-      if (seqs.get(path) !== seq) return // 已有更新的请求：丢弃过期响应
-      const next = typeof result.patch === 'string' && result.patch.length > 0 ? result.patch : null
-      rememberPatch(patchKey, next)
-      setPatchLoading(false)
-      setPatch(next)
-    })
-    return () => { cancelled = true }
-  }, [sessionId, mode, selectedPath, selected?.hasPatch, selected?.patch])
+  }, [sessionId, mode, load, selected, requestPatch])
 
   return (
     <div className="dshx-review">
@@ -399,8 +450,14 @@ export const ReviewView = memo(function ReviewView({ sessionId, store, visible =
         {mode === 'last' && typeof data?.at === 'number' && (
           <span className="dshx-muted">冻结于 {new Date(data.at).toLocaleTimeString()}</span>
         )}
-        <button className="dshx-btn small" onClick={() => { listSig.current = ''; load(true) }}>刷新</button>
+        <button className="dshx-btn small" onClick={refresh}>刷新</button>
       </div>
+
+      {mode === 'last' && data?.truncated === true && (
+        <div className="dshx-muted" style={{ padding: '4px 10px', flex: 'none', borderBottom: '1px solid var(--dshx-border)' }}>
+          ⚠ 快照期间 diff 输出被截断，变更清单与 diff 内容可能不完整
+        </div>
+      )}
 
       {mode === 'branch' && data?.commits !== undefined && data.commits.length > 0 && (
         <div style={{ borderBottom: '1px solid var(--dshx-border)', maxHeight: 120, overflow: 'auto', flex: 'none' }}>
@@ -452,7 +509,7 @@ export const ReviewView = memo(function ReviewView({ sessionId, store, visible =
                   ? <div className="dshx-empty">加载 diff…</div>
                   : patch === null || patch === ''
                     ? <div className="dshx-empty">该文件没有 diff 内容</div>
-                    : <DiffView path={selected.path} patch={patch} />
+                    : <DiffView path={selected.path} patch={patch} truncated={patchTruncated} />
               )}
             </div>
           )}

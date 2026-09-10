@@ -1,5 +1,10 @@
 # OpenCode Notification Sound Research
 
+> 姊妹篇（互补，非重复）：`docs/opencode-notification-sound-research.md` 是同一主题的
+> 实现深读版（完整 sound.ts 源码、settings-v2 控制器、运行时触发链、
+> CSP issue/PR 分析）；本文是源码锚定精简版（证据克隆指针 + 仓库身份结论 +
+> 第三方插件生态 + 复刻要点清单）。读其一即可，按需互查。
+
 Researched from source (commit `e00890c`, branch `dev`). All paths relative to repo root.
 Local clone: `.research/opencode/` (sparse: packages/app, packages/desktop, packages/ui).
 Individual fetched files: `.research/files/packages/...`

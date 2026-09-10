@@ -73,7 +73,10 @@ export function buildViewLines(content: string, patch: string | null, untracked:
   let newI = 1
   let oldI = 1
   for (const hunk of hunks) {
+    // 双侧起点都要校验：patch 与正文不同步（保存/外部改动的间隙）时
+    // 行号会按 1:1 递增漂移，失配宁可整文件按上下文渲染。
     if (hunk.newStart > 0 && hunk.newStart < newI) return asPlain(rows, 'ctx')
+    if (hunk.oldStart > 0 && hunk.oldStart < oldI) return asPlain(rows, 'ctx')
     while (newI < hunk.newStart && newI <= rows.length) {
       out.push({ kind: 'ctx', text: rows[newI - 1] ?? '', oldNo: oldI, newNo: newI })
       newI++
