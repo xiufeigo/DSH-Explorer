@@ -8,16 +8,10 @@ import { defineConfig } from 'tsdown'
  * react / react-dom / the native icon library stay external so the plugin
  * reuses the app's shared instances; everything else this package imports
  * gets inlined.
- *
- * `@deepseek-ai/dsh-client-store` 同属 baseline（宿主
- * `packages/client/web/src/platform.ts` 的 PLATFORM_MODULES 把 client/store、
- * ui-slots、ui-primitives 一起播种进模块表），因此同样外部化——内联它会在
- * 运行时把同一份 store 引擎装成第二份实例。
  */
 const CLIENT_EXTERNALS = [
   'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client',
   '@deepseek-ai/dsh-client-ui-primitives',
-  '@deepseek-ai/dsh-client-store',
 ]
 
 /**

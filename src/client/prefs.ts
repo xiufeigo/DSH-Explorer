@@ -1,31 +1,20 @@
 /**
- * DSH-Explorer 用户偏好：存在 localStorage，设置页和终端共用。
- * Host 另注册 kebab-case 命名空间 `dsh-explorer`，让「插件配置」的 keyed
- * 座位能在 describe ∩ 卡片 key 的交集里派发到这张卡。字段值不写那份文档。
+ * DSH-Explorer 终端外观与排序开关。
+ *
+ * 设置卡已删除，因此这里**只读不写**：仍会读取 localStorage 里遗留的偏好
+ * （终端配色 / 字号 / 字体），让老用户的外观不丢；没有写入方，也不会再有。
+ * `sortWorkspacesByRecency` 恒为默认 true——左侧栏排序是保留功能，不再有开关。
  */
 
 export type TermThemeId = 'auto' | 'light' | 'dark' | 'slate' | 'forest'
 export type TermFontId = 'ui' | 'code' | 'mono' | 'custom'
-export type SoundId = 'none' | 'staplebops-01' | 'staplebops-02' | 'nope-03' | 'chime-soft' | 'chime-bright' | 'alert-low' | 'alert-high'
 
 export interface ExplorerPrefs {
   termTheme: TermThemeId
   termFontSize: number
   termFont: TermFontId
   termFontCustom: string
-  /** 系统通知：智能体完成或需要注意时 */
-  notifyAgent: boolean
-  /** 系统通知：需要权限时 */
-  notifyPermission: boolean
-  /** 系统通知：发生错误时 */
-  notifyError: boolean
-  /** 音效：智能体完成或需要注意时 */
-  soundAgent: SoundId
-  /** 音效：需要权限时 */
-  soundPermission: SoundId
-  /** 音效：发生错误时 */
-  soundError: SoundId
-  /** 工作区侧栏按最后会话时间自动排序（关闭则保留手动拖拽顺序） */
+  /** 工作区侧栏按最后会话时间自动排序（默认 true） */
   sortWorkspacesByRecency: boolean
 }
 
@@ -36,17 +25,8 @@ export const DEFAULT_PREFS: ExplorerPrefs = {
   termFontSize: 13,
   termFont: 'code',
   termFontCustom: '',
-  notifyAgent: true,
-  notifyPermission: true,
-  notifyError: false,
-  soundAgent: 'staplebops-01',
-  soundPermission: 'staplebops-02',
-  soundError: 'nope-03',
   sortWorkspacesByRecency: true,
 }
-
-/** 写入 localStorage 的版本。v1 默认把终端交给比例正文，xterm 格子会发糊、字重不均。 */
-const PREFS_VERSION = 2
 
 const MONO_FALLBACK = [
   '"JetBrains Mono NL"',
@@ -186,8 +166,6 @@ function pickKey(prefs: ExplorerPrefs): string {
 
 const THEMES: readonly TermThemeId[] = ['auto', 'light', 'dark', 'slate', 'forest']
 const FONTS: readonly TermFontId[] = ['ui', 'code', 'mono', 'custom']
-const SOUNDS: readonly SoundId[] = ['none', 'staplebops-01', 'staplebops-02', 'nope-03', 'chime-soft', 'chime-bright', 'alert-low', 'alert-high']
-const SOUND_SET = new Set<string>(SOUNDS)
 
 function clipSize(n: number): number {
   return Math.min(22, Math.max(11, Math.round(n)))
@@ -209,12 +187,6 @@ function parsePrefs(raw: string | null): ExplorerPrefs {
       termFontSize: size,
       termFont: font,
       termFontCustom: custom,
-      notifyAgent: typeof data.notifyAgent === 'boolean' ? data.notifyAgent : DEFAULT_PREFS.notifyAgent,
-      notifyPermission: typeof data.notifyPermission === 'boolean' ? data.notifyPermission : DEFAULT_PREFS.notifyPermission,
-      notifyError: typeof data.notifyError === 'boolean' ? data.notifyError : DEFAULT_PREFS.notifyError,
-      soundAgent: typeof data.soundAgent === 'string' && SOUND_SET.has(data.soundAgent) ? data.soundAgent as SoundId : DEFAULT_PREFS.soundAgent,
-      soundPermission: typeof data.soundPermission === 'string' && SOUND_SET.has(data.soundPermission) ? data.soundPermission as SoundId : DEFAULT_PREFS.soundPermission,
-      soundError: typeof data.soundError === 'string' && SOUND_SET.has(data.soundError) ? data.soundError as SoundId : DEFAULT_PREFS.soundError,
       sortWorkspacesByRecency: typeof data.sortWorkspacesByRecency === 'boolean' ? data.sortWorkspacesByRecency : DEFAULT_PREFS.sortWorkspacesByRecency,
     }
   } catch {
@@ -231,37 +203,13 @@ function readPrefs(): ExplorerPrefs {
 }
 
 const listeners = new Set<() => void>()
-let current = readPrefs()
-
-function persist(): void {
-  try { localStorage.setItem(PREFS_KEY, JSON.stringify({ v: PREFS_VERSION, ...current })) } catch { /* private mode */ }
-}
-
-function notify(): void {
-  for (const listener of listeners) listener()
-}
+const current = readPrefs()
 
 export function getPrefs(): ExplorerPrefs {
   return current
 }
 
-export function setPrefs(patch: Partial<ExplorerPrefs>): ExplorerPrefs {
-  const next: ExplorerPrefs = { ...current, ...patch }
-  if (typeof patch.termFontSize === 'number') next.termFontSize = clipSize(patch.termFontSize)
-  if (typeof patch.termFontCustom === 'string') next.termFontCustom = patch.termFontCustom.slice(0, 120)
-  current = next
-  persist()
-  notify()
-  return current
-}
-
-export function resetPrefs(): ExplorerPrefs {
-  current = { ...DEFAULT_PREFS }
-  persist()
-  notify()
-  return current
-}
-
+/** 偏好不再有写入方：保留订阅面，让旧调用点不必改签名（永不触发）。 */
 export function subscribePrefs(listener: () => void): () => void {
   listeners.add(listener)
   return () => { listeners.delete(listener) }

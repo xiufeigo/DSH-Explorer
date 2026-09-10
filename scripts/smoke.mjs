@@ -59,33 +59,17 @@ try {
   }
   ok(`host half: require("dsh-explorer") exposes { inject: [${plugin.inject.join(', ')}], apply }`)
 
-  const registered = []
   const routes = []
   const ctx = {
     get(name) {
       if (name === 'webServer') return { register: (route) => { routes.push(route); return () => {} } }
-      if (name === 'fs') return {}
-      if (name === 'shell') return {}
-      if (name === 'sessions') return { get: () => undefined }
-      if (name === 'settings') {
-        return {
-          register(ns, schema, options) {
-            registered.push({ ns, schema, options })
-            return { get: () => ({}), watch: () => () => {}, update: async () => {}, replace: async () => {} }
-          },
-        }
-      }
+      if (name === 'sessions') return { get: () => undefined, list: () => [] }
       return undefined
-    },
-    inject(deps, callback) {
-      if (deps.includes('settings')) callback(ctx)
-      return () => {}
     },
     effect(cb) {
       const d = cb()
       return typeof d === 'function' ? d : () => {}
     },
-    on() { return () => {} },
   }
   plugin.apply(ctx)
   // 路由挂载断言：register 被吞掉时，路径写错也会全绿 —— 必须核对实际入参。
@@ -98,18 +82,6 @@ try {
     throw new Error('host apply did not register exact /dsh-explorer/pty route')
   }
   ok('host half: registers exact /dsh-explorer/rpc + /dsh-explorer/pty routes')
-  const ns = registered.find(row => row.ns === 'dsh-explorer')
-  if (ns === undefined) throw new Error('host apply did not settings.register("dsh-explorer")')
-  if (typeof ns.schema !== 'function') throw new Error('explorer settings schema is not callable')
-  if (typeof ns.schema.toJSON !== 'function') throw new Error('explorer settings schema missing toJSON')
-  const parsed = ns.schema({})
-  if (parsed.termTheme !== 'auto' || parsed.termFontSize !== 13 || parsed.termFont !== 'code') {
-    throw new Error(`schema defaults unexpected: ${JSON.stringify(parsed)}`)
-  }
-  if (ns.schema['~standard']?.vendor !== 'dsh-explorer' || typeof ns.schema['~standard']?.validate !== 'function') {
-    throw new Error('explorer settings schema missing Standard Schema ~standard')
-  }
-  ok('host half: settings.register("dsh-explorer") with callable schema')
 } catch (error) {
   fail('host half import', error)
 }
@@ -117,8 +89,8 @@ try {
 // ── 2. Browser half ────────────────────────────────────────────────────────
 try {
   const code = readFileSync(join(root, 'lib', 'client.js'), 'utf8')
-  if (!code.includes('.dshx-root')) {
-    throw new Error('client bundle did not inline explorer CSS (.dshx-root missing)')
+  if (!code.includes('.dshx-term-panel')) {
+    throw new Error('client bundle did not inline explorer CSS (.dshx-term-panel missing)')
   }
   if (!code.includes('dataset.plugin')) {
     throw new Error('client bundle did not stamp style[data-plugin] for unload')
@@ -153,18 +125,6 @@ try {
   if (typeof pluginModule?.apply !== 'function') throw new Error('client module exposes no apply')
   if (!Array.isArray(pluginModule.inject)) throw new Error('client module exposes no inject array')
   ok(`browser half: factory evaluates and exports apply + inject (${pluginModule.inject.join(', ')})`)
-  if (typeof pluginModule.parentDir !== 'function') throw new Error('client module exposes no parentDir')
-  const parentCases = [
-    ['C:\\sensorsdata\\main\\program\\DSH-Explorer\\cordis.patch.example.yml', 'C:\\sensorsdata\\main\\program\\DSH-Explorer'],
-    ['C:\\foo\\bar\\', 'C:\\foo'],
-    ['C:\\foo', 'C:\\'],
-    ['/tmp/a/b.txt', '/tmp/a'],
-  ]
-  for (const [input, expected] of parentCases) {
-    const got = pluginModule.parentDir(input)
-    if (got !== expected) throw new Error(`parentDir(${JSON.stringify(input)}) => ${JSON.stringify(got)}, expected ${JSON.stringify(expected)}`)
-  }
-  ok('browser half: parentDir handles Windows and POSIX paths')
 
   function makeSlots() {
     const specs = new Map()
@@ -197,47 +157,22 @@ try {
     }
   }
   const slots = makeSlots()
+  // effect 不执行：排序 / 置顶安装器要真实 DOM（它们由 §5 用假服务直测），
+  // 这里只验证 apply 里的槽位注册这条接线。
   pluginModule.apply({
     get: () => undefined,
-    effect: (cb) => {
-      const d = cb()
-      return typeof d === 'function' ? d : () => {}
-    },
+    effect: () => () => {},
     slots,
     sessions: {},
-    workspaces: { openPath: async () => {} },
-    layout: {},
+    workspaces: {},
   })
-  slots.declare('settings.plugin.item', { kind: 'keyed', scope: 'root' })
-  const card = slots.registers.find(row => row.options.name === 'settings.plugin.item' && row.options.key === 'dsh-explorer')
-  if (card === undefined) throw new Error('missing settings.plugin.item key=dsh-explorer')
-  if (card.options.id !== 'dsh-explorer') throw new Error('settings.plugin.item should also carry id=dsh-explorer')
-  ok('settings slots: plugin.item card registers with key+id=dsh-explorer')
-
-  // ── 0.1.2 兼容回归：client-runtime 重组后 workspaces.openPath 被删除 ──
-  // apply 不得因缺失本地 opener 抛错；openWithSystem 应回落远端通道。
-  pluginModule.resetHostOpenPath()
-  const remoteOpens = []
-  const slots2 = makeSlots()
-  pluginModule.apply({
-    get: (name) => name === 'remote'
-      ? { session: { openWorkspacePath: async (req) => { remoteOpens.push(req?.path) } } }
-      : undefined,
-    effect: (cb) => {
-      const d = cb()
-      return typeof d === 'function' ? d : () => {}
-    },
-    slots: slots2,
-    sessions: {},
-    workspaces: {}, // 0.1.2：没有 openPath 成员
-    layout: {},
-  })
-  slots2.declare('settings.plugin.item', { kind: 'keyed', scope: 'root' })
-  await pluginModule.openWithSystem('C:\\tmp\\demo.txt')
-  if (remoteOpens.length !== 1 || remoteOpens[0] !== 'C:\\tmp\\demo.txt') {
-    throw new Error(`remote openWorkspacePath fallback expected one call, got ${JSON.stringify(remoteOpens)}`)
+  slots.declare('conversation.session.header.utilities', { kind: 'list' })
+  const term = slots.registers.find(row => row.options.name === 'conversation.session.header.utilities')
+  if (term === undefined) throw new Error('missing conversation.session.header.utilities registration')
+  if (term.options.id !== 'dsh-explorer-term') {
+    throw new Error(`terminal toggle must carry id=dsh-explorer-term (got ${JSON.stringify(term.options.id)})`)
   }
-  ok('0.1.2 compat: apply survives missing workspaces.openPath; openWithSystem falls back to remote.session')
+  ok('session-header slot: 终端开关注册到 conversation.session.header.utilities')
 } catch (error) {
   fail('browser half evaluation', error)
 }
@@ -385,143 +320,6 @@ try {
   fail('rpc gate checks', error)
 }
 
-// ── 4. 载荷自愈钩子（src/payloadFork.ts） ─────────────────────────────────
-// 纯内存 IO 直测三条路径：补丁写入（含备份与原子换名）、幂等跳过、
-// 无点位跳过；再验证 rewriteClampSites 对已 fork 源码返回 null。
-try {
-  const { applyPayloadFork, FORK_MARKER, rewriteClampSites } = require('dsh-explorer')
-
-  const UPSTREAM = [
-    'setDetails: (d, px) => { d.details = clampWidth(px, 300, 520); },',
-    'const d0 = details === 0 ? 0 : clampWidth(details, 300, 520);',
-  ].join('\n')
-
-  {
-    const rewritten = rewriteClampSites(UPSTREAM, 1200)
-    if (rewritten === null) throw new Error('upstream source should produce a rewrite')
-    if (rewritten.sites !== 2) throw new Error(`expected 2 clamp sites, got ${rewritten.sites}`)
-    if (!rewritten.text.includes('clampWidth(px, 300, 1200)')) throw new Error('drag site not raised to 1200')
-    if (!rewritten.text.includes('clampWidth(details, 300, 1200)')) throw new Error('computeColumns site not raised to 1200')
-    if (!rewritten.text.includes(FORK_MARKER)) throw new Error('marker not appended')
-    ok('payload fork: rewrite raises both clamp sites to 1200 and stamps the marker')
-  }
-  {
-    const once = rewriteClampSites(UPSTREAM, 1200)
-    const already = rewriteClampSites(once.text, 1200)
-    if (already !== null) throw new Error('forked source should yield null (no 520 sites left)')
-    ok('payload fork: already-forked source is detected as no-op')
-  }
-
-  function makeIo(files) {
-    const io = {
-      exists: path => Object.prototype.hasOwnProperty.call(files, path),
-      read: path => {
-        if (!(path in files)) throw new Error(`ENOENT: ${path}`)
-        return files[path]
-      },
-      write: (path, text) => { files[path] = text },
-      rename: (from, to) => {
-        if (!(from in files)) throw new Error(`ENOENT: ${from}`)
-        files[to] = files[from]
-        delete files[from]
-      },
-      files,
-    }
-    return io
-  }
-  const { join } = require('node:path')
-  const APP_ROOT = 'C:\\fake\\payload\\app'
-  const BUNDLE = join(APP_ROOT, 'node_modules', '@deepseek-ai', 'dsh-client-ui-layout', 'lib', 'client.js')
-  const BASES = [APP_ROOT]
-
-  {
-    const files = { [BUNDLE]: UPSTREAM }
-    const status = applyPayloadFork({ bases: BASES, io: makeIo(files) })
-    if (status.status !== 'patched' || status.sites !== 2) throw new Error(`expected patched(2), got ${JSON.stringify(status)}`)
-    const patchedText = files[BUNDLE]
-    if (!patchedText.includes('clampWidth(px, 300, 1200)')) throw new Error('bundle not rewritten on disk')
-    const backupPath = `${BUNDLE}.dshx-orig`
-    if (files[backupPath] !== UPSTREAM) throw new Error('original backup missing or wrong')
-    if (files[`${BUNDLE}.dshx-tmp`] !== undefined) throw new Error('temp file leaked after rename')
-    ok('payload fork: startup hook patches the bundle, backs up the original, cleans the temp file')
-  }
-  {
-    const files = { [BUNDLE]: `${UPSTREAM}\n${FORK_MARKER}\n` }
-    const status = applyPayloadFork({ bases: BASES, io: makeIo(files) })
-    if (status.status !== 'already') throw new Error(`expected already, got ${JSON.stringify(status)}`)
-    ok('payload fork: second run is idempotent (marker short-circuits)')
-  }
-  {
-    // max 漂移：载荷已被打到 1000，本进程期望 1200 → 按既有标记的 max 重打。
-    const drifted = rewriteClampSites(UPSTREAM, 1000)
-    if (drifted === null) throw new Error('rewrite to 1000 should succeed')
-    const files = { [BUNDLE]: drifted.text }
-    const status = applyPayloadFork({ bases: BASES, io: makeIo(files), max: 1200 })
-    if (status.status !== 'patched' || status.sites !== 2) throw new Error(`expected patched(2) on max drift, got ${JSON.stringify(status)}`)
-    if (!files[BUNDLE].includes('clampWidth(px, 300, 1200)')) throw new Error('drifted bundle not re-raised to 1200')
-    ok('payload fork: max drift re-patches from the stamped max')
-  }
-  {
-    const files = { [BUNDLE]: 'export const DETAILS_MAX = 520 // upstream changed shape' }
-    const status = applyPayloadFork({ bases: BASES, io: makeIo(files) })
-    if (status.status !== 'skipped') throw new Error(`expected skipped, got ${JSON.stringify(status)}`)
-    if (files[BUNDLE] !== 'export const DETAILS_MAX = 520 // upstream changed shape') throw new Error('skipped run must not write')
-    ok('payload fork: unmatched bundle shape is skipped without writing')
-  }
-  {
-    const status = applyPayloadFork({ bases: ['C:/definitely/missing'], io: makeIo({}) })
-    if (status.status !== 'missing') throw new Error(`expected missing, got ${JSON.stringify(status)}`)
-    ok('payload fork: absent payload reports missing instead of throwing')
-  }
-  {
-    // P2-4 新语义：rename 失败不再直写降级（目标文件可能正被服务器读取，
-    // 直写有截断风险）——放弃写入、保留原文件、返回 failed；io 提供 remove
-    // 时顺带清理临时文件。
-    const files = { [BUNDLE]: UPSTREAM }
-    const io = makeIo(files)
-    io.rename = () => { throw new Error('EPERM: rename denied') }
-    io.remove = (path) => { delete files[path] }
-    const status = applyPayloadFork({ bases: BASES, io })
-    if (status.status !== 'failed' || !String(status.reason).includes('重命名失败')) {
-      throw new Error(`expected failed(重命名失败), got ${JSON.stringify(status)}`)
-    }
-    if (files[BUNDLE] !== UPSTREAM) throw new Error('rename failure must not direct-write the bundle')
-    if (files[`${BUNDLE}.dshx-tmp`] !== undefined) throw new Error('temp file should be removed when io.remove exists')
-
-    // io 未提供 remove：跳过清理但同样绝不直写。
-    const files2 = { [BUNDLE]: UPSTREAM }
-    const io2 = makeIo(files2)
-    io2.rename = () => { throw new Error('EPERM: rename denied') }
-    const status2 = applyPayloadFork({ bases: BASES, io: io2 })
-    if (status2.status !== 'failed' || files2[BUNDLE] !== UPSTREAM) {
-      throw new Error(`io without remove must still fail without direct-write, got ${JSON.stringify(status2)}`)
-    }
-    ok('payload fork: rename failure abandons the write, keeps original, cleans temp via io.remove')
-  }
-  {
-    // P2-③：半命中（只找到 1 处点位）不得写盘、不得落标记、不得备份。
-    const half = UPSTREAM.split('\n').slice(0, 1).join('\n')
-    if (rewriteClampSites(half, 1200) !== null) {
-      throw new Error('single-site source must not rewrite (expectedSites=2)')
-    }
-    const files = { [BUNDLE]: half }
-    const status = applyPayloadFork({ bases: BASES, io: makeIo(files) })
-    if (status.status !== 'skipped') throw new Error(`expected skipped on half-match, got ${JSON.stringify(status)}`)
-    if (files[BUNDLE] !== half) throw new Error('half-match must not write the bundle')
-    if (files[`${BUNDLE}.dshx-orig`] !== undefined) throw new Error('half-match must not touch the backup')
-    ok('payload fork: half-matched clamp sites are skipped without writing or stamping')
-  }
-  {
-    // P2-④：备份被污染（含 fork 标记）时，重打前先用当前原始文本刷新备份。
-    const files = { [BUNDLE]: UPSTREAM, [`${BUNDLE}.dshx-orig`]: `${UPSTREAM}\n${FORK_MARKER}\n` }
-    const status = applyPayloadFork({ bases: BASES, io: makeIo(files) })
-    if (status.status !== 'patched' || status.sites !== 2) throw new Error(`expected patched(2), got ${JSON.stringify(status)}`)
-    if (files[`${BUNDLE}.dshx-orig`] !== UPSTREAM) throw new Error('polluted backup was not refreshed to the pristine source')
-    ok('payload fork: polluted backup is refreshed before re-patching')
-  }
-} catch (error) {
-  fail('payload fork checks', error)
-}
 
 // ── 5. 工作区按会话时间排序（workspaceRecencyOrder） ──────────────────────
 // 假 store + 假 insertBefore（按宿主 DOM-insertBefore 语义搬数组），
@@ -851,53 +649,6 @@ try {
   delete globalThis.document
 } catch (error) {
   fail('workspace recency order', error)
-}
-
-// ── 6. git 路径解码（中文文件名 / C 风格八进制转义） ──────────────────────
-try {
-  const { unquotePath } = require('dsh-explorer')
-  if (typeof unquotePath !== 'function') throw new Error('unquotePath not exported')
-  const cases = [
-    ['plain.txt', 'plain.txt'],
-    ['"a\\"b.txt"', 'a"b.txt'],
-    ['"a\\nb.txt"', 'a\nb.txt'],
-    // 「文」= U+6587 → UTF-8 E6 96 87
-    ['"\\346\\226\\207.txt"', '文.txt'],
-    // 「中文 文件」连续多字节跨字符 + 空格：字节必须攒批再统一 UTF-8 解码
-    ['"\\344\\270\\255\\346\\226\\207 \\346\\226\\207\\344\\273\\266.md"', '中文 文件.md'],
-  ]
-  for (const [input, expected] of cases) {
-    const actual = unquotePath(input)
-    if (actual !== expected) throw new Error(`unquotePath(${JSON.stringify(input)}) = ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`)
-  }
-  ok('git pathspec: C-style octal escapes decode to UTF-8 (Chinese filenames)')
-} catch (error) {
-  fail('unquotePath checks', error)
-}
-
-// ── 7. shellSafePath（P0-1 回归修复：按平台放行路径分隔符） ───────────────
-// win32 绝对路径必含反斜杠 → 放行；POSIX 拒绝 `\`。元字符黑名单与长度/
-// 空值校验与 shellSafe 一致。
-try {
-  const { shellSafePath } = require('dsh-explorer')
-  if (typeof shellSafePath !== 'function') throw new Error('shellSafePath not exported')
-  const win = process.platform === 'win32'
-
-  const abs = shellSafePath('C:\\a\\b')
-  const absExpected = win ? 'C:\\a\\b' : null
-  if (abs !== absExpected) throw new Error(`shellSafePath('C:\\a\\b') => ${JSON.stringify(abs)}, expected ${JSON.stringify(absExpected)}`)
-  if (shellSafePath('C:/a/b') !== 'C:/a/b') throw new Error('forward-slash path should pass on every platform')
-  if (shellSafePath('relative/dir') !== 'relative/dir') throw new Error('plain relative path should pass')
-
-  const rejects = ['C:\\a"b', 'a;rm -rf', 'a|b', 'a`b', "a'b", 'a$b', 'a&b', 'a<b', 'a>b', 'a^b', 'a%b', 'a!b', 'a\u0001b', 'a b\tc', '']
-  for (const bad of rejects) {
-    if (shellSafePath(bad) !== null) throw new Error(`shellSafePath(${JSON.stringify(bad)}) should be null`)
-  }
-  if (shellSafePath('x'.repeat(4097)) !== null) throw new Error('over-long path should be rejected')
-  if (shellSafePath(123) !== null) throw new Error('non-string input should be rejected')
-  ok(`shellSafePath: platform-aware separators + metachar blacklist (P0-1 regression guard, win32=${win})`)
-} catch (error) {
-  fail('shellSafePath checks', error)
 }
 
 if (failures > 0) {

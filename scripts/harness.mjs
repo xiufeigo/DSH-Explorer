@@ -5,7 +5,7 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { copyFileSync, existsSync, readlinkSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, readlinkSync } from 'node:fs'
 import { dirname, join, resolve, sep } from 'node:path'
 
 export function looksLikeHarness(root) {
@@ -26,7 +26,7 @@ function addCandidate(seen, tries, raw) {
  * Find a deepseek-harness checkout.
  * Order: --harness → DSH_HARNESS → 仓库隔壁 deepseek-harness → 从 dsh-base
  * junction 往上爬。本机 profile 农场经常指向 Desktop 的 npm 载荷（路径里
- * 没有 apps/cli），不能把「找到 dsh-base」当成「找到了可 fork 的 checkout」。
+ * 没有 apps/cli），不能把「找到 dsh-base」当成「找到了可用的 checkout」。
  */
 export function locateHarness({ explicit, projectRoot, junctionBases }) {
   const seen = new Set()
@@ -94,29 +94,6 @@ export function shellLine(cmd, args) {
     return `"${text.replace(/"/g, '\\"')}"`
   })
   return tokens.join(' ')
-}
-
-/** 原始备份只写一次（卸载/排查时可手工还原）。返回备份路径。 */
-export function backupOnce(filePath, suffix = '.dshx-orig') {
-  const backup = `${filePath}${suffix}`
-  if (!existsSync(backup)) copyFileSync(filePath, backup)
-  return backup
-}
-
-/**
- * 同盘临时文件 + 原子换名，避免半截文件被读到。换名失败时放弃写入并清理
- * 临时文件后抛出——绝不直写目标（目标可能正被读取，半截内容有截断风险）；
- * 与 src/payloadFork.ts 的写入策略同源（P2-4 语义），由调用方报告/回滚。
- */
-export function atomicWrite(filePath, text) {
-  const tmp = `${filePath}.dshx-tmp`
-  writeFileSync(tmp, text, 'utf8')
-  try {
-    renameSync(tmp, filePath)
-  } catch (error) {
-    try { rmSync(tmp, { force: true }) } catch { /* 尽力清理 */ }
-    throw error
-  }
 }
 
 // ── 安装器 / 卸载器共享脚手架 ─────────────────────────────────────────────

@@ -3,15 +3,11 @@
  * DSH-Explorer 自动安装器（幂等，可重复执行）。
  *
  * 流程：构建 + 自检 → 创建包解析 junction（profile 农场，有 checkout 再加 apps/cli）
- *      → 写入 profile patch 行 → （可选 --fork-width / --fork-ui）改 harness
- *      → 尽力而为的 HTTP 验证。Harness 不是硬性前置：Desktop 载荷下的
- *      dsh-base 没有 apps/cli，常规安装仍应成功。
+ *      → 写入 profile patch 行 → 尽力而为的 HTTP 验证。Harness 不是硬性前置：
+ *      Desktop 载荷下的 dsh-base 没有 apps/cli，常规安装仍应成功。
  *
  * 用法：
  *   node scripts/install.mjs                      # 常规安装（幂等）
- *   node scripts/install.mjs --fork-width         # fork：放宽右侧栏宽度上限（改一行常量）
- *   node scripts/install.mjs --fork-ui            # fork：宽度上限 + 工作区顶部动作条座位
- *   node scripts/install.mjs --forks              # 同上（--fork-ui 别名）
  *   node scripts/install.mjs --rebuild            # 强制重新 pnpm install + build
  *   node scripts/install.mjs --profile <name>     # 目标 profile（默认 web）
  *   node scripts/install.mjs --harness <path>     # 手动指定 harness 路径
@@ -25,7 +21,7 @@ import {
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  atomicWrite, backupOnce, linkPointsTo, locateHarness, log, makeExec, parseArgs,
+  linkPointsTo, locateHarness, log, makeExec, parseArgs,
   profilePaths, resolveDshHome, run, step,
 } from './harness.mjs'
 
@@ -36,13 +32,11 @@ const ROW_ID = 'dsh-explorer'
 const { flag, opt, requireValue } = parseArgs({
   argv: process.argv.slice(2),
   known: new Set([
-    '--dry-run', '--fork-width', '--fork-ui', '--forks', '--rebuild', '--profile', '--harness',
+    '--dry-run', '--rebuild', '--profile', '--harness',
   ]),
-  usage: '--dry-run --fork-width --fork-ui --forks --rebuild --profile <name> --harness <path>',
+  usage: '--dry-run --rebuild --profile <name> --harness <path>',
 })
 const DRY = flag('--dry-run')
-const wantWidthFork = flag('--fork-width') || flag('--fork-ui') || flag('--forks')
-const wantSidebarFork = flag('--fork-ui') || flag('--forks')
 const harnessFlag = opt('--harness')
 requireValue('--harness', harnessFlag)
 const PROFILE = opt('--profile') ?? 'web'
@@ -53,16 +47,7 @@ const { profileDir: PROFILE_DIR, patchPath: PATCH_PATH, junctionBases: JUNCTION_
 
 const exec = makeExec(DRY)
 
-/** 文件存在且含标记；读失败（权限/占用）只当不含，不让提示分支硬崩。 */
-function fileIncludes(filePath, marker) {
-  try {
-    return existsSync(filePath) && readFileSync(filePath, 'utf8').includes(marker)
-  } catch {
-    return false
-  }
-}
-
-// ── 1. 定位 harness（fork / apps/cli junction 才需要） ─────────────────────
+// ── 1. 定位 harness（apps/cli junction 才需要） ────────────────────────────
 step('定位 deepseek-harness')
 const harnessRoot = locateHarness({
   explicit: harnessFlag,
@@ -76,14 +61,9 @@ if (harnessFlag !== undefined && harnessRoot === undefined) {
 }
 if (harnessRoot !== undefined) {
   log(`  已定位：${harnessRoot}`)
-} else if (wantWidthFork || wantSidebarFork) {
-  console.error('✘ 无法定位 deepseek-harness，而 --fork-width / --fork-ui 需要改它的源码')
-  console.error('  请用 --harness <path> 指定 checkout 根目录（含 apps/cli 与 packages/client）')
-  process.exit(1)
 } else {
   log('  △ 未找到 harness checkout（本机 dsh-base 常指向 Desktop 载荷，没有 apps/cli）')
-  log('  △ 仍会写入 profile 农场 junction + patch 行；CLI junction 与 fork 跳过')
-  log('  △ 若要给本机 dsh web 打宽度/座位 fork，加 --harness <path> 或把仓库放在 deepseek-harness 隔壁')
+  log('  △ 仍会写入 profile 农场 junction + patch 行；CLI junction 跳过')
 }
 const CLI_NODE_MODULES = harnessRoot === undefined
   ? null
@@ -257,268 +237,7 @@ if (rowIndex >= 0) {
   if (!DRY) log('  ✓ 已写入（watchUserPatches 会热重载组合）')
 }
 
-// ── 5. 可选：harness fork（宽度上限 + 工作区顶部动作条座位） ───────────────
-const COLUMNS_PATH = harnessRoot === undefined
-  ? ''
-  : join(harnessRoot, 'packages', 'client', 'ui-layout', 'src', 'client', 'columns.ts')
-const FORK_MARKER = 'FORK'
-const SIDEBAR_DIR = harnessRoot === undefined
-  ? ''
-  : join(harnessRoot, 'packages', 'client', 'ui-sidebar', 'src', 'client')
-const SEAT_KEY = 'sidebar.workspaces.actions'
-
-/**
- * 计算一组补丁（纯函数，不写盘）：已含标记 → already；needle 未命中 →
- * error；需要写入 → applied（带 original/next）。写盘延后到 commitPatches，
- * 实现「全部命中才写、任一失败零写盘」的预检语义（t7 审计 B2）。
- */
-function computePatches(jobs) {
-  return jobs.map(({ filePath, marker, patchFn }) => {
-    if (!existsSync(filePath)) return { filePath, error: `找不到 ${filePath}` }
-    const original = readFileSync(filePath, 'utf8')
-    if (original.includes(marker)) return { filePath, status: 'already' }
-    const next = patchFn(original)
-    if (next === original) return { filePath, error: `补丁未命中（上游源码可能已变）：${filePath}` }
-    if (!next.includes(marker)) return { filePath, error: `补丁未写入标记 ${marker}：${filePath}` }
-    return { filePath, status: 'applied', original, next }
-  })
-}
-
-/**
- * 写盘（预检全过后才调用）：写前先留一次原始备份（.dshx-orig），同盘临时
- * 文件 + 原子换名，避免进程中途被杀留下半截宿主源码。半途失败时回滚本次
- * 已写文件（.dshx-orig 是 backupOnce 留下的原始内容）并把失败写进对应
- * result.error——绝不留半套必坏 fork。dry-run 只打印不落盘。
- */
-function commitPatches(results) {
-  const written = []
-  try {
-    for (const result of results) {
-      if (result.status !== 'applied') continue
-      if (DRY) {
-        log(`  [dry-run] 写入 fork：${result.filePath}`)
-        continue
-      }
-      backupOnce(result.filePath)
-      atomicWrite(result.filePath, result.next)
-      written.push(result.filePath)
-    }
-  } catch (error) {
-    for (const filePath of written) {
-      try { atomicWrite(filePath, readFileSync(`${filePath}.dshx-orig`, 'utf8')) }
-      catch { /* 尽力回滚；残留可自 .dshx-orig 手工恢复 */ }
-    }
-    for (const result of results) {
-      if (result.status === 'applied' && !DRY) {
-        result.error = `写入失败（已回滚本次写入）：${result.filePath}: ${error.message}`
-      }
-    }
-  }
-}
-
-function logPatchErrors(results) {
-  for (const result of results) {
-    if (result.error !== undefined) console.error(`  ✘ ${result.error}`)
-  }
-}
-
-function allPatchesOk(results) {
-  return results.every(result => result.error === undefined)
-}
-
-function anyPatchApplied(results) {
-  return results.some(result => result.status === 'applied')
-}
-
-// ── 5. 可选：harness fork（宽度上限 + 宽度记忆 + 顶部动作条座位） ───────────
-// 预检-后写盘：fork 组先各自纯计算（needle 命中 + 生成新文本），全部成功才
-// 统一写盘（见下方 commit 段）；任一失败零写盘退出——绝不留「部分文件已打
-// fork、部分未打、跳过重建」的半套必坏状态（t7 审计 B2）。
-const forkPlans = []
-
-if (wantWidthFork) {
-  step('fork：右侧栏宽度上限 + 宽度记忆（ui-layout）')
-  const storesPath = join(harnessRoot, 'packages', 'client', 'ui-layout', 'src', 'client', 'stores.ts')
-  forkPlans.push({
-    okLabel: '宽度 fork 已就位',
-    rebuildLabel: '重建 ui-layout 客户端 bundle',
-    rebuildArgs: ['--filter', '@deepseek-ai/dsh-client-ui-layout', 'run', 'bundle'],
-    results: computePatches([
-      {
-        // 宽度上限：DETAILS_MAX 520 → 1200（marker: FORK）。
-        filePath: COLUMNS_PATH,
-        marker: FORK_MARKER,
-        patchFn: (source) => {
-          // 未命中时返回原文，由 computePatches 统一报错（避免双份日志）。
-          if (!/export const DETAILS_MAX = 520/.test(source)) return source
-          return source.replace(
-            /\/\*\* Details drag clamp ceiling\. \*\/\s*\n\s*export const DETAILS_MAX = 520/,
-            '/** Details drag clamp ceiling.\n *  FORK（本机部署改动，DSH-Explorer 依赖）：上游为 520，插件层无法绕过\n *  store 内钳制；升级 DSH 会覆盖，重新执行 `pnpm plugin:install --forks`\n *  即可恢复。实际渲染仍受列宽让步链约束（中心列保持 >= 640）。 */\nexport const DETAILS_MAX = 1200',
-          )
-        },
-      },
-      {
-        // 宽度记忆：setDetails 落盘 + openDetails 恢复（marker: DETAILS_WIDTH_KEY）。
-        filePath: storesPath,
-        marker: 'DETAILS_WIDTH_KEY',
-        patchFn: (source) => {
-          const setNeedle = '      setDetails: (d, px: number) => { d.details = clampWidth(px, DETAILS_MIN, DETAILS_MAX) },'
-          const openNeedle = '      openDetails: (d) => { if (d.details === 0) d.details = DETAILS_DEFAULT },'
-          if (!source.includes(setNeedle) || !source.includes(openNeedle)) return source
-          let out = source.replace(
-            setNeedle,
-            '      // FORK（DSH-Explorer）：右侧栏宽度记忆 —— 拖拽落点写 localStorage。\n'
-            + '      setDetails: (d, px: number) => {\n'
-            + '        d.details = clampWidth(px, DETAILS_MIN, DETAILS_MAX)\n'
-            + '        persistDetails(d.details)\n'
-            + '      },',
-          )
-          out = out.replace(
-            openNeedle,
-            '      openDetails: (d) => { if (d.details === 0) d.details = readSavedDetails() },',
-          )
-          if (out === source) return source
-          out += '\n\n// ── FORK（DSH-Explorer）：右侧栏宽度记忆 ────────────────────────────────────\n'
-            + '// 升级 DSH 会覆盖；恢复见 DSH-Explorer/README.md。\n'
-            + "const DETAILS_WIDTH_KEY = 'dsh-explorer:details-width'\n\n"
-            + '/** 读取上次保存的 details 列宽（钳制进契约范围；无记录时回落默认值）。 */\n'
-            + 'function readSavedDetails(): number {\n'
-            + "  try {\n    if (typeof localStorage === 'undefined') return DETAILS_DEFAULT\n"
-            + '    const raw = localStorage.getItem(DETAILS_WIDTH_KEY)\n'
-            + '    if (raw === null) return DETAILS_DEFAULT\n'
-            + '    const parsed = Number(raw)\n'
-            + '    return Number.isFinite(parsed) && parsed > 0 ? clampWidth(parsed, DETAILS_MIN, DETAILS_MAX) : DETAILS_DEFAULT\n'
-            + '  } catch {\n    return DETAILS_DEFAULT\n  }\n'
-            + '}\n\n'
-            + '/** 落盘一次拖拽结果（失败静默）。 */\n'
-            + 'function persistDetails(px: number): void {\n'
-            + "  try {\n    if (typeof localStorage !== 'undefined') localStorage.setItem(DETAILS_WIDTH_KEY, String(px))\n"
-            + '  } catch {\n    // ignore\n  }\n'
-            + '}\n'
-          return out
-        },
-      },
-    ]),
-  })
-} else if (harnessRoot !== undefined && fileIncludes(COLUMNS_PATH, FORK_MARKER)) {
-  log('  提示：宽度 fork 已就位（如需重新应用见 README）')
-} else if (harnessRoot !== undefined) {
-  log('  提示：如需"随意调整"右侧栏宽度，可加 --fork-width（改 harness 一行并重建）')
-}
-
-if (wantSidebarFork) {
-  step('fork：工作区顶部动作条座位（sidebar.workspaces.actions）')
-  const slotsPath = join(SIDEBAR_DIR, 'contract', 'slots.ts')
-  const indexPath = join(SIDEBAR_DIR, 'index.ts')
-  const rootPath = join(SIDEBAR_DIR, 'SidebarRoot.tsx')
-  const cssPath = join(SIDEBAR_DIR, 'SidebarRoot.module.css')
-  forkPlans.push({
-    okLabel: '顶部动作条座位 fork 已就位',
-    rebuildLabel: '重建 ui-sidebar 客户端 bundle',
-    rebuildArgs: ['--filter', '@deepseek-ai/dsh-client-ui-sidebar', 'run', 'bundle'],
-    results: computePatches([
-      {
-        filePath: slotsPath,
-        marker: SEAT_KEY,
-        patchFn: (source) => {
-          const footer = "'sidebar.footer.action': { kind: 'list'; scope: 'root'; owner: SidebarFooterActionOwnerProps }"
-          if (!source.includes(footer)) return source
-          // PropsRenderSlots union 双形态（t7 审计 B1）：上游加入 brand 席位后
-          // 从单行改为多行 union——两种形态都注入 'sidebar.workspaces.actions'。
-          // 新形态优先（当前 checkout），旧单行形态回退（覆盖上一代 harness）。
-          const singleLine = "& PropsRenderSlots<'sidebar.workspaces' | 'sidebar.settings' | 'sidebar.footer.action'>"
-          const multiLineRe = /^([ \t]*)\| 'sidebar\.workspaces'[ \t]*\r?\n/m
-          if (!source.includes(singleLine) && multiLineRe.test(source) === false) return source
-          let out = source.replace(
-            footer,
-            `${footer}\n`
-            + "    /** FORK（本机部署改动，DSH-Explorer 依赖）：工作区上方动作条座位，见 README。 */\n"
-            + "    'sidebar.workspaces.actions': { kind: 'list'; scope: 'root'; owner: SidebarFooterActionOwnerProps }",
-          )
-          if (source.includes(singleLine)) {
-            out = out.replace(
-              singleLine,
-              "& PropsRenderSlots<'sidebar.workspaces' | 'sidebar.workspaces.actions' | 'sidebar.settings' | 'sidebar.footer.action'>",
-            )
-          } else {
-            const indent = source.match(multiLineRe)[1]
-            out = out.replace(
-              multiLineRe,
-              `${indent}| 'sidebar.workspaces'\n${indent}| 'sidebar.workspaces.actions'\n`,
-            )
-          }
-          return out
-        },
-      },
-      {
-        filePath: indexPath,
-        marker: SEAT_KEY,
-        patchFn: (source) => source.replace(
-          "        'sidebar.workspaces': { kind: 'single', scope: 'root' },",
-          "        'sidebar.workspaces': { kind: 'single', scope: 'root' },\n"
-          + "        // FORK（DSH-Explorer）：工作区上方动作条座位。\n"
-          + "        'sidebar.workspaces.actions': { kind: 'list', scope: 'root' },",
-        ),
-      },
-      {
-        filePath: rootPath,
-        marker: 'workspaceActions',
-        patchFn: (source) => source.replace(
-          "      {/* The browsing region fills the column between the controls and the",
-          "      {/* FORK（DSH-Explorer）：工作区上方的紧凑动作条（宽栏时渲染，\n"
-          + "          空座位自动隐藏）。 */}\n"
-          + "      {wide && (\n"
-          + "        <div className={css.workspaceActions}>\n"
-          + "          {renderSlot('sidebar.workspaces.actions', { wide })}\n"
-          + "        </div>\n"
-          + "      )}\n\n"
-          + "      {/* The browsing region fills the column between the controls and the",
-        ),
-      },
-      {
-        filePath: cssPath,
-        marker: '.workspaceActions',
-        patchFn: (source) => source.replace(
-          '.collapsed .regionArea {\n  margin-left: 0;\n  margin-right: 0;\n  padding-left: 0;\n}',
-          '.collapsed .regionArea {\n  margin-left: 0;\n  margin-right: 0;\n  padding-left: 0;\n}\n\n'
-          + '/* FORK（DSH-Explorer）：工作区上方动作条座位。空座位时整条隐藏。 */\n'
-          + '.workspaceActions {\n  flex: none;\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  padding: 0 4px 4px 4px;\n}\n'
-          + '.workspaceActions:empty {\n  display: none;\n}',
-        ),
-      },
-    ]),
-  })
-} else if (harnessRoot !== undefined && fileIncludes(join(SIDEBAR_DIR, 'SidebarRoot.tsx'), 'workspaceActions')) {
-  log('  提示：顶部动作条座位 fork 已就位')
-} else if (harnessRoot !== undefined) {
-  log('  提示：如需"文件"按钮紧贴工作区（顶部动作条座位），加 --fork-ui（改 ui-sidebar 并重建）')
-}
-
-if (forkPlans.length > 0) {
-  // 预检：跨组全有或全无（--fork-ui 同时请求两组时也不留半套）。
-  const failedPlans = forkPlans.filter(plan => allPatchesOk(plan.results) === false)
-  if (failedPlans.length > 0) {
-    for (const plan of failedPlans) logPatchErrors(plan.results)
-    console.error('✘ fork 预检未通过：未写任何文件，目标 harness 保持原样')
-    process.exit(1)
-  }
-  for (const plan of forkPlans) {
-    commitPatches(plan.results)
-    logPatchErrors(plan.results)
-    if (!allPatchesOk(plan.results)) process.exit(1)
-    log(`  ✓ ${plan.okLabel}`)
-  }
-  for (const plan of forkPlans) {
-    if (!anyPatchApplied(plan.results) && !flag('--rebuild')) {
-      log('  （源码已含 fork，跳过重建；若上次重建失败请加 --rebuild）')
-    } else {
-      const code = exec(plan.rebuildLabel, () => run('pnpm', plan.rebuildArgs, harnessRoot))
-      if (code !== 0) process.exit(1)
-    }
-  }
-}
-
-// ── 6. HTTP 验证（尽力而为；dry-run 不发真实请求） ─────────────────────────
+// ── 5. HTTP 验证（尽力而为；dry-run 不发真实请求） ─────────────────────────
 step('线上验证（尽力而为，不阻塞安装）')
 if (DRY) {
   log('  [dry-run] 跳过线上验证')
@@ -559,6 +278,6 @@ if (DRY) {
 console.log('\n════════════════════════════════════════')
 console.log(DRY ? '  dry-run 结束（未做任何修改）' : '  安装完成')
 console.log('  接下来：重启 dsh web → 刷新页面')
-console.log('  确认：左侧栏 [工作区 | 文件] + 会话大纲 + 头部摘要/面板按钮')
+console.log('  确认：会话头终端按钮 + 左侧栏工作区排序/置顶')
 console.log('  卸载：pnpm plugin:uninstall')
 console.log('════════════════════════════════════════')

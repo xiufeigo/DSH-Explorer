@@ -1,8 +1,8 @@
 {
   "name": "dsh-explorer",
-  "version": "0.1.2-rc.1.1",
+  "version": "0.1.5-rc.1.0",
   "private": true,
-  "description": "DSH Explorer — OpenCode 风格文件树 / 编辑 / 预览 / 审查 / 上下文 / 来源 / 终端面板插件（对齐 DSH 0.1.2-rc.1 接入规范）",
+  "description": "DSH Explorer — 会话头终端面板 + 左侧栏工作区排序/置顶（精简版，对齐 DSH 0.1.5-rc.1）",
   "type": "module",
   "engines": {
     "node": ">=22.12"
@@ -27,7 +27,6 @@
       "platform": "web",
       "inject": [
         "@deepseek-ai/dsh-client-ui-renderer",
-        "@deepseek-ai/dsh-client-ui-layout",
         "@deepseek-ai/dsh-api-session-controller",
         "@deepseek-ai/dsh-api-workspace-controller"
       ]
@@ -39,7 +38,6 @@
     "watch": "tsdown --watch",
     "typecheck": "tsc --noEmit",
     "verify": "node scripts/smoke.mjs",
-    "selfcheck": "node scripts/md-selfcheck.mjs",
     "plugin:install": "node scripts/install.mjs",
     "plugin:uninstall": "node scripts/uninstall.mjs"
   },

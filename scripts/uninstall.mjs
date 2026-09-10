@@ -2,13 +2,10 @@
 /**
  * DSH-Explorer 卸载器（幂等，可重复执行）。
  *
- * 流程：移除 profile patch 里的插件行（热重载生效）→ 删除两个包解析 junction
- *      → 若 harness 含本安装器写入的宽度 FORK 与顶部动作条座位 FORK 标记，
- *        默认回退并重建（--keep-fork 全部保留）。回退前留 .dshx-orig 备份。
+ * 流程：移除 profile patch 里的插件行（热重载生效）→ 删除包解析 junction。
  *
  * 用法：
  *   node scripts/uninstall.mjs            # 完整卸载
- *   node scripts/uninstall.mjs --keep-fork # 保留 harness fork 改动
  *   node scripts/uninstall.mjs --dry-run   # 只打印计划，不执行
  */
 
@@ -18,8 +15,8 @@ import {
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  atomicWrite, backupOnce, linkPointsTo, locateHarness, log, makeExec, parseArgs,
-  profilePaths, resolveDshHome, run, sameResolved, step, stripNtPrefix,
+  linkPointsTo, locateHarness, log, makeExec, parseArgs,
+  profilePaths, resolveDshHome, sameResolved, step, stripNtPrefix,
 } from './harness.mjs'
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -28,8 +25,8 @@ const ROW_ID = 'dsh-explorer'
 // ── 参数解析（共享实现见 harness.mjs） ─────────────────────────────────────
 const { flag, opt, requireValue } = parseArgs({
   argv: process.argv.slice(2),
-  known: new Set(['--keep-fork', '--dry-run', '--profile', '--harness']),
-  usage: '--keep-fork --dry-run --profile <name> --harness <path>',
+  known: new Set(['--dry-run', '--profile', '--harness']),
+  usage: '--dry-run --profile <name> --harness <path>',
 })
 const DRY = flag('--dry-run')
 const harnessFlag = opt('--harness')
@@ -42,7 +39,7 @@ const DSH_HOME = resolveDshHome()
 const { profileDir: PROFILE_DIR, patchPath: PATCH_PATH, junctionBases: JUNCTION_BASES } = profilePaths(DSH_HOME, PROFILE)
 
 const exec = makeExec(DRY)
-// 卸载结束时汇总的残留提示（fork 回退未命中等）。
+// 卸载结束时汇总的残留提示（junction 未确认指向本项目等）。
 const residueWarnings = []
 
 const harnessRoot = locateHarness({
@@ -187,201 +184,10 @@ if (harnessRoot !== undefined) {
   log('  △ 无法定位 harness，apps/cli 下的 junction 请手动确认')
 }
 
-// ── 3. 宽度 fork 回退（默认，--keep-fork 跳过） ───────────────────────────
-if (!flag('--keep-fork')) {
-  step('检查宽度 fork（DETAILS_MAX + 宽度记忆）')
-  if (harnessRoot === undefined) {
-    log('  △ 无法定位 harness，跳过 fork 回退（手动：把 DETAILS_MAX 改回 520 并重建）')
-  } else {
-    const columnsPath = join(harnessRoot, 'packages', 'client', 'ui-layout', 'src', 'client', 'columns.ts')
-    let needRebuild = false
-    if (!existsSync(columnsPath)) {
-      log('  △ 找不到 columns.ts，跳过')
-    } else {
-      let source = readFileSync(columnsPath, 'utf8')
-      if (!source.includes('FORK') && !source.includes('DETAILS_MAX = 1200')) {
-        log('  ✓ 无 FORK 标记（未改过，或由他人改动），跳过')
-      } else if (DRY) {
-        log('  [dry-run] 回退 DETAILS_MAX 1200 → 520 并重建 ui-layout bundle')
-      } else {
-        const next = source.replace(
-          /\/\*\* Details drag clamp ceiling\.[\s\S]*?\*\/\s*\nexport const DETAILS_MAX = 1200/,
-          '/** Details drag clamp ceiling. */\nexport const DETAILS_MAX = 520',
-        )
-        if (next === source) {
-          log('  ✘ columns.ts 回退未命中（源码可能已变），未改文件')
-          residueWarnings.push(`${columnsPath} 仍含宽度 FORK 标记（DETAILS_MAX = 1200）`)
-        } else {
-          try {
-            atomicWrite(columnsPath, next)
-            log('  ✓ 已回退 DETAILS_MAX = 520')
-            needRebuild = true
-          } catch (error) {
-            log(`  ✘ columns.ts 回退写入失败（原文件未动或可自 .dshx-orig 恢复）：${error.message}`)
-            residueWarnings.push(`${columnsPath} 回退写入失败，宽度 FORK 可能残留`)
-          }
-        }
-      }
-    }
-    // 宽度记忆（stores.ts）回退：按函数体匹配，不绑死安装器当时的注释原文。
-    const storesPath = join(harnessRoot, 'packages', 'client', 'ui-layout', 'src', 'client', 'stores.ts')
-    if (!existsSync(storesPath)) {
-      log('  △ 找不到 stores.ts，跳过')
-    } else {
-      let source = readFileSync(storesPath, 'utf8')
-      if (!source.includes('DETAILS_WIDTH_KEY')) {
-        log('  ✓ stores.ts 无宽度记忆 fork，跳过')
-      } else if (DRY) {
-        log('  [dry-run] 回退 stores.ts 宽度记忆')
-      } else {
-        const before = source
-        source = source.replace(
-          /(?:      \/\/ FORK（DSH-Explorer）：[^\n]*\n(?:      \/\/[^\n]*\n)*)?      setDetails: \(d, px: number\) => \{\n        d\.details = clampWidth\(px, DETAILS_MIN, DETAILS_MAX\)\n        persistDetails\(d\.details\)\n      \},/,
-          '      setDetails: (d, px: number) => { d.details = clampWidth(px, DETAILS_MIN, DETAILS_MAX) },',
-        )
-        source = source.replace(
-          '      openDetails: (d) => { if (d.details === 0) d.details = readSavedDetails() },',
-          '      openDetails: (d) => { if (d.details === 0) d.details = DETAILS_DEFAULT },',
-        )
-        if (source.includes('persistDetails(d.details)')) {
-          log('  ✘ setDetails 回退未命中，保留 helper，避免留下空调用')
-          residueWarnings.push(`${storesPath} 仍含宽度记忆 FORK（persistDetails 调用未还原）`)
-        } else {
-          source = source.replace(/\n\n\/\/ ── FORK（DSH-Explorer）：右侧栏宽度记忆[\s\S]*$/, '\n')
-          if (source === before) {
-            log('  ✘ stores.ts 回退未命中（源码可能已变），未改文件')
-            residueWarnings.push(`${storesPath} 仍含宽度记忆 FORK 标记（DETAILS_WIDTH_KEY）`)
-          } else {
-            try {
-              atomicWrite(storesPath, source)
-              log('  ✓ 已回退 stores.ts 宽度记忆')
-              needRebuild = true
-            } catch (error) {
-              log(`  ✘ stores.ts 回退写入失败（原文件未动或可自 .dshx-orig 恢复）：${error.message}`)
-              residueWarnings.push(`${storesPath} 回退写入失败，宽度记忆 FORK 可能残留`)
-            }
-          }
-        }
-      }
-    }
-    if (needRebuild && !DRY) {
-      const code = run('pnpm', ['--filter', '@deepseek-ai/dsh-client-ui-layout', 'run', 'bundle'], harnessRoot)
-      if (code === 0) log('  ✓ 已重建 ui-layout 客户端 bundle（刷新页面生效）')
-      else log('  ✘ 重建失败，请手动执行 pnpm --filter @deepseek-ai/dsh-client-ui-layout run bundle')
-    }
-  }
-} else {
-  log('\n（--keep-fork：保留宽度 fork 改动）')
-}
-
-// ── 4. 顶部动作条座位 fork 回退（--fork-ui 写入的 ui-sidebar 改动） ────────
-if (!flag('--keep-fork')) {
-  step('检查顶部动作条座位 fork（sidebar.workspaces.actions）')
-  if (harnessRoot === undefined) {
-    log('  △ 无法定位 harness，跳过（手动确认 ui-sidebar 是否残留 FORK 改动）')
-  } else {
-    const SIDEBAR_DIR = join(harnessRoot, 'packages', 'client', 'ui-sidebar', 'src', 'client')
-    const SEAT_KEY = 'sidebar.workspaces.actions'
-    let needSidebarRebuild = false
-
-    /** 单文件回退：按标记判断存在性，回退未命中宁可不动文件并记残留。 */
-    function revertFile(label, filePath, marker, revertFn) {
-      if (!existsSync(filePath)) {
-        log(`  △ 找不到 ${label}，跳过`)
-        return
-      }
-      const source = readFileSync(filePath, 'utf8')
-      if (!source.includes(marker)) {
-        log(`  ✓ ${label} 无该 fork，跳过`)
-        return
-      }
-      if (DRY) {
-        log(`  [dry-run] 回退 ${label} 的 fork`)
-        needSidebarRebuild = true
-        return
-      }
-      const next = revertFn(source)
-      if (next === source || next.includes(marker)) {
-        log(`  ✘ ${label} 回退未命中（源码可能已变），未改文件`)
-        residueWarnings.push(`${filePath} 仍含 ${marker} 标记`)
-        return
-      }
-      try { backupOnce(filePath) } catch { /* 备份失败不阻断回退 */ }
-      try {
-        atomicWrite(filePath, next)
-      } catch (error) {
-        log(`  ✘ ${label} 写入失败（原文件未动或可自 .dshx-orig 恢复）：${error.message}`)
-        residueWarnings.push(`${filePath} 回退写入失败`)
-        return
-      }
-      log(`  ✓ 已回退 ${label}`)
-      needSidebarRebuild = true
-    }
-
-    revertFile('contract/slots.ts', join(SIDEBAR_DIR, 'contract', 'slots.ts'), SEAT_KEY, (source) => {
-      let out = source.replace(
-        /\n[ \t]*\/\*\* FORK（本机部署改动，DSH-Explorer 依赖）：工作区上方动作条座位，见 README。 \*\/\n[ \t]*'sidebar\.workspaces\.actions': \{ kind: 'list'; scope: 'root'; owner: SidebarFooterActionOwnerProps \}/,
-        '',
-      )
-      // 单行 union 形态（旧上游）。
-      out = out.replace(
-        "'sidebar.workspaces' | 'sidebar.workspaces.actions' | 'sidebar.settings'",
-        "'sidebar.workspaces' | 'sidebar.settings'",
-      )
-      // 多行 union 形态（上游加入 brand 席位后；与安装器双形态针配套）：
-      // 删掉整个成员行。
-      out = out.replace(/^[ \t]*\| 'sidebar\.workspaces\.actions'[ \t]*\r?\n/m, '')
-      return out
-    })
-    revertFile('index.ts', join(SIDEBAR_DIR, 'index.ts'), SEAT_KEY, (source) => source.replace(
-      /\n[ \t]*\/\/ FORK（DSH-Explorer）：工作区上方动作条座位。\n[ \t]*'sidebar\.workspaces\.actions': \{ kind: 'list', scope: 'root' \},/,
-      '',
-    ))
-    revertFile('SidebarRoot.tsx', join(SIDEBAR_DIR, 'SidebarRoot.tsx'), 'workspaceActions', (source) => source.replace(
-      /[ \t]*\{\/\* FORK（DSH-Explorer）：工作区上方的紧凑动作条[\s\S]*?\{renderSlot\('sidebar\.workspaces\.actions', \{ wide \}\)\}[\s\S]*?\)\}\n\n/,
-      '',
-    ))
-    revertFile('SidebarRoot.module.css', join(SIDEBAR_DIR, 'SidebarRoot.module.css'), '.workspaceActions', (source) => source.replace(
-      /\n\n\/\* FORK（DSH-Explorer）：工作区上方动作条座位[\s\S]*?\.workspaceActions:empty \{[^}]*\}/,
-      '',
-    ))
-
-    if (needSidebarRebuild && !DRY) {
-      const code = run('pnpm', ['--filter', '@deepseek-ai/dsh-client-ui-sidebar', 'run', 'bundle'], harnessRoot)
-      if (code === 0) log('  ✓ 已重建 ui-sidebar 客户端 bundle（刷新页面生效）')
-      else log('  ✘ 重建失败，请手动执行 pnpm --filter @deepseek-ai/dsh-client-ui-sidebar run bundle')
-    }
-  }
-} else {
-  log('\n（--keep-fork：保留宽度与座位 fork 改动）')
-}
-
-// ── 残留终检：fork 标记仍在即显式告警，不再假装「卸载完成」 ───────────────
-// 覆盖全部六类 fork 标记（宽度 ×2 + 座位 ×2 终检、座位另两文件由
-// revertFile 自身记录），无论上面走了哪条分支（dry-run / --keep-fork /
-// 回退未命中），结尾汇总都给出完整残留清单。
-if (harnessRoot !== undefined) {
-  const probes = [
-    [join(harnessRoot, 'packages', 'client', 'ui-layout', 'src', 'client', 'columns.ts'), 'DETAILS_MAX = 1200'],
-    [join(harnessRoot, 'packages', 'client', 'ui-layout', 'src', 'client', 'stores.ts'), 'DETAILS_WIDTH_KEY'],
-    [join(harnessRoot, 'packages', 'client', 'ui-sidebar', 'src', 'client', 'contract', 'slots.ts'), 'sidebar.workspaces.actions'],
-    [join(harnessRoot, 'packages', 'client', 'ui-sidebar', 'src', 'client', 'index.ts'), 'sidebar.workspaces.actions'],
-    [join(harnessRoot, 'packages', 'client', 'ui-sidebar', 'src', 'client', 'SidebarRoot.tsx'), 'workspaceActions'],
-    [join(harnessRoot, 'packages', 'client', 'ui-sidebar', 'src', 'client', 'SidebarRoot.module.css'), '.workspaceActions'],
-  ]
-  for (const [file, marker] of probes) {
-    try {
-      if (readFileSync(file, 'utf8').includes(marker) && !residueWarnings.some(w => w.includes(file))) {
-        residueWarnings.push(`${file} 仍含 ${marker} 标记`)
-      }
-    } catch { /* 文件不存在即无残留 */ }
-  }
-}
-
 console.log('\n════════════════════════════════════════')
 console.log(DRY ? '  dry-run 结束（未做任何修改）' : '  卸载完成')
 if (residueWarnings.length > 0) {
-  console.log('  ⚠ 检测到 fork 残留（回退未命中或 --keep-fork）：')
+  console.log('  ⚠ 检测到残留：')
   for (const warning of residueWarnings) console.log(`    - ${warning}`)
 }
 console.log('  建议重启 dsh web 一次，彻底清掉 Host 模块缓存')

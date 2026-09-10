@@ -10,8 +10,5 @@ declare module '@deepseek-ai/dsh-client-ui-primitives' {
     className?: string
   }
   export const IconFolderClose16: (props?: IconProps) => JSX.Element
-  export const IconFolderOpen16: (props?: IconProps) => JSX.Element
-  export const IconTriangleRightFill14: (props?: IconProps) => JSX.Element
-  export const IconRefreshOutline16: (props?: IconProps) => JSX.Element
   export const IconPanelLeftOutline16: (props?: IconProps) => JSX.Element
 }
